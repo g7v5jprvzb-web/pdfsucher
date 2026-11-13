@@ -1,0 +1,82 @@
+// SingleDocumentSearch.swift — Task 2.4
+import Foundation
+import IndexKit
+
+public enum SingleDocumentSearchError: Error, Equatable {
+    /// The PDF has no extractable text on any page (e.g. a scan). Not the same as
+    /// "no matches": the UI shows the scan hint (spec §6).
+    case noText(URL)
+}
+
+/// Searches one PDF without an index (spec §4.2 "Einzel-PDF-Modus"): text comes straight
+/// from the `TextSource`, every page is checked with the same `PageMatcher` as the
+/// index search, so both modes find and highlight exactly the same things.
+///
+/// The extracted text of the last document is kept while its modification date is
+/// unchanged, so search-as-you-type does not re-read a large PDF on every keystroke.
+/// Matching checks for Task cancellation between pages.
+public struct SingleDocumentSearch: Sendable {
+    private let source: any TextSource
+    private let cache = PageCache()
+    /// The document is an image (spec 1.2 §5: photo symbol in the row header).
+    private let isImage: Bool
+
+    public init(source: any TextSource = PDFKitTextSource(), isImage: Bool = false) {
+        self.source = source
+        self.isImage = isImage
+    }
+
+    /// nil for an empty query or when no page matches. Throws `SingleDocumentSearchError.noText`
+    /// for a PDF without text, `CancellationError` when the surrounding Task is cancelled,
+    /// and passes on errors of the text source (unreadable or locked file).
+    public func search(url: URL, query: ParsedQuery) throws -> DocumentHit? {
+        guard !query.isEmpty else { return nil }
+        // Not `url.resourceValues`: URL caches those, and a changed file would look unchanged.
+        let modifiedAt = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+        let pages = try cache.pages(for: url, modifiedAt: modifiedAt) { try source.pages(of: url) }
+        if pages.allSatisfy({ $0.text.allSatisfy(\.isWhitespace) }) {
+            throw SingleDocumentSearchError.noText(url)
+        }
+
+        let matcher = PageMatcher(query)
+        var pageHits: [PageHit] = []
+        for page in pages {
+            try Task.checkCancellation()
+            if let count = matcher.matchCount(in: page.text) {
+                pageHits.append(PageHit(pageIndex: page.pageIndex, matchCount: count))
+            }
+        }
+        guard !pageHits.isEmpty else { return nil }
+        pageHits.sort { $0.pageIndex < $1.pageIndex }
+        let total = pageHits.reduce(0) { $0 + $1.matchCount }
+        return DocumentHit(
+            url: url,
+            relativePath: url.lastPathComponent,
+            modifiedAt: modifiedAt ?? Date(timeIntervalSince1970: 0),
+            pageHits: pageHits,
+            totalMatches: total,
+            relevance: Double(total),
+            sourceRoot: url,
+            pageCount: pages.count,
+            isImage: isImage)
+    }
+}
+
+/// Holds the pages of the most recently read document.
+private final class PageCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var key: (url: URL, modifiedAt: Date?)?
+    private var pages: [PageText] = []
+
+    func pages(for url: URL, modifiedAt: Date?, load: () throws -> [PageText]) throws -> [PageText] {
+        if let cached = lock.withLock({ key.map { $0.url == url && $0.modifiedAt == modifiedAt } == true ? pages : nil }) {
+            return cached
+        }
+        let loaded = try load()  // outside the lock: reading can take seconds
+        lock.withLock {
+            key = (url, modifiedAt)
+            pages = loaded
+        }
+        return loaded
+    }
+}
