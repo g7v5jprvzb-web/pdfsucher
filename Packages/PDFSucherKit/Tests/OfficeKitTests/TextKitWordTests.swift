@@ -2,6 +2,7 @@ import AppKit
 import CoreGraphics
 import Foundation
 import IndexKit
+import OOXMLKit
 import Testing
 import TestSupport
 @testable import OfficeKit
@@ -39,7 +40,7 @@ struct TextKitWordTests {
     @Test(arguments: ["Makro.docm", "Vorlage.dotx"])
     func macroAndTemplateVariantsLayOut(name: String) async throws {
         let url = try OfficeFixtures.docx(paragraphs: ["Variante Alpha", "Variante Beta"], pageBreakAfter: [0], name: name, in: dir)
-        let types = try String(decoding: #require(ZipArchive(url: url).data(at: "[Content_Types].xml")), as: UTF8.self)
+        let types = try String(decoding: #require(ZipArchive(officePackage: url).data(at: "[Content_Types].xml")), as: UTF8.self)
         #expect(types.contains(name.hasSuffix("docm") ? "macroEnabled.main+xml" : "template.main+xml"))
         let result = try await TextKitWordSource().layout(of: url, kind: .word)
         #expect(result.pages.count == 2)

@@ -32,7 +32,7 @@ let package = Package(
         .target(name: "SlideKit", dependencies: ["OOXMLKit", "IndexKit"]),
         .target(name: "SlideKitAdapter", dependencies: ["SlideKit", "IndexKit", "OutputKit"]),
         .testTarget(name: "IndexKitTests", dependencies: ["TestSupport", "IndexKit"]),
-        .testTarget(name: "OfficeKitTests", dependencies: ["TestSupport", "OfficeKit", "IndexKit", "OutputKit", "SearchKit", "MediaKit", "SlideKitAdapter"]),
+        .testTarget(name: "OfficeKitTests", dependencies: ["TestSupport", "OfficeKit", "IndexKit", "OutputKit", "SearchKit", "MediaKit", "SlideKitAdapter", "OOXMLKit"]),
         .testTarget(name: "OCRKitTests", dependencies: ["TestSupport", "OCRKit", "IndexKit", "SearchKit"]),
         .testTarget(name: "SearchKitTests", dependencies: ["TestSupport", "SearchKit", "IndexKit"]),
         .testTarget(name: "MediaKitTests", dependencies: ["TestSupport", "MediaKit", "IndexKit"]),

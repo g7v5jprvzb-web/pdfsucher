@@ -38,6 +38,11 @@ public struct ZipArchive: Sendable {
         } catch {
             throw ZipError.corrupt("cannot read file: \(error.localizedDescription)")
         }
+        try self.init(data: mapped)
+    }
+
+    /// The archive in `mapped` (read by the caller, e.g. to let its I/O errors through unchanged).
+    public init(data mapped: Data) throws(ZipError) {
         let r = Reader(mapped)
         if r.count >= 8, r.byte(0) == 0xD0, r.byte(1) == 0xCF, r.byte(2) == 0x11, r.byte(3) == 0xE0,
            r.byte(4) == 0xA1, r.byte(5) == 0xB1, r.byte(6) == 0x1A, r.byte(7) == 0xE1 {
@@ -119,6 +124,11 @@ public struct ZipArchive: Sendable {
     public func contains(_ name: String) -> Bool { table[Array(name.utf8)] != nil }
 
     public func data(_ name: String) throws(ZipError) -> Data {
+        try data(name, maxSize: Self.maxEntrySize)
+    }
+
+    /// As `data(_:)`, with a lower limit for the uncompressed size (callers that read only small parts).
+    public func data(_ name: String, maxSize: UInt64) throws(ZipError) -> Data {
         guard let e = table[Array(name.utf8)] else { throw ZipError.entryMissing(name) }
         if e.flags & 0x0001 != 0 { throw ZipError.corrupt("encrypted entry \(name)") }
         guard e.method == 0 || e.method == 8 else { throw ZipError.unsupportedMethod(e.method) }
@@ -131,7 +141,7 @@ public struct ZipArchive: Sendable {
         let extraLen = UInt64(r.u16(lo + 28) ?? 0)
         let start = e.localOffset + 30 + nameLen + extraLen
         guard start <= total, e.compressedSize <= total - start else { throw ZipError.truncated }
-        guard e.uncompressedSize <= Self.maxEntrySize else { throw ZipError.corrupt("entry \(name) too large") }
+        guard e.uncompressedSize <= min(maxSize, Self.maxEntrySize) else { throw ZipError.corrupt("entry \(name) too large") }
         let payloadStart = Int(start)
         let payloadCount = Int(e.compressedSize)
         if e.method == 0 {

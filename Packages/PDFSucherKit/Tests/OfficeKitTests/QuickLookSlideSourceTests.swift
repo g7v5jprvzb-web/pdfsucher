@@ -1,6 +1,7 @@
 import CoreGraphics
 import Foundation
 import IndexKit
+import OOXMLKit
 import Synchronization
 import Testing
 import TestSupport
@@ -106,7 +107,7 @@ struct QuickLookSlideSourceTests {
     @Test func macroEnabledDeckLaysOut() async throws {
         guard generatorAvailable() else { return }
         let deck = try OfficeFixtures.pptx(slides: Self.slides, name: "Makro.pptm", in: dir)
-        let types = try String(decoding: #require(ZipArchive(url: deck).data(at: "[Content_Types].xml")), as: UTF8.self)
+        let types = try String(decoding: #require(ZipArchive(officePackage: deck).data(at: "[Content_Types].xml")), as: UTF8.self)
         #expect(types.contains("presentation.macroEnabled.main+xml"))
         let result = try await source().layout(of: deck, kind: .powerpoint)
         try #require(result.pages.count == 3)
@@ -395,18 +396,38 @@ struct QuickLookSlideSourceTests {
     }
 
     @Test func oversizedEntryIsNotInflated() throws {
-        let deck = try patchedDeck(at: 24, value: UInt32(ZipArchive.maxEntrySize + 1)) // uncompressed size
-        #expect(try ZipArchive(url: deck).data(at: "ppt/presentation.xml") == nil)
+        let deck = try patchedDeck(at: 24, value: UInt32(ZipArchive.officePartLimit + 1)) // uncompressed size
+        #expect(try ZipArchive(officePackage: deck).data(at: "ppt/presentation.xml") == nil)
         #expect(throws: LayoutSourceError.self) { try PresentationSlides.visibleSlideNumbers(of: deck) }
     }
 
-    @Test func zip64MarkersAreRejected() throws {
+    /// ZIP64 markers without ZIP64 data (OOXMLKit's reader understands real ZIP64, audit 2026-11-15): the archive
+    /// does not open, or the part does not read; either way the presentation is unreadable.
+    @Test func zip64MarkersWithoutZip64DataAreUnreadable() throws {
         for (offset, eocd, value) in [(42, false, UInt32.max), (20, false, UInt32.max), (24, false, UInt32.max),
                                       (16, true, UInt32.max), (8, true, UInt32(0xFFFF_FFFF))] {
             let deck = try patchedDeck(at: offset, eocd: eocd, value: value)
-            #expect(throws: ZipArchive.Failure.self) { try ZipArchive(url: deck) }
+            #expect((try? ZipArchive(officePackage: deck))?.data(at: "ppt/presentation.xml") == nil)
             #expect(throws: LayoutSourceError.self) { try PresentationSlides.visibleSlideNumbers(of: deck) }
         }
+    }
+
+    /// A file that cannot be read at all is an I/O error, not „unreadable presentation“ (unchanged by the switch
+    /// to OOXMLKit's reader).
+    @Test func missingFileThrowsTheIOError() {
+        let missing = dir.appendingPathComponent("missing-\(UUID().uuidString).pptx")
+        #expect(throws: CocoaError.self) { try PresentationSlides.visibleSlideNumbers(of: missing) }
+    }
+
+    /// Audit 2026-11-15: XMLScan stops at entity declarations (no "billion laughs" expansion).
+    @Test func xmlScanStopsAtEntityDeclarations() {
+        var plain = 0
+        XMLScan.elements(in: Data("<d><e/></d>".utf8)) { _, _ in plain += 1; return true }
+        #expect(plain == 2)
+        let dtd = "<!ENTITY l0 \"ha\">" + (1...9).map { "<!ENTITY l\($0) \"" + String(repeating: "&l\($0 - 1);", count: 10) + "\">" }.joined()
+        var bomb = 0
+        XMLScan.elements(in: Data("<?xml version=\"1.0\"?><!DOCTYPE d [\(dtd)]><d>&l9;</d>".utf8)) { _, _ in bomb += 1; return true }
+        #expect(bomb == 0)
     }
 
     @Test func garbageFileIsUnreadable() async throws {
