@@ -352,6 +352,36 @@ struct SlideCacheTests {
         for k in keys { #expect(cache.slideCount(for: k) == nil) }
     }
 
+    /// Audit 2026-11-15: beyond the size limit the least recently used entries go first; `.tmp` folders stay.
+    @Test func pruneBySizeRemovesLeastRecentlyUsedFirst() throws {
+        let keys = (0..<4).map { key("/tmp/gross\($0).pptx") }
+        for (i, k) in keys.enumerated() {
+            try cache.store([makeImage(width: 400, height: 400)], for: k)
+            try setFolderDate(k, daysAgo: Double(10 - i))     // keys[0] is the oldest
+        }
+        let open = try cache.beginEntry(for: key("/tmp/offen.pptx"))
+        try open.append(makeImage(width: 10, height: 10))
+        let sizes = try keys.map { k -> Int in
+            let folder = root.appendingPathComponent(k.id, isDirectory: true)
+            return try FileManager.default.contentsOfDirectory(atPath: folder.path).reduce(0) { sum, f in
+                sum + (try FileManager.default.attributesOfItem(atPath: folder.appendingPathComponent(f).path)[.size] as? Int ?? 0)
+            }
+        }
+        // Room for the two newest entries only.
+        #expect(try cache.prune(keepingAtMostBytes: sizes[2] + sizes[3]) == 2)
+        #expect(cache.slideCount(for: keys[0]) == nil)
+        #expect(cache.slideCount(for: keys[1]) == nil)
+        #expect(cache.slideCount(for: keys[2]) == 1)
+        #expect(cache.slideCount(for: keys[3]) == 1)
+        try open.commit()
+        #expect(cache.slideCount(for: key("/tmp/offen.pptx")) == 1)
+        #expect(try cache.prune(keepingAtMostBytes: Int.max) == 0)
+    }
+
+    @Test func pruneBySizeOnMissingRootIsNoOp() throws {
+        #expect(try cache.prune(keepingAtMostBytes: 0) == 0)
+    }
+
     @Test func pruneByAgeOnMissingRootIsNoOp() throws {
         #expect(try cache.prune(notUsedSince: Date()) == 0)
     }

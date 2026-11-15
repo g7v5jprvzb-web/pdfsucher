@@ -151,6 +151,39 @@ public final class SlideCache: Sendable {
         return removed
     }
 
+    /// Removes the least recently used entries (oldest folder date first, as `prune(notUsedSince:)` reads it) until
+    /// the complete entries together take at most `maxBytes` (audit 2026-11-15: the age limit alone let the cache grow
+    /// without bound for 180 days). Skips `.tmp` folders like `prune(notUsedSince:)`, with the same race. Returns how
+    /// many; continues past a failing item and rethrows the first error at the end.
+    @discardableResult
+    public func prune(keepingAtMostBytes maxBytes: Int) throws -> Int {
+        let fm = FileManager.default
+        var entries: [(url: URL, date: Date, bytes: Int)] = []
+        for name in try existingNames() where !name.hasSuffix(".tmp") {
+            let url = root.appendingPathComponent(name, isDirectory: true)
+            let date = ((try? fm.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date) ?? .distantPast
+            let files = (try? fm.contentsOfDirectory(atPath: url.path)) ?? []
+            let bytes = files.reduce(0) { sum, file in
+                sum + (((try? fm.attributesOfItem(atPath: url.appendingPathComponent(file).path))?[.size] as? Int) ?? 0)
+            }
+            entries.append((url, date, bytes))
+        }
+        var total = entries.reduce(0) { $0 + $1.bytes }
+        var removed = 0
+        var firstError: Error?
+        for entry in entries.sorted(by: { $0.date < $1.date }) where total > maxBytes {
+            do {
+                try fm.removeItem(at: entry.url)
+                total -= entry.bytes
+                removed += 1
+            } catch {
+                firstError = firstError ?? error
+            }
+        }
+        if let firstError { throw firstError }
+        return removed
+    }
+
     /// Removes `.tmp` folders of writers that crashed or were killed (1.3 Teil B, app start): those whose folder
     /// date is before `cutoff`. An open writer's folder changes with every `append` (a new file in it), so a young
     /// one — a writer still working, possibly in another process — is never touched; the app passes a day.

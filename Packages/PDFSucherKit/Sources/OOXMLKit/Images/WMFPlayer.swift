@@ -105,7 +105,8 @@ private struct WMFParser {
             record(fn, off..<(off + 2 * words))
             off += 2 * words
         }
-        program.cost = program.records.count * 64 + r.b.count
+        // `+=`: the bitmaps were counted while parsing (see EMFPlayer.run).
+        program.cost += program.records.count * 64 + r.b.count
     }
 
     private mutating func add(_ rec: GDIRecord) { program.records.append(rec) }

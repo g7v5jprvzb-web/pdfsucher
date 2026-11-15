@@ -357,7 +357,7 @@ struct WordPageSetup {
     /// From the package of a `.docx`/`.docm`/`.dotx`: the main document part named in `_rels/.rels`
     /// (default `word/document.xml`). Nil when the package or part can't be read or has no usable page size.
     init?(package url: URL) {
-        guard let archive = try? ZipArchive(url: url) else { return nil }
+        guard let archive = try? ZipArchive(officePackage: url) else { return nil }
         var part = "word/document.xml"
         if let rels = archive.data(at: "_rels/.rels") {
             XMLScan.elements(in: rels) { name, attributes in

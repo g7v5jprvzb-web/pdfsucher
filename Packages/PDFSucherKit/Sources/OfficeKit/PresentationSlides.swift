@@ -4,6 +4,7 @@
 import CoreGraphics
 import Foundation
 import IndexKit
+import OOXMLKit
 
 enum PresentationSlides {
     /// One entry of `p:sldIdLst`, in presentation order.
@@ -28,7 +29,7 @@ enum PresentationSlides {
     static func slides(of url: URL) throws -> [Slide] {
         let unreadable = LayoutSourceError.unreadable(url, reason: unreadableReason)
         let archive: ZipArchive
-        do { archive = try ZipArchive(url: url) } catch is ZipArchive.Failure { throw unreadable }
+        do { archive = try ZipArchive(officePackage: url) } catch is ZipError { throw unreadable }
         guard let presentation = archive.data(at: "ppt/presentation.xml") else { throw unreadable }
         let relationships = archive.data(at: "ppt/_rels/presentation.xml.rels").map(Self.relationships) ?? [:]
         let first = firstSlideNumber(inPresentationXML: presentation)
@@ -48,7 +49,7 @@ enum PresentationSlides {
     /// The slide size from `p:sldSz` in points (EMU / 12 700), `defaultSlideSize` when the presentation has none (or
     /// an unusable one). Nil when the file is not a readable presentation package. Reads the link target.
     static func slideSize(of url: URL) -> CGSize? {
-        guard let archive = try? ZipArchive(url: url.resolvingSymlinksInPath()),
+        guard let archive = try? ZipArchive(officePackage: url.resolvingSymlinksInPath()),
               let presentation = archive.data(at: "ppt/presentation.xml") else { return nil }
         var size = defaultSlideSize
         XMLScan.elements(in: presentation) { name, attributes in
