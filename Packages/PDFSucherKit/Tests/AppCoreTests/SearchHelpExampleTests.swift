@@ -1,3 +1,4 @@
+import OfficeKit
 import Foundation
 import Testing
 import TestSupport
@@ -30,8 +31,8 @@ struct SearchHelpExampleTests {
         let settings = makeSettings()
         settings.partialWords = example.partialWords
         let model = AppModel(settings: settings, defaults: UserDefaults(suiteName: "Help-\(UUID().uuidString)")!,
-                             environment: FakeEnvironment(), debounce: .zero,
-                             openIndex: { try FolderIndex.shared(root: $0, indexURL: indexURL) })
+                             environment: FakeEnvironment(), slideCache: testSlideCache, debounce: .zero,
+                             openIndex: { try FolderIndex.shared(root: $0, indexURL: indexURL, slideCache: testSlideCache) }, officeRendering: PowerPointDisplaySetting())
         await model.open(folder: folder)
         await model.waitUntilIdle()
         model.queryText = example.query

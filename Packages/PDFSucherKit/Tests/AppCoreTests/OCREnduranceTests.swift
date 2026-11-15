@@ -2,6 +2,7 @@ import AppKit
 import Darwin
 import Foundation
 import IndexKit
+import OfficeKit
 import Testing
 import TestSupport
 import ViewerUI
@@ -95,7 +96,7 @@ struct OCREnduranceTests {
         let reopen = clock.now - t2
         #expect(await model!.ocrCounts(for: root).map { $0 == full } == true)
         #expect(reopen < .seconds(10), "restart recognized again: \(Self.ms(reopen))")
-        let again = try await FolderIndex(root: root.standardizedFileURL, indexURL: indexURL).recognize { _ in }
+        let again = try await FolderIndex(root: root.standardizedFileURL, indexURL: indexURL, slideCache: testSlideCache).recognize { _ in }
         #expect(again.recognized == 0)
         model!.queryText = "quittung"
         await model!.waitForSearch()
@@ -124,8 +125,8 @@ struct OCREnduranceTests {
     }
 
     private static func makeModel(defaults: UserDefaults, indexURL: URL) -> AppModel {
-        AppModel(settings: GridSettings(defaults: defaults), defaults: defaults, environment: QuietEnvironment(), debounce: .zero,
-                 openIndex: { try FolderIndex(root: $0.standardizedFileURL, indexURL: indexURL) })
+        AppModel(settings: GridSettings(defaults: defaults), defaults: defaults, environment: QuietEnvironment(), slideCache: testSlideCache, debounce: .zero,
+                 openIndex: { try FolderIndex(root: $0.standardizedFileURL, indexURL: indexURL, slideCache: testSlideCache) }, officeRendering: PowerPointDisplaySetting())
     }
 
     private static func waitUntilCurrent(_ model: AppModel) async throws {
@@ -160,5 +161,6 @@ struct OCREnduranceTests {
     func chooseSaveLocation(defaultName: String) -> URL? { nil }
     func runPrint(_ operation: NSPrintOperation) {}
     func openInPreview(_ url: URL) {}
+    func openWithDefaultApp(_ url: URL) {}
     func confirmDeleteIndex(question: String) -> Bool { false }
 }

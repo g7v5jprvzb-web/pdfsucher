@@ -96,7 +96,7 @@ public enum SearchHelp {
             let note = shortcut.keyboardShortcut == nil ? " (außerhalb des Suchfelds)" : ""
             lines.append("\(shortcut.display): \(action.title)\(note)")
         }
-        lines.append("Pfeiltasten: zwischen den Seiten wechseln · Tab: " + (k.tabSkipsSearch ? "Vorschau ↔ Trefferraster" : "Suchfeld → Vorschau → Trefferraster"))
+        lines.append("Pfeiltasten: zwischen den Seiten wechseln · " + k.tabOrderText())
         return lines
     }
 

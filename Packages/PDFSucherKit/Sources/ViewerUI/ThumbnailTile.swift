@@ -1,5 +1,6 @@
 // ThumbnailTile.swift — Task 4.3
 import AppKit
+import IndexKit
 import OutputKit
 import SearchKit
 import SwiftUI
@@ -9,6 +10,8 @@ import os
 /// (Chris, Task 5.6), on a material background so they stay readable over the page.
 struct ThumbnailTile: View {
     let ref: PageRef
+    /// PDF, image, Word or PowerPoint (1.3 Teil B): badge, placeholder, tooltip and reload follow it.
+    let kind: DocumentKind
     let size: CGSize
     let isSelected: Bool
     let isFocused: Bool
@@ -20,21 +23,62 @@ struct ThumbnailTile: View {
     var highlightColor: RGBA = .yellow
     /// Text and word boxes of an OCR page (spec 1.2 §5): the marks are drawn from them.
     var ocrText: (@MainActor (PageRef) async -> OCRPageText?)?
+    /// `ViewerModel.layoutRevision`; only Word/PowerPoint tiles load again when it rises (pass 0 for the rest, so
+    /// their rows do not observe it).
+    var layoutRevision = 0
+    /// `ViewerModel.foreignPagesRevision`: another page provider reloads every Word/PowerPoint tile (pass 0 for the
+    /// rest, so their rows do not observe it).
+    var pagesRevision = 0
+    /// Pages of the tile's document (`DocumentHit.pageCount`); > 0 means laid out for Word/PowerPoint.
+    var documentPageCount = 0
+    /// Called when this tile shows „Vorschau wird vorbereitet …“ although its document has pages
+    /// (`reportsSlidesMissing`): a laid-out PowerPoint whose slide picture is not in the slide cache.
+    var onSlidesMissing: (() -> Void)?
     let onToggle: () -> Void
     let onFocus: () -> Void
     let onOpen: () -> Void
 
-    private enum Phase: Equatable { case loading, image(NSImage), missing, unavailable }
+    /// `preparing`: a Word/PowerPoint page without a picture yet (not laid out, slide not cached).
+    enum Phase: Equatable { case loading, image(NSImage), missing, unavailable, preparing }
     @State private var phase = Phase.loading
     @State private var recognized = false
 
-    /// „Texterkennung“ on a PDF page whose text was recognized (images are recognized as a whole).
-    nonisolated static func showsOCRBadge(isImage: Bool, ocr: OCRPageText?) -> Bool { !isImage && ocr != nil }
+    /// „Texterkennung“ on a PDF page whose text was recognized (images are recognized as a whole; the stored text
+    /// of Word/PowerPoint pages comes from the layout, not from recognition – Review Focus 1).
+    nonisolated static func showsOCRBadge(kind: DocumentKind, ocr: OCRPageText?) -> Bool { kind == .pdf && ocr != nil }
 
-    private struct LoadID: Equatable {
+    /// What a tile without a picture shows: file gone, a Word/PowerPoint page still being prepared, or unavailable.
+    nonisolated static func placeholderPhase(kind: DocumentKind, fileExists: Bool) -> Phase {
+        guard fileExists else { return .missing }
+        return kind.isOffice ? .preparing : .unavailable
+    }
+
+    /// A PowerPoint with pages (laid out) whose tile has no picture: its slide cache entry is missing (Task 9).
+    nonisolated static func reportsSlidesMissing(kind: DocumentKind, pageCount: Int, phase: Phase) -> Bool {
+        kind == .powerpoint && pageCount > 0 && phase == .preparing
+    }
+
+    struct LoadID: Equatable {
         let ref: PageRef
         let width: Int, height: Int
         let highlightKey: String
+        /// Layout revision of a Word/PowerPoint tile still waiting for its picture (0 otherwise): newly laid-out
+        /// pages and slides load then. A tile showing its picture keeps it (a changed file gets a new key via its stamp).
+        let layoutRevision: Int
+        /// Page provider revision of a Word/PowerPoint tile (0 otherwise), also when it shows its picture.
+        let pagesRevision: Int
+    }
+
+    static func loadID(ref: PageRef, size: CGSize, highlightKey: String, kind: DocumentKind, layoutRevision: Int,
+                       pagesRevision: Int = 0, showsImage: Bool = false) -> LoadID {
+        LoadID(ref: ref, width: round10(size.width), height: round10(size.height), highlightKey: highlightKey,
+               layoutRevision: kind.isOffice && !showsImage ? layoutRevision : 0,
+               pagesRevision: kind.isOffice ? pagesRevision : 0)
+    }
+
+    private var showsImage: Bool {
+        if case .image = phase { return true }
+        return false
     }
 
     var body: some View {
@@ -82,7 +126,7 @@ struct ThumbnailTile: View {
             .contentShape(Rectangle())
             .onTapGesture(count: 2, perform: onOpen)
             .simultaneousGesture(TapGesture().onEnded(onFocus))
-            .help("Klick: groß anzeigen · Doppelklick: in Vorschau öffnen")
+            .help(ViewerText.tileHelp(kind: kind))
             // After the gestures, so a click on the tick does not also count as a click on the page.
             .overlay(alignment: .topLeading) {
                 Toggle(isOn: Binding(get: { isSelected }, set: { _ in onFocus(); onToggle() })) {
@@ -101,9 +145,11 @@ struct ThumbnailTile: View {
             .clipped()          // very narrow fixed-mode tiles: the label must not cover the next tile
             .contentShape(Rectangle())   // and its hidden part must not take clicks between the tiles
             .frame(width: max(size.width, 1))
-            .task(id: LoadID(ref: ref, width: Self.round10(size.width), height: Self.round10(size.height),
-                             highlightKey: highlightRanges == nil ? ""
-                                : highlightKey + "|" + highlightColor.key + "|" + "\(HighlightGeometry.style(forTileWidth: size.width))")) {
+            .task(id: Self.loadID(ref: ref, size: size,
+                                  highlightKey: highlightRanges == nil ? ""
+                                    : highlightKey + "|" + highlightColor.key + "|" + "\(HighlightGeometry.style(forTileWidth: size.width))",
+                                  kind: kind, layoutRevision: layoutRevision, pagesRevision: pagesRevision,
+                                  showsImage: showsImage)) {
                 await load()
             }
             .onDisappear { phase = .loading }   // drop the bitmap when scrolled away; the cache keeps a bounded copy
@@ -113,7 +159,7 @@ struct ThumbnailTile: View {
             // The keyboard focus (arrow keys, space ticks) is otherwise only a border.
             .accessibilityAddTraits(isFocused ? .isSelected : [])
             .accessibilityAction(named: "Groß anzeigen", onFocus)
-            .accessibilityAction(named: "In Vorschau öffnen", onOpen)
+            .accessibilityAction(named: Text(ViewerText.openOriginal(kind: kind)), onOpen)
             .accessibilityAction(named: isSelected ? "Häkchen entfernen" : "Häkchen setzen", onToggle)
     }
 
@@ -133,6 +179,8 @@ struct ThumbnailTile: View {
             placeholder(ViewerText.tilePlaceholder(fileExists: false, folderUnreachable: folderUnreachable), symbol: "doc.questionmark")
         case .unavailable:
             placeholder(ViewerText.tilePlaceholder(fileExists: true, folderUnreachable: folderUnreachable), symbol: "exclamationmark.triangle")
+        case .preparing:
+            placeholder(ViewerText.previewPreparing, symbol: "hourglass")
         }
     }
 
@@ -166,14 +214,16 @@ struct ThumbnailTile: View {
             let waited = ContinuousClock.now - started
             Self.timing.debug("tile shown after \(waited.components.seconds * 1000 + waited.components.attoseconds / 1_000_000_000_000_000) ms")
         }
-        if highlightRanges == nil { ocr = await ocrText?(ref) }
-        recognized = Self.showsOCRBadge(isImage: ImagePages.isImage(ref.url), ocr: ocr)
+        // Only PDF pages get the badge: no index lookup for images and Word/PowerPoint pages.
+        if highlightRanges == nil, kind == .pdf { ocr = await ocrText?(ref) }
+        recognized = Self.showsOCRBadge(kind: kind, ocr: ocr)
         guard !Task.isCancelled else { return }
         if image == nil {
             let path = ref.url.path
             let exists = await Task.detached { FileManager.default.fileExists(atPath: path) }.value
             guard !Task.isCancelled else { return }
-            phase = exists ? .unavailable : .missing
+            phase = Self.placeholderPhase(kind: kind, fileExists: exists)
+            if Self.reportsSlidesMissing(kind: kind, pageCount: documentPageCount, phase: phase) { onSlidesMissing?() }
         }
     }
 }

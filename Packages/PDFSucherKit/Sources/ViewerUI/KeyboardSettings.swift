@@ -2,17 +2,21 @@
 import Foundation
 import Observation
 
-/// „Tippen sucht sofort“, „Tab überspringt das Suchfeld“ and the chosen shortcuts, persisted.
+/// „Tippen sucht sofort“, the Tab stops and the chosen shortcuts, persisted.
 @MainActor @Observable public final class KeyboardSettings {
     enum Key {
         static let typeToSearch = "search.typeToSearch"
-        static let tabSkipsSearch = "keyboard.tabSkipsSearch"
+        static let tabIncludesSearch = "keyboard.tabIncludesSearch"
+        static let tabIncludesPreview = "keyboard.tabIncludesPreview"
+        /// Up to 1.3.3: „Tab überspringt das Suchfeld“; only read once for the migration.
+        static let legacyTabSkipsSearch = "keyboard.tabSkipsSearch"
         static func shortcut(_ action: ShortcutAction) -> String { "shortcuts.\(action.rawValue)" }
     }
 
     @ObservationIgnored private let defaults: UserDefaults
     private var storedTypeToSearch: Bool
-    private var storedTabSkipsSearch: Bool?
+    private var storedTabIncludesSearch: Bool
+    private var storedTabIncludesPreview: Bool
     private var shortcuts: [ShortcutAction: KeyShortcut]
     /// Set when switching on „Tippen sucht sofort“ put single-key shortcuts back to their defaults.
     public var lastResetNotice: String?
@@ -20,7 +24,14 @@ import Observation
     public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         storedTypeToSearch = defaults.object(forKey: Key.typeToSearch) == nil ? true : defaults.bool(forKey: Key.typeToSearch)
-        storedTabSkipsSearch = defaults.object(forKey: Key.tabSkipsSearch) == nil ? nil : defaults.bool(forKey: Key.tabSkipsSearch)
+        if defaults.object(forKey: Key.tabIncludesSearch) != nil {
+            storedTabIncludesSearch = defaults.bool(forKey: Key.tabIncludesSearch)
+        } else {
+            // Migration: „Tab überspringt das Suchfeld“ explicitly off meant Tab reached the search field.
+            storedTabIncludesSearch = defaults.object(forKey: Key.legacyTabSkipsSearch) != nil
+                && !defaults.bool(forKey: Key.legacyTabSkipsSearch)
+        }
+        storedTabIncludesPreview = defaults.bool(forKey: Key.tabIncludesPreview)
         shortcuts = [:]
         // Each stored shortcut must still pass the rules against the ones loaded before it; else the default.
         for action in ShortcutAction.allCases {
@@ -44,10 +55,22 @@ import Observation
         }
     }
 
-    /// Spec §9: Tab moves only between preview and grid. Default follows „Tippen sucht sofort“ until set.
-    public var tabSkipsSearch: Bool {
-        get { storedTabSkipsSearch ?? storedTypeToSearch }
-        set { storedTabSkipsSearch = newValue; defaults.set(newValue, forKey: Key.tabSkipsSearch) }
+    /// „Tab erreicht auch das Suchfeld“ (default off: Tab goes between folder bar and grid).
+    public var tabIncludesSearch: Bool {
+        get { storedTabIncludesSearch }
+        set { storedTabIncludesSearch = newValue; defaults.set(newValue, forKey: Key.tabIncludesSearch) }
+    }
+
+    /// „Tab erreicht auch die Vorschau“ (default off).
+    public var tabIncludesPreview: Bool {
+        get { storedTabIncludesPreview }
+        set { storedTabIncludesPreview = newValue; defaults.set(newValue, forKey: Key.tabIncludesPreview) }
+    }
+
+    /// „Tab: Ordner → Kacheln“ with the folder bar shown (`folderBarVisible`).
+    public func tabOrderText(folderBarVisible: Bool = true) -> String {
+        KeyRouting.tabOrderText(KeyRouting.tabStops(includesSearch: tabIncludesSearch, includesPreview: tabIncludesPreview,
+                                                    folderBarVisible: folderBarVisible))
     }
 
     public func shortcut(for action: ShortcutAction) -> KeyShortcut { shortcuts[action] ?? action.defaultShortcut }

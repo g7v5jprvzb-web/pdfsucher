@@ -6,8 +6,11 @@ import PDFKit
 @MainActor public enum Printer {
     /// A print operation for the merged pages; run it (e.g. `runModal(for:…)`) to show the macOS print dialog.
     /// The caller may set `jobTitle` (e.g. from `DefaultFileName`, without ".pdf") for "Save as PDF".
-    public static func printOperation(for refs: [PageRef]) throws -> NSPrintOperation {
-        printOperation(for: try Merger().makeDocument(refs))
+    /// Merges on the main actor: fine for a few PDF pages, but with Office pages (`foreign`: Word layout, slide
+    /// decoding) build the document with `PrintDocument.build(_:foreign:)` in a background task and pass it to
+    /// `printOperation(for: document)` instead.
+    public static func printOperation(for refs: [PageRef], foreign: (any ForeignPageProvider)? = nil) throws -> NSPrintOperation {
+        printOperation(for: try Merger(foreign: foreign).makeDocument(refs))
     }
 
     /// A print operation for an already merged document (built off the main actor, see `PrintDocument`).
@@ -37,7 +40,7 @@ public struct PrintDocument: @unchecked Sendable {
     public let document: PDFDocument
 
     /// Merges `refs` (call off the main actor; throws like `Merger.makeDocument`).
-    public static func build(_ refs: [PageRef]) throws -> PrintDocument {
-        PrintDocument(document: try Merger().makeDocument(refs))
+    public static func build(_ refs: [PageRef], foreign: (any ForeignPageProvider)? = nil) throws -> PrintDocument {
+        PrintDocument(document: try Merger(foreign: foreign).makeDocument(refs))
     }
 }

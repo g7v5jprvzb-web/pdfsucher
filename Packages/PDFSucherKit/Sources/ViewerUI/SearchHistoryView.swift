@@ -9,9 +9,10 @@ struct HistoryButton: View {
 
     var body: some View {
         Button { shows.toggle() } label: {
-            Image(systemName: "chevron.down.circle").foregroundStyle(.secondary)
+            Image(systemName: "chevron.down.circle")
         }
-        .buttonStyle(.borderless)
+        .buttonStyle(FieldIconButtonStyle())
+        .disabled(model.searchHistory.entries.isEmpty)      // grey only when there is nothing to show (1.2.4)
         .help("Letzte Suchbegriffe (⌥↓)")
         .accessibilityLabel(ViewerText.historyTitle)
         .accessibilityIdentifier("searchHistoryButton")

@@ -13,14 +13,16 @@ import Foundation
 /// Dedicated threads, not the cooperative pool: page drawing blocks for up to a few hundred ms per
 /// scanned page and must neither starve nor be starved by indexing and text recognition.
 final class TileRenderQueue: @unchecked Sendable {
-    enum Priority: Int, Comparable {
-        case prefetch, visible
+    /// `preview`: pictures of the large preview's neighbouring pages (1.3.4), after the visible tiles, before tiles
+    /// rendered ahead.
+    enum Priority: Int, Comparable, Sendable {
+        case prefetch, preview, visible
         static func < (a: Priority, b: Priority) -> Bool { a.rawValue < b.rawValue }
     }
 
     /// A job's identity: any Sendable key (wrapping it keeps the Sendable check of the closures).
     struct Key: Hashable, @unchecked Sendable {
-        private let base: AnyHashable
+        let base: AnyHashable
         init(_ base: some Hashable & Sendable) { self.base = AnyHashable(base) }
     }
 
@@ -55,7 +57,9 @@ final class TileRenderQueue: @unchecked Sendable {
     private var jobs: [Key: Job] = [:]      // pending or running
     private var nextSeq: UInt64 = 0
     private var nextWaiter: UInt64 = 0
-    private(set) var startedCount = 0
+    private var started = 0
+    /// Jobs started so far (tests, benchmark), read under the lock.
+    var startedCount: Int { condition.withLock { started } }
 
     init(workers: Int, maxPrefetch: Int = 64) {
         self.workers = max(workers, 1)
@@ -120,6 +124,18 @@ final class TileRenderQueue: @unchecked Sendable {
         condition.withLock { _ = enqueue(key: Key(key), priority: .prefetch, work: work) }
     }
 
+    /// Removes waiting prefetch jobs (no caller waits for them) whose key matches: a new prefetch batch
+    /// replaces the old one (spec 1.2.4 §2). Jobs already running finish.
+    func dropWaitingPrefetches(matching: (Key) -> Bool) {
+        condition.withLock {
+            let drop = pending.filter { $0.priority == .prefetch && $0.waiters.isEmpty && matching($0.key) }
+            guard !drop.isEmpty else { return }
+            let ids = Set(drop.map { ObjectIdentifier($0) })
+            pending.removeAll { ids.contains(ObjectIdentifier($0)) }
+            for job in drop { jobs.removeValue(forKey: job.key) }
+        }
+    }
+
     /// Number of jobs waiting (tests).
     var pendingCount: Int { condition.withLock { pending.count } }
 
@@ -163,7 +179,7 @@ final class TileRenderQueue: @unchecked Sendable {
             }
             let job = pending.remove(at: best)
             job.started = true
-            startedCount += 1
+            started += 1
             condition.unlock()
 
             let image = autoreleasepool { job.work() }

@@ -90,6 +90,14 @@ public enum FocusNavigator {
         return PageRef(url: hit.url, pageIndex: nearest.pageIndex)
     }
 
+    /// The page a search shows by itself (1.3.3): the first hit page of the first document with tiles, in grid
+    /// order (the order of `pageHits`); a document found only by its name shows its first page. Tiles do not
+    /// depend on „Alle Seiten“ here: with it on, page 1 may be no hit.
+    public static func firstHit(in hits: [DocumentHit]) -> PageRef? {
+        guard let hit = hits.first(where: { RowPages.count(for: $0, showAll: false) > 0 }) else { return nil }
+        return PageRef(url: hit.url, pageIndex: hit.pageHits.first?.pageIndex ?? 0)
+    }
+
     private static func firstTile(_ hits: [DocumentHit]) -> PageRef? {
         hits.firstIndex { RowPages.count(for: $0, showAll: false) > 0 }.map { ref(hits[$0], 0, false) }
     }

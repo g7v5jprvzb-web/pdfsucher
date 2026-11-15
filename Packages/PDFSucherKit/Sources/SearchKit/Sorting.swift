@@ -11,7 +11,9 @@ public func sortHits(_ hits: [DocumentHit], by mode: SortMode) -> [DocumentHit] 
             primary = compareDescending(a.totalMatches, b.totalMatches)
                 .then(natural(a.fileName, b.fileName))
         case .relevance:
-            primary = compareDescending(a.relevance, b.relevance)
+            // Spec 1.3.2 §3: hits in the file name before hits in the content only.
+            primary = compareDescending(a.nameMatch ? 1 : 0, b.nameMatch ? 1 : 0)
+                .then(compareDescending(a.relevance, b.relevance))
         case .modifiedDate:
             primary = compareDescending(a.modifiedAt, b.modifiedAt)
         case .fileName:

@@ -14,7 +14,10 @@ struct KeyInput: Equatable {
 /// Where the key press happens.
 struct KeyContext {
     let typeToSearch: Bool
-    let tabSkipsSearch: Bool
+    /// Tab also stops at the search field (Einstellungen → Tastatur; default off).
+    let tabIncludesSearch: Bool
+    /// Tab also stops at the preview (Einstellungen → Tastatur; default off).
+    let tabIncludesPreview: Bool
     /// Keyboard focus in the main window; nil = none of the three areas.
     let focus: FocusArea?
     /// A text field other than the search field has the focus.
@@ -31,6 +34,10 @@ struct KeyContext {
     /// No SwiftUI area is focused but an AppKit control or the PDF view has the keyboard and uses arrows
     /// itself (Full Keyboard Access on a toolbar control, a click into the preview; review I4).
     var responderTakesArrows = false
+    /// The folder bar's list has the keyboard (Ordnerleiste).
+    var folderTreeFocused = false
+    /// The folder bar is shown: its list is a Tab stop (computed for Tab only).
+    var folderBarVisible = false
     let shortcuts: [ShortcutAction: KeyShortcut]
 }
 
@@ -45,6 +52,8 @@ enum KeyDecision: Equatable {
     case navigate(FocusNavigator.Direction)
     /// ⌥↓ in the search field: the list of recent search terms (1.2.2 §1).
     case showHistory
+    /// Tab into the folder bar's list (an AppKit view: the monitor makes it first responder).
+    case focusFolderTree
 }
 
 /// What a key press does (pure; the monitor applies it). Rules: spec 1.1 §7, §9, §10.
@@ -73,7 +82,21 @@ enum KeyRouting {
         // After the chosen shortcuts, so one put on ⌥↓ still works (review M7).
         if s.key == "down", s.modifiers == .option, inSearch { return .showHistory }
         if s.key == "tab", s.modifiers.isSubset(of: .shift), !context.fullKeyboardAccess {
-            return .moveFocus(nextFocus(from: context.focus, backwards: s.modifiers.contains(.shift), skipSearch: context.tabSkipsSearch))
+            let stops = tabStops(includesSearch: context.tabIncludesSearch, includesPreview: context.tabIncludesPreview,
+                                 folderBarVisible: context.folderBarVisible)
+            let current: TabStop? = switch context.focus {
+            case .search: .search
+            case .grid: .grid
+            case .preview: .preview
+            case nil: context.folderTreeFocused ? .folders : nil
+            }
+            guard let current else { return .moveFocus(.grid) }
+            switch nextStop(from: current, in: stops, backwards: s.modifiers.contains(.shift)) {
+            case .folders: return .focusFolderTree
+            case .search: return .moveFocus(.search)
+            case .grid: return .moveFocus(.grid)
+            case .preview: return .moveFocus(.preview)
+            }
         }
         if let direction = Self.arrows[s.key] {
             // 1.2.1: arrows reach the grid from the search field too (first start: nothing had moved the
@@ -121,18 +144,46 @@ enum KeyRouting {
         return false
     }
 
-    static func nextFocus(from focus: FocusArea?, backwards: Bool, skipSearch: Bool) -> FocusArea {
-        if skipSearch {
-            switch focus {
-            case .grid: return .preview
-            case .preview: return .grid
-            case .search: return backwards ? .preview : .grid
-            case nil: return .grid
+    /// A place Tab can stop at, in the fixed order Suchfeld → Ordner → Kacheln → Vorschau.
+    enum TabStop: CaseIterable, Equatable { case search, folders, grid, preview }
+
+    /// The Tab cycle: the grid always; the folder bar while shown; search field and preview when switched on.
+    /// Fewer than two stops (folder bar hidden, nothing switched on): the preview joins, so Tab never does nothing.
+    static func tabStops(includesSearch: Bool, includesPreview: Bool, folderBarVisible: Bool) -> [TabStop] {
+        var stops = TabStop.allCases.filter { stop in
+            switch stop {
+            case .search: includesSearch
+            case .folders: folderBarVisible
+            case .grid: true
+            case .preview: includesPreview
             }
         }
-        let order: [FocusArea] = [.search, .preview, .grid]
-        guard let focus, let i = order.firstIndex(of: focus) else { return backwards ? .grid : .search }
-        return order[(i + (backwards ? order.count - 1 : 1)) % order.count]
+        if stops.count < 2 { stops.append(.preview) }
+        return stops
+    }
+
+    /// The next stop after `current`; a place outside the cycle (e.g. a click into the preview) goes on to the
+    /// next stop of the cycle in the fixed order (backwards with ⇧Tab).
+    static func nextStop(from current: TabStop, in stops: [TabStop], backwards: Bool) -> TabStop {
+        let order = TabStop.allCases
+        let step = backwards ? order.count - 1 : 1
+        var i = order.firstIndex(of: current)!
+        repeat {
+            i = (i + step) % order.count
+        } while !stops.contains(order[i])
+        return order[i]
+    }
+
+    /// „Tab: Suchfeld → Ordner → Kacheln → Vorschau“ (settings, help).
+    static func tabOrderText(_ stops: [TabStop]) -> String {
+        "Tab: " + stops.map { stop in
+            switch stop {
+            case .search: "Suchfeld"
+            case .folders: "Ordner"
+            case .grid: "Kacheln"
+            case .preview: "Vorschau"
+            }
+        }.joined(separator: " → ")
     }
 
     private static func isControl(_ u: Unicode.Scalar) -> Bool {

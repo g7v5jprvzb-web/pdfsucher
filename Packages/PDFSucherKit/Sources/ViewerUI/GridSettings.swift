@@ -1,6 +1,7 @@
 // GridSettings.swift — Task 4.1
 import CoreGraphics
 import Foundation
+import IndexKit
 import Observation
 import SearchKit
 
@@ -32,6 +33,9 @@ public enum PreviewPosition: String, CaseIterable, Sendable {
         static let columns = "grid.columns"
         static let sort = "grid.sort"
         static let partialWords = "search.partialWords"
+        static let searchFileNames = "search.fileNames"
+        static let previewFollowsZoom = "preview.followsZoom"
+        static let previewZoomBeyondWidth = "preview.zoomBeyondWidth"
         static let columnsMode = "grid.columnsMode"
         static let debounceMs = "search.debounceMs"
         static let headerFontSize = "grid.headerFontSize"
@@ -42,9 +46,45 @@ public enum PreviewPosition: String, CaseIterable, Sendable {
         static let addSourcesPolicy = "sources.addPolicy"
         static let toolbarFontSize = "toolbar.fontSize"
         static let mainWindowFrame = "window.main.frame"
-        static let settingsWindowOrigin = "window.settings.origin"
+        static let settingsWindowFrame = "window.settings.frame"
         static let settingsTab = "settings.tab"
+        static let fileKinds = "filter.kinds"
         static func split(_ position: PreviewPosition) -> String { "layout.split.\(position.rawValue)" }
+    }
+
+    // MARK: 1.3 §8a file type filter
+
+    /// The kinds of the „Dateitypen“ menu, in menu order.
+    nonisolated public static let allFileKinds: [DocumentKind] = [.pdf, .word, .powerpoint, .image]
+
+    /// Kinds shown in the grid (search and browse); never empty. Setting an empty set changes nothing.
+    public var fileKinds: Set<DocumentKind> {
+        get { storedFileKinds }
+        set {
+            guard !newValue.isEmpty, newValue != storedFileKinds else { return }
+            storedFileKinds = newValue
+            defaults.set(Self.allFileKinds.filter(newValue.contains).map(\.rawValue), forKey: Key.fileKinds)
+        }
+    }
+    private var storedFileKinds: Set<DocumentKind>
+
+    /// Ticks or unticks a kind; the last ticked kind stays ticked (no-op).
+    public func toggleFileKind(_ kind: DocumentKind) {
+        if fileKinds.contains(kind) {
+            guard fileKinds.count > 1 else { return }
+            fileKinds.remove(kind)
+        } else {
+            fileKinds.insert(kind)
+        }
+    }
+
+    /// „Alle Dateitypen zeigen“: every kind ticked again.
+    public func showAllFileKinds() { fileKinds = Set(Self.allFileKinds) }
+
+    /// Stored raw values; empty or unknown values → every kind.
+    static func validFileKinds(_ stored: [String]?) -> Set<DocumentKind> {
+        let kinds = Set((stored ?? []).compactMap(DocumentKind.init(rawValue:)))
+        return kinds.isEmpty ? Set(allFileKinds) : kinds
     }
 
     // MARK: 1.2.2 §2 toolbar font
@@ -72,10 +112,10 @@ public enum PreviewPosition: String, CaseIterable, Sendable {
         set { defaults.set(newValue.map(WindowPlacement.format), forKey: Key.mainWindowFrame) }
     }
 
-    /// Top-left corner of the settings window (its size follows the chosen tab).
-    public var settingsWindowOrigin: CGPoint? {
-        get { WindowPlacement.parsePoint(defaults.string(forKey: Key.settingsWindowOrigin)) }
-        set { defaults.set(newValue.map(WindowPlacement.format), forKey: Key.settingsWindowOrigin) }
+    /// Frame of the settings window (1.2.4: resizable; 1.2.1 kept only its corner).
+    public var settingsWindowFrame: CGRect? {
+        get { WindowPlacement.parseFrame(defaults.string(forKey: Key.settingsWindowFrame)) }
+        set { defaults.set(newValue.map(WindowPlacement.format), forKey: Key.settingsWindowFrame) }
     }
 
     /// The settings tab chosen last.
@@ -176,6 +216,9 @@ public enum PreviewPosition: String, CaseIterable, Sendable {
     private var storedColumns: Int
     private var storedSort: SortMode
     private var storedPartialWords: Bool
+    private var storedSearchFileNames: Bool
+    private var storedPreviewFollowsZoom: Bool
+    private var storedPreviewZoomBeyondWidth: Bool
     private var storedColumnsMode: ColumnsMode
     private var storedDebounceMs: Int
 
@@ -220,6 +263,26 @@ public enum PreviewPosition: String, CaseIterable, Sendable {
         set { storedPartialWords = newValue; defaults.set(newValue, forKey: Key.partialWords) }
     }
 
+    /// „Vorschaubreite an Zoom anpassen“ (spec 1.3.2 §12): the preview beside the grid is as wide as the zoomed page,
+    /// at most the width the user set. On by default.
+    public var previewFollowsZoom: Bool {
+        get { storedPreviewFollowsZoom }
+        set { storedPreviewFollowsZoom = newValue; defaults.set(newValue, forKey: Key.previewFollowsZoom) }
+    }
+
+    /// „Zoom über die Fensterbreite hinaus erlauben“ (spec 1.3.2 §11): off by default, the page width is the largest
+    /// zoom then.
+    public var previewZoomBeyondWidth: Bool {
+        get { storedPreviewZoomBeyondWidth }
+        set { storedPreviewZoomBeyondWidth = newValue; defaults.set(newValue, forKey: Key.previewZoomBeyondWidth) }
+    }
+
+    /// „Auch Dateinamen durchsuchen“ (spec 1.3.2 §4): the file name counts as well as the content. On by default.
+    public var searchFileNames: Bool {
+        get { storedSearchFileNames }
+        set { storedSearchFileNames = newValue; defaults.set(newValue, forKey: Key.searchFileNames) }
+    }
+
     public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         let has = { (key: String) in defaults.object(forKey: key) != nil }
@@ -227,6 +290,9 @@ public enum PreviewPosition: String, CaseIterable, Sendable {
         storedColumns = Self.clamp(has(Key.columns) ? defaults.integer(forKey: Key.columns) : 5)
         storedSort = defaults.string(forKey: Key.sort).flatMap(SortMode.init(rawValue:)) ?? .matchCount
         storedPartialWords = has(Key.partialWords) ? defaults.bool(forKey: Key.partialWords) : false
+        storedSearchFileNames = has(Key.searchFileNames) ? defaults.bool(forKey: Key.searchFileNames) : true
+        storedPreviewFollowsZoom = has(Key.previewFollowsZoom) ? defaults.bool(forKey: Key.previewFollowsZoom) : true
+        storedPreviewZoomBeyondWidth = defaults.bool(forKey: Key.previewZoomBeyondWidth)
         storedColumnsMode = defaults.string(forKey: Key.columnsMode).flatMap(ColumnsMode.init(rawValue:)) ?? .fixed
         storedDebounceMs = Self.validDebounce(defaults.integer(forKey: Key.debounceMs))
         storedShowAllPages = defaults.bool(forKey: Key.showAllPages)
@@ -236,6 +302,7 @@ public enum PreviewPosition: String, CaseIterable, Sendable {
         zoomLevelFractions = levels?.count == 4 ? levels! : Self.defaultZoomLevels
         storedToolbarFontSize = (defaults.object(forKey: Key.toolbarFontSize) as? NSNumber).map(\.doubleValue)
             .flatMap { ToolbarScale.range.contains($0) ? $0 : nil }
+        storedFileKinds = Self.validFileKinds(defaults.stringArray(forKey: Key.fileKinds))
         storedSettingsTab = defaults.string(forKey: Key.settingsTab).flatMap(SettingsTab.init(rawValue:)) ?? .general
         storedSplits = Dictionary(uniqueKeysWithValues: PreviewPosition.allCases.compactMap { position in
             (defaults.object(forKey: Key.split(position)) as? NSNumber).map { (position, SplitMath.clampFraction($0.doubleValue, for: position)) }

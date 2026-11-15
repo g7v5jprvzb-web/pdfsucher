@@ -1,5 +1,6 @@
 // SearchService.swift — Task 2.3
 import Foundation
+import Synchronization
 import IndexKit
 import os
 
@@ -32,15 +33,24 @@ public struct SearchService: Sendable {
 
     /// - Parameter onPartial: called at most once, during the search, with the documents of the first
     ///   `batchSize` candidate pages that are complete (sorted by `sort`), when more candidates follow.
-    ///   They are a subset of the final result, with the same page hits.
-    public func search(_ q: ParsedQuery, sort: SortMode, batchSize: Int = SearchService.defaultBatchSize,
+    ///   They are a subset of the final result, with the same page hits – except documents found by their name
+    ///   alone so far (spec 1.3.2 §5: names go out with the first early rows), whose content hits may still follow.
+    /// - Parameter searchNames: also the file names (spec 1.3.2 §1): a document matches by its name OR its content.
+    public func search(_ q: ParsedQuery, sort: SortMode, searchNames: Bool = false, batchSize: Int = SearchService.defaultBatchSize,
                        onPartial: (([DocumentHit]) -> Void)? = nil) throws -> [DocumentHit] {
         guard let plan = FTSQueryBuilder.plan(for: q) else { return [] }
+        let stored = try index.documents()
+        // Content only of readable documents; names of every document (Chris, 2026-11-14: unreadable, locked and
+        // not yet read ones too, shown like when browsing).
         var documents: [Int64: StoredDocument] = [:]
-        for doc in try index.documents() where doc.status == .ok {
+        for doc in stored where doc.status == .ok {
             documents[doc.id] = doc
         }
         let matcher = PageMatcher(q)
+        // Names first: a few milliseconds for 10,000 files, so they are in the first early rows too.
+        let names = searchNames ? Self.nameMatches(stored, matcher: matcher) : []
+        let named = names.isEmpty ? [:] : Dictionary(stored.filter { names.contains($0.id) }.map { ($0.id, $0) }) { a, _ in a }
+        let hits = { (checked: [(RawPageMatch, Int)]) in self.withNames(self.hits(from: checked, documents: documents), names, named) }
         var verified: [(RawPageMatch, Int)] = []
         var pending: [RawPageMatch] = []
         var reported = false
@@ -52,7 +62,7 @@ public struct SearchService: Sendable {
                 let complete = pending.filter { $0.docId != lastDoc }
                 pending.removeAll { $0.docId != lastDoc }
                 verified += Self.check(complete, with: matcher)
-                let early = hits(from: verified, documents: documents)
+                let early = hits(verified)
                 if !early.isEmpty {
                     reported = true
                     onPartial(sortHits(early, by: sort))
@@ -77,7 +87,39 @@ public struct SearchService: Sendable {
         }
         if Task.isCancelled { throw CancellationError() }
         verified += Self.check(pending, with: matcher)
-        return sortHits(hits(from: verified, documents: documents), by: sort)
+        return sortHits(hits(verified), by: sort)
+    }
+
+    /// The ids of the documents whose file name (without extension) matches, checked on all cores.
+    static func nameMatches(_ documents: [StoredDocument], matcher: PageMatcher) -> Set<Int64> {
+        let chunkSize = 256
+        let chunks = (documents.count + chunkSize - 1) / chunkSize
+        let found = Mutex<Set<Int64>>([])
+        DispatchQueue.concurrentPerform(iterations: chunks) { c in
+            let slice = documents[(c * chunkSize)..<min(documents.count, (c + 1) * chunkSize)]
+            let ids = slice.filter { matcher.matchCount(in: DocumentHit.searchableName(of: $0.relativePath)) != nil }.map(\.id)
+            if !ids.isEmpty { found.withLock { $0.formUnion(ids) } }
+        }
+        return found.withLock { $0 }
+    }
+
+    /// Content hits marked where the name matches too, plus the documents whose name alone matches (no page
+    /// hits, no matches, relevance 0: the relevance sort puts name hits first by `nameMatch`).
+    private func withNames(_ content: [DocumentHit], _ names: Set<Int64>, _ documents: [Int64: StoredDocument]) -> [DocumentHit] {
+        guard !names.isEmpty else { return content }
+        var byPath: [String: Int64] = [:]
+        for id in names { if let doc = documents[id] { byPath[doc.relativePath] = id } }
+        var result = content.map { hit -> DocumentHit in
+            byPath.removeValue(forKey: hit.relativePath) != nil ? hit.withNameMatch() : hit
+        }
+        for id in byPath.values {
+            guard let doc = documents[id] else { continue }
+            result.append(DocumentHit(url: root.appendingPathComponent(doc.relativePath, isDirectory: false), relativePath: doc.relativePath,
+                                      modifiedAt: doc.modifiedAt, pageHits: [], totalMatches: 0, relevance: 0, sourceRoot: root,
+                                      pageCount: doc.status == .error ? 0 : doc.pageCount, isUnreadable: doc.status == .error,
+                                      kind: doc.kind, isSimplified: doc.isSimplified, nameMatch: true))
+        }
+        return result
     }
 
     /// Verified pages grouped into one hit per document.
@@ -98,7 +140,8 @@ public struct SearchService: Sendable {
                 relevance: -byPage.values.reduce(0) { $0 + $1.bm25 },
                 sourceRoot: root,
                 pageCount: doc.pageCount,
-                isImage: doc.kind == .image)
+                kind: doc.kind,
+                isSimplified: doc.isSimplified)
         }
     }
 

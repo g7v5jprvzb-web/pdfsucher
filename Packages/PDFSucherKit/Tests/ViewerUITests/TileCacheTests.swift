@@ -175,9 +175,10 @@ struct ThumbnailCacheParallelTests {
     }
 
     @Test func highlightsAndOCRAreSeparateDiskTiles() {
-        let a = TileDiskCache.name(for: ["/x.pdf", "0", "q"])
-        #expect(a == TileDiskCache.name(for: ["/x.pdf", "0", "q"]))
-        #expect(a != TileDiskCache.name(for: ["/x.pdf", "0", "r"]))
+        let a = TileDiskCache.name(source: "/x.pdf", parts: ["0", "q"])
+        #expect(a == TileDiskCache.name(source: "/x.pdf", parts: ["0", "q"]))
+        #expect(a != TileDiskCache.name(source: "/x.pdf", parts: ["0", "r"]))
+        #expect(a.folder == TileDiskCache.name(source: "/x.pdf", parts: ["1"]).folder, "one folder per PDF")
     }
 
     @Test func trimKeepsTheLimit() async throws {
@@ -197,7 +198,7 @@ struct ThumbnailCacheParallelTests {
         for i in 0..<3 { _ = await cache.thumbnail(for: PageRef(url: url, pageIndex: i), size: CGSize(width: 100, height: 141)) }
         disk.flush()
         #expect(disk.byteCount > 0)
-        disk.removeAll()
+        await disk.removeAll()
         #expect(disk.byteCount == 0)
         #expect(SettingsView.tileCacheSize(5 << 20).contains("MB"))
     }

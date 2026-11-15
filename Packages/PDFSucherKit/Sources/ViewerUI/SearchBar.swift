@@ -56,13 +56,32 @@ struct HelpButton: View {
 
     var body: some View {
         Button { shows.toggle() } label: {
-            Image(systemName: "questionmark.circle").foregroundStyle(.secondary)
+            Image(systemName: "questionmark.circle")
         }
-        .buttonStyle(.borderless)
+        .buttonStyle(FieldIconButtonStyle())
         .help("Suchhilfe")
         .accessibilityLabel("Suchhilfe")
         .accessibilityIdentifier("searchHelpButton")
         .popover(isPresented: $shows, arrowEdge: .bottom) { SearchHelpView(keyboard: keyboard) }
+    }
+}
+
+/// ⌄ and „?“ in the search field (1.2.4, Chris): full label colour so they look clickable, a light
+/// highlight on hover, a visible press; grey only when disabled.
+struct FieldIconButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+    @State private var hovering = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(isEnabled ? Color(nsColor: .labelColor) : Color(nsColor: .tertiaryLabelColor))
+            .padding(2)
+            .background(Circle().fill(Color(nsColor: .labelColor)
+                .opacity(!isEnabled ? 0 : configuration.isPressed ? 0.22 : hovering ? 0.10 : 0)))
+            .scaleEffect(configuration.isPressed ? 0.9 : 1)
+            .contentShape(Circle())
+            .onHover { hovering = $0 }
+            .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
     }
 }
 
@@ -72,8 +91,9 @@ struct GridControls: View {
 
     var body: some View {
         // 1.2.2 §2: the line wraps instead of cutting anything off (large toolbar font, a narrow window). Further
-        // controls (e.g. a file type filter) go into this flow.
+        // controls go into this flow.
         ToolbarFlow(spacing: 12, lineSpacing: 6) {
+            FileKindsMenu(settings: settings)        // spec 1.3 §8a
             Stepper("Reihen: \(settings.rows)", value: $settings.rows, in: GridSettings.range)
                 .monospacedDigit()
                 .disabled(!settings.rowsApply)

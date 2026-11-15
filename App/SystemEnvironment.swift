@@ -12,7 +12,7 @@ import UniformTypeIdentifiers
         panel.allowsMultipleSelection = true
         panel.allowedContentTypes = SupportedSourceTypes.openPanelTypes      // the one list (1.2.1)
         panel.prompt = "Hinzufügen"
-        panel.message = "Ordner, PDFs und Bilder wählen (mehrere mit ⌘-Klick oder ⇧-Klick; Unterordner werden mit durchsucht)"
+        panel.message = "Ordner, PDFs, Bilder, Word- und PowerPoint-Dateien wählen (mehrere mit ⌘-Klick oder ⇧-Klick; Unterordner werden mit durchsucht)"
         return panel.runModal() == .OK ? panel.urls : []
     }
 
@@ -45,6 +45,12 @@ import UniformTypeIdentifiers
         } else {
             NSWorkspace.shared.open(url)
         }
+    }
+
+    /// Word/PowerPoint originals: whatever app macOS assigns to the file (Pages, Keynote, Office …);
+    /// never launched by bundle id or scripted.
+    func openWithDefaultApp(_ url: URL) {
+        NSWorkspace.shared.open(url)
     }
 
     func confirmDeleteIndex(question: String) -> Bool {

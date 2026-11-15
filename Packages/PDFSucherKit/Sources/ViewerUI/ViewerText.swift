@@ -1,5 +1,6 @@
 // ViewerText.swift — Task 4.3 (German UI copy, kept out of the views so it can be tested)
 import Foundation
+import IndexKit
 import SearchKit
 
 public enum ViewerText {
@@ -32,6 +33,9 @@ public enum ViewerText {
         case .recognizing(let folder, let folders, let done, let total):
             folders > 1 ? "Texterkennung Ordner \(folder)/\(folders): \(number(done))/\(number(total))"
                         : "Texterkennung \(number(done))/\(number(total))"
+        case .layingOut(let folder, let folders, let done, let total):
+            folders > 1 ? "Word/PowerPoint Ordner \(folder)/\(folders): \(number(done))/\(number(total))"
+                        : "Word/PowerPoint \(number(done))/\(number(total))"
         case .upToDate: "Index: aktuell"
         case .problems(let failed, let noText):
             "Index: aktuell" + (failed.isEmpty ? "" : " · " + files(failed.count) + " nicht lesbar")
@@ -90,6 +94,16 @@ public enum ViewerText {
         return inner.isEmpty ? source : source + "/" + inner
     }
 
+    /// Ordnerleiste.
+    static let folderSourcesSection = "Quellen"
+    static let folderPlacesSection = "Orte"
+    static let allSources = "Alle Quellen"
+    static let revealInFinder = "Im Finder zeigen"
+    static let removeAsSource = "Als Quelle entfernen"
+    static let rebuildIndex = "Index neu aufbauen"
+    static let clearFolderFilter = "Ordnerfilter aufheben"
+    static let showFolderBar = "Ordnerleiste einblenden"
+    static let hideFolderBar = "Ordnerleiste ausblenden"
     /// 1.2.2 §1: search history.
     static let historyTitle = "Letzte Suchbegriffe"
     static let historyEmpty = "Noch keine Suchbegriffe"
@@ -112,14 +126,101 @@ public enum ViewerText {
         return self.pages(pages) + " und " + (images == 1 ? "1 Bild" : "\(number(images)) Bilder") + " erkannt"
     }
 
+    /// Settings „Word/PowerPoint“: footer of the first section, every format read.
+    static let officeFormatsFooter = "Liest .docx, .docm, .dotx, .doc, .pptx und .pptm ohne Microsoft Office. Doppelklick öffnet das Original."
+
+    /// Settings „Folien-Cache“ footer: the cache serves Quick Look only.
+    static func slideCacheFooter(_ renderer: OfficeRendererChoice) -> String {
+        switch renderer {
+        case .quickLook: "Nur für Quick Look: Folienbilder werden beim nächsten Durchlauf neu erzeugt."
+        case .slideKit: "Der eigene Viewer braucht keine Folienbilder: Leeren gibt nur Speicherplatz frei (Bilder aus Quick Look)."
+        }
+    }
+
+    /// Settings „Word/PowerPoint“, per folder (1.3 Teil B Task 12): „12 Word-Dateien gelesen, 1 nicht lesbar ·
+    /// 30 PowerPoint-Dateien gelesen · 4 warten“; a kind without files is left out, none read → „2 PowerPoint-Dateien nicht lesbar“; nothing at all → „Keine Word- oder
+    /// PowerPoint-Dateien“.
+    public static func layoutCounts(_ c: LayoutCounts) -> String {
+        func kind(_ name: String, read: Int, failed: Int) -> String? {
+            func files(_ n: Int) -> String { n == 1 ? "1 \(name)-Datei" : "\(number(n)) \(name)-Dateien" }
+            switch (read, failed) {
+            case (0, 0): return nil
+            case (0, _): return files(failed) + " nicht lesbar"
+            case (_, 0): return files(read) + " gelesen"
+            default: return files(read) + " gelesen, \(number(failed)) nicht lesbar"
+            }
+        }
+        let parts = [kind("Word", read: c.wordRead, failed: c.wordFailed),
+                     kind("PowerPoint", read: c.powerpointRead, failed: c.powerpointFailed),
+                     c.waiting > 0 ? (c.waiting == 1 ? "1 wartet" : "\(number(c.waiting)) warten") : nil].compactMap { $0 }
+        return parts.isEmpty ? "Keine Word- oder PowerPoint-Dateien" : parts.joined(separator: " · ")
+    }
+
     static let recognitionStopped = "Texterkennung angehalten"
     static let resumeRecognition = "Fortsetzen"
 
-    /// Symbol before the row header: images get a photo symbol (spec 1.2 §5).
-    static func rowSymbol(_ hit: DocumentHit) -> String? { hit.isImage ? "photo" : nil }
+    /// Symbol before the row header: images get a photo symbol (spec 1.2 §5), Word and PowerPoint their own
+    /// (1.3 Teil B); PDFs none.
+    static func rowSymbol(_ hit: DocumentHit) -> String? {
+        switch hit.kind {
+        case .pdf: nil
+        case .image: "photo"
+        case .word: "doc.richtext"
+        case .powerpoint: "rectangle.inset.filled.on.rectangle"
+        }
+    }
+    /// Name of a document kind (VoiceOver label of the row symbol, file type filter).
+    static func kindLabel(_ kind: DocumentKind) -> String {
+        switch kind {
+        case .pdf: "PDF"
+        case .word: "Word"
+        case .powerpoint: "PowerPoint"
+        case .image: "Bild"
+        }
+    }
+    /// Name of a kind in the „Dateitypen“ menu and its title (spec 1.3 §8a): images are „Bilder“.
+    static func fileKindLabel(_ kind: DocumentKind) -> String { kind == .image ? "Bilder" : kindLabel(kind) }
+    /// Title of the „Dateitypen“ menu: „Dateitypen“ while every kind is shown, else the shown kinds in menu
+    /// order („PDF, Word“).
+    static func fileKindsTitle(_ kinds: Set<DocumentKind>) -> String {
+        let all = GridSettings.allFileKinds
+        guard !kinds.isSuperset(of: all), !kinds.isEmpty else { return fileKindsMenu }
+        return all.filter(kinds.contains).map(fileKindLabel).joined(separator: ", ")
+    }
+    static let fileKindsMenu = "Dateitypen"
+    /// Empty grid while the filter hides every result (review of Task 11).
+    static func hiddenByFilter(_ n: Int, browsing: Bool) -> String {
+        browsing ? (n == 1 ? "1 Datei ausgeblendet" : "\(number(n)) Dateien ausgeblendet")
+                 : (n == 1 ? "1 Dokument mit Treffern ausgeblendet" : "\(number(n)) Dokumente mit Treffern ausgeblendet")
+    }
+    static func hiddenByFilterDetail(_ kinds: Set<DocumentKind>) -> String {
+        "Der Filter „\(fileKindsMenu)“ zeigt nur: \(fileKindsTitle(kinds))."
+    }
+    static let showAllFileKinds = "Alle Dateitypen zeigen"
+    /// A summary with the count of documents the file type filter hides („… · 2 ausgeblendet“).
+    public static func withHidden(_ summary: String, hidden: Int) -> String {
+        hidden > 0 ? "\(summary) · \(number(hidden)) ausgeblendet" : summary
+    }
+    static let fileKindsHelp = "Nur Dateien dieser Typen zeigen (Suche und Durchblättern); mindestens ein Typ bleibt an"
+    /// Hint next to the header of a document found by its file name only (spec 1.3.2 §2).
+    static let nameHit = "Treffer im Dateinamen"
+    static let nameHitHelp = "Der Suchbegriff steht im Dateinamen, nicht im Text. Die Reihe zeigt die Seiten wie beim Durchblättern."
+    /// Hint next to the header of a document drawn in simplified form (renderer `textkit`, 1.3 Teil B).
+    static let simplified = "vereinfacht"
+    static let simplifiedHelp = "Vereinfachte Darstellung: Kopf- und Fußzeilen, Bilder und Formatvorlagen fehlen; der Text ist vollständig durchsuchbar."
+    /// Row body of a Word/PowerPoint file whose pages are not laid out yet (page count 0).
+    static let layoutPending = "Wird für die Anzeige vorbereitet …"
+    /// Row body when a row has no tiles: unreadable, Office not laid out yet, or page count not read yet.
+    static func rowHint(_ hit: DocumentHit) -> String {
+        if hit.isUnreadable { return unreadableRow }
+        return hit.kind.isOffice && hit.pageCount == 0 ? layoutPending : pagesPending
+    }
+    /// Tooltip of a tile: Office files open in their own app on double click.
+    static func tileHelp(kind: DocumentKind) -> String {
+        "Klick: groß anzeigen · Doppelklick: " + (kind.isOffice ? "Original öffnen" : "in Vorschau öffnen")
+    }
     /// Badge on a PDF page whose text was recognized (spec 1.2 §5).
     static let ocrBadge = "Texterkennung"
-    static let imageLabel = "Bild"
 
     static func pageLabel(_ pageIndex: Int) -> String { "S. \(pageIndex + 1)" }
 
@@ -143,6 +244,15 @@ public enum ViewerText {
     static let missingFile = "Datei nicht mehr vorhanden"
     static let folderUnreachable = "Ordner nicht erreichbar"
     static let previewUnavailable = "Vorschau nicht verfügbar"
+    /// A Word/PowerPoint page not laid out yet (1.3 Teil B).
+    static let previewPreparing = "Vorschau wird vorbereitet …"
+    /// The detail view's open button: Office files open in their own app (1.3 Teil B), the rest in Preview.
+    static func openOriginal(kind: DocumentKind) -> String {
+        switch kind {
+        case .word, .powerpoint: "Original öffnen"
+        case .pdf, .image: "In Vorschau öffnen"
+        }
+    }
     static let noTextSection = "Kein Text erkannt (auch nicht durch die Texterkennung)"
     static let unreadableSection = "Nicht lesbar (beschädigt oder passwortgeschützt)"
     static func noTextSection(recognitionOn: Bool) -> String { recognitionOn ? noTextSection : "Ohne Text (Texterkennung ist aus)" }

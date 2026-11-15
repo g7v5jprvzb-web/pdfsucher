@@ -17,7 +17,8 @@ public struct FolderScanResult: Sendable, Equatable {
 }
 
 /// Lists every `.pdf` file (extension case-insensitive) below a folder, and with
-/// `includeImages` also every image file of `DocumentKind.imageExtensions` (spec 1.2 §2).
+/// `includeImages` also every image file of `DocumentKind.imageExtensions` (spec 1.2 §2), and with
+/// `includeOffice` Word and PowerPoint files (spec 1.3; `~$` lock files are always skipped).
 ///
 /// - Depth: files directly in `root` are depth 0; at most `maxDepth` directory levels below
 ///   `root` are entered.
@@ -36,15 +37,19 @@ public struct FolderScanResult: Sendable, Equatable {
 public struct FolderScanner: Sendable {
     private let maxDepth: Int
     private let includeImages: Bool
+    private let includeOffice: Bool
 
     /// `includeImages` is off by default so callers from before 1.2 keep listing PDFs only.
-    public init(maxDepth: Int = 10, includeImages: Bool = false) {
+    /// `includeOffice` (Word/PowerPoint, spec 1.3) is off by default for the same reason.
+    public init(maxDepth: Int = 10, includeImages: Bool = false, includeOffice: Bool = false) {
         self.maxDepth = maxDepth
         self.includeImages = includeImages
+        self.includeOffice = includeOffice
     }
 
     private func isIndexed(_ name: String) -> Bool {
-        SupportedSourceTypes.accepts(fileExtension: (name as NSString).pathExtension, includeImages: includeImages)
+        // Office lock files (`~$name.docx`) are never documents (`SupportedSourceTypes`).
+        SupportedSourceTypes.accepts(fileName: name, includeImages: includeImages, includeOffice: includeOffice)
     }
 
     private static let keys: Set<URLResourceKey> = [

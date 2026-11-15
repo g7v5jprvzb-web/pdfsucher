@@ -1,5 +1,6 @@
 import Foundation
 import IndexKit
+import OfficeKit
 import OutputKit
 import Testing
 import TestSupport
@@ -29,11 +30,11 @@ struct AddPromptTests {
             return (name, index)
         })
         let defaults = defaults ?? UserDefaults(suiteName: "AddPrompt-\(UUID().uuidString)")!
-        let m = AppModel(settings: settings ?? GridSettings(defaults: defaults), defaults: defaults, environment: FakeEnvironment(),
+        let m = AppModel(settings: settings ?? GridSettings(defaults: defaults), defaults: defaults, environment: FakeEnvironment(), slideCache: testSlideCache,
                          debounce: .zero, openIndex: { root in
                              guard let index = indexes[root.lastPathComponent] else { throw CocoaError(.fileReadCorruptFile) }
                              return index
-                         })
+                         }, officeRendering: PowerPointDisplaySetting())
         return (m, indexes)
     }
 

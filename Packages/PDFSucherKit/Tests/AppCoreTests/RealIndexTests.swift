@@ -1,6 +1,7 @@
 import Foundation
 import PDFKit
 import IndexKit
+import OfficeKit
 import OutputKit
 import SearchKit
 import Testing
@@ -30,8 +31,8 @@ struct RealIndexTests {
         let indexURL = self.indexURL
         return AppModel(settings: makeSettings(),
                         defaults: defaults ?? UserDefaults(suiteName: "AppCoreTests-\(UUID().uuidString)")!,
-                        environment: environment, debounce: .zero,
-                        openIndex: { root in try FolderIndex.shared(root: root, indexURL: indexURL) })
+                        environment: environment, slideCache: testSlideCache, debounce: .zero,
+                        openIndex: { root in try FolderIndex.shared(root: root, indexURL: indexURL, slideCache: testSlideCache) }, officeRendering: PowerPointDisplaySetting())
     }
 
     @Test func searchWorksWhenFolderUnreachable() async throws {
@@ -50,8 +51,8 @@ struct RealIndexTests {
     }
 
     @Test func sameFolderReusesIndex() throws {
-        let a = try FolderIndex.shared(root: folder, indexURL: indexURL)
-        let b = try FolderIndex.shared(root: folder.appendingPathComponent("."), indexURL: indexURL)
+        let a = try FolderIndex.shared(root: folder, indexURL: indexURL, slideCache: testSlideCache)
+        let b = try FolderIndex.shared(root: folder.appendingPathComponent("."), indexURL: indexURL, slideCache: testSlideCache)
         #expect(a === b)
     }
 
@@ -210,9 +211,74 @@ struct RealIndexTests {
         #expect(model.selection.count == 2)
     }
 
+    /// Spec 1.3 Teil B: browsing without a query carries the document kind and the „vereinfacht“ hint.
+    @Test func browseCarriesDocumentKind() async throws {
+        let root = base.appendingPathComponent("Gemischt", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try PDFFixtures.makePDF(at: root.appendingPathComponent("a.pdf"), pages: ["Stichwort im PDF"])
+        try ImageFixtures.makeImage(at: root.appendingPathComponent("b.png"), text: "Bild", size: CGSize(width: 200, height: 100),
+                                    format: .png)
+        try Data("x".utf8).write(to: root.appendingPathComponent("c.docx"))
+        try Data("x".utf8).write(to: root.appendingPathComponent("d.pptx"))
+        let kindIndexURL = base.appendingPathComponent("kinds.sqlite")
+        let store = try IndexStore(fileURL: kindIndexURL, root: root)
+        _ = try await Indexer(root: root, store: store, ocr: KindFixedOCR(), layout: KindFixedLayout()).update { _ in }
+
+        let entries = try FolderIndex(root: root, indexURL: kindIndexURL, slideCache: testSlideCache).browse()
+        let kinds = Dictionary(uniqueKeysWithValues: entries.map { ($0.relativePath, $0.kind) })
+        #expect(kinds == ["a.pdf": .pdf, "b.png": .image, "c.docx": .word, "d.pptx": .powerpoint])
+        #expect(entries.filter(\.isImage).map(\.relativePath) == ["b.png"])
+        #expect(entries.filter(\.isSimplified).map(\.relativePath) == ["c.docx"])
+    }
+
+    /// Office smoke run (1.3 Teil B): hit URLs of files in a folder with an umlaut carry the decomposed path, the index
+    /// stores the precomposed one; the word boxes (slide highlights) must still be found.
+    @Test func layoutWordsOfFileInUmlautFolderAreFound() async throws {
+        let decks = folder.appendingPathComponent("Präsentationen", isDirectory: true)
+        try FileManager.default.createDirectory(at: decks, withIntermediateDirectories: true)
+        try Data("x".utf8).write(to: decks.appendingPathComponent("Übersicht.pptx"))
+        let index = try FolderIndex(root: folder.standardizedFileURL, indexURL: indexURL, makeLayout: { WordsLayout() })
+        let model = AppModel(settings: makeSettings(), defaults: UserDefaults(suiteName: "AppCoreTests-\(UUID().uuidString)")!,
+                             environment: FakeEnvironment(), slideCache: testSlideCache, debounce: .zero, openIndex: { _ in index }, officeRendering: PowerPointDisplaySetting())
+        await model.open(folder: folder)
+        await model.waitUntilIdle()
+        model.queryText = "Kündigungsfrist"
+        await model.waitUntilIdle()
+        let hit = try #require(model.hits.first { $0.kind == .powerpoint })
+        let words = await model.ocrText(for: PageRef(url: hit.url, pageIndex: 0))?.words
+        #expect(words?.count == 1, "\(hit.url.path)")
+    }
+
     @Test func saveMessageUsesReason() {
         let url = URL(fileURLWithPath: "/x/Auswahl.pdf")
         #expect(AppModel.message(forSaveError: OutputError.writeFailed(url, reason: "Kein Schreibrecht"), url: url)
                 == "Speichern fehlgeschlagen: Auswahl.pdf – Kein Schreibrecht")
+    }
+}
+
+private struct KindFixedOCR: OCRSource {
+    func recognize(pageIndex: Int, of url: URL, kind: DocumentKind) throws -> OCRResult {
+        OCRResult(text: "Stichwort im Bild", words: [])
+    }
+}
+
+/// Word as `textkit` („vereinfacht“), PowerPoint as `quicklook`; one page each.
+private struct KindFixedLayout: PageLayoutSource {
+    func renderer(for kind: DocumentKind) -> (name: String, version: Int) { (kind == .word ? "textkit" : "quicklook", 1) }
+    func layout(of url: URL, kind: DocumentKind) async throws -> LayoutResult {
+        let (name, version) = renderer(for: kind)
+        return LayoutResult(pages: [LaidOutPage(text: "Stichwort", words: [], size: CGSize(width: 595, height: 842))],
+                            renderer: name, layoutVersion: version)
+    }
+}
+
+/// PowerPoint with one slide holding „Kündigungsfrist“ and its word box (like Quick Look slides).
+private struct WordsLayout: PageLayoutSource {
+    func renderer(for kind: DocumentKind) -> (name: String, version: Int) { ("quicklook", 1) }
+    func layout(of url: URL, kind: DocumentKind) async throws -> LayoutResult {
+        LayoutResult(pages: [LaidOutPage(text: "Kündigungsfrist", words: [OCRWord(range: NSRange(location: 0, length: 15),
+                                                                                   box: CGRect(x: 0.1, y: 0.1, width: 0.3, height: 0.05))],
+                                         size: CGSize(width: 720, height: 540))],
+                     renderer: "quicklook", layoutVersion: 1)
     }
 }

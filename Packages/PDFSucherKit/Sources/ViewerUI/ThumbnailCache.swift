@@ -1,5 +1,6 @@
 // ThumbnailCache.swift — Task 4.2
 import AppKit
+import ImageIO
 import Foundation
 import OutputKit
 import SearchKit
@@ -33,6 +34,9 @@ public final class ThumbnailCache: Sendable {
         let colorKey: String
         /// The exact tile width decides the style; the 10 pt rounding above would mix 275–284 pt.
         let enlarged: Bool
+        /// Hash of the OCR text and boxes the marks came from ("" = none): a page recognized later gets
+        /// its marks (spec 1.2.4 §5).
+        let ocrVersion: String
     }
 
     /// Identifies one version of a file on disk.
@@ -42,7 +46,7 @@ public final class ThumbnailCache: Sendable {
     }
 
     /// A job of this cache in the shared render queue.
-    private struct JobKey: Hashable { let cache: UUID; let key: ImageKey }
+    struct JobKey: Hashable { let cache: UUID; let key: ImageKey }
 
     private static let log = Logger(subsystem: "local.pdfsucher", category: "ThumbnailCache")
     static func cgColor(_ c: RGBA, alpha: Double) -> CGColor {
@@ -53,12 +57,19 @@ public final class ThumbnailCache: Sendable {
     /// Long side of a rendered bitmap at most; larger tiles are drawn scaled up (about 12 MB per bitmap).
     static let maxRenderPixelSide: CGFloat = 2048
 
-    private let id = UUID()
-    private let images: Mutex<LRUCache<ImageKey, NSImage>>
-    private let documents: DocumentPool
-    private let queue: TileRenderQueue
-    private let disk: TileDiskCache?
-    private let scale: CGFloat
+    let id = UUID()
+    let images: Mutex<LRUCache<ImageKey, NSImage>>
+    let documents: DocumentPool
+    let queue: TileRenderQueue
+    let disk: TileDiskCache?
+    let scale: CGFloat
+    /// The running prefetch batch; a new one cancels it (spec 1.2.4 §2).
+    private let prefetchTask = Mutex<Task<Void, Never>?>(nil)
+    /// Word/PowerPoint pages (1.3 Teil B, `ThumbnailCache+Foreign.swift`).
+    let foreign: (any ForeignPageProvider)?
+    let foreignVersions = Mutex<[URL: String]>([:])
+    /// The size the grid last asked a tile for (1.3.4: the preview's stand-in looks for that tile on disk).
+    let lastTileSize = Mutex<CGSize?>(nil)
 
     /// - Parameters:
     ///   - countLimit: maximum number of cached thumbnails.
@@ -67,15 +78,18 @@ public final class ThumbnailCache: Sendable {
     ///   - scale: pixels per point of the rendered bitmap (2 = Retina).
     ///   - disk: tiles on disk; nil (tests) keeps them in memory only.
     public convenience init(countLimit: Int = 300, byteLimit: Int = 256 << 20, documentLimit: Int = 20, scale: CGFloat = 2,
-                disk: TileDiskCache? = nil) {
+                disk: TileDiskCache? = nil, foreign: (any ForeignPageProvider)? = nil) {
         self.init(countLimit: countLimit, byteLimit: byteLimit, documentLimit: documentLimit, scale: scale, disk: disk,
-                  queue: .shared)
+                  queue: .shared, foreign: foreign)
     }
 
     init(countLimit: Int = 300, byteLimit: Int = 256 << 20, documentLimit: Int = 20, scale: CGFloat = 2,
-         disk: TileDiskCache?, queue: TileRenderQueue) {
+         disk: TileDiskCache?, queue: TileRenderQueue, foreign: (any ForeignPageProvider)? = nil) {
+        self.foreign = foreign
         images = Mutex(LRUCache(limit: countLimit, costLimit: byteLimit))
-        documents = DocumentPool(limit: documentLimit, instancesPerFile: queue.workers)
+        // Parallel renders of one file keep their documents, but all files together keep at most `workers`
+        // documents beyond one per file (spec 1.2.4 §4: about 26 open instead of up to 120).
+        documents = DocumentPool(limit: documentLimit, instancesPerFile: queue.workers, extraLimit: queue.workers)
         self.queue = queue
         self.disk = disk
         self.scale = max(scale, 1)
@@ -98,34 +112,77 @@ public final class ThumbnailCache: Sendable {
             if Self.validSize(size) { forget(ref.url) }
             return nil
         }
+        lastTileSize.withLock { $0 = size }
         if let cached = images.withLock({ $0.value(for: request.key) }) { return cached }
         guard !Task.isCancelled else { return nil }
         if let disk, let stored = await disk.image(named: request.diskName) {
+            // Decoded already: kept even when the tile scrolled away meanwhile (review M5).
             let image = NSImage(cgImage: stored, size: size)
             images.withLock { $0.insert(image, for: request.key, cost: stored.bytesPerRow * stored.height) }
-            return image
+            return Task.isCancelled ? nil : image
         }
         guard !Task.isCancelled else { return nil }
         return await queue.image(key: JobKey(cache: id, key: request.key), priority: .visible) { [self] in render(request) }
     }
 
-    /// Renders tiles ahead of time at low priority (the rows and pages next to the visible ones), into
-    /// memory and disk. Does not wait. Pages already cached are skipped; when more prefetches wait than
-    /// the queue keeps, the oldest are dropped.
-    /// - Parameter ocr: looked up only for highlighted tiles, like `ThumbnailTile` does.
+    /// One group of tiles to render ahead with the same size and marks.
+    public struct PrefetchGroup: Sendable {
+        public let refs: [PageRef]
+        public let size: CGSize
+        public let highlightKey: String
+        public let highlightRanges: HighlightRanges?
+        public let highlightColor: RGBA
+        public let ocr: (@Sendable (PageRef) async -> OCRPageText?)?
+
+        public init(refs: [PageRef], size: CGSize, highlightKey: String = "", highlightRanges: HighlightRanges? = nil,
+                    highlightColor: RGBA = .yellow, ocr: (@Sendable (PageRef) async -> OCRPageText?)? = nil) {
+            self.refs = refs
+            self.size = size
+            self.highlightKey = highlightKey
+            self.highlightRanges = highlightRanges
+            self.highlightColor = highlightColor
+            self.ocr = ocr
+        }
+    }
+
+    /// Renders tiles ahead of time at low priority (the area next to the visible tiles), into memory and
+    /// disk. Does not wait. Replaces the previous batch: its task is cancelled and its waiting jobs leave
+    /// the render queue (spec 1.2.4 §2). Pages already cached are skipped.
+    public func prefetch(_ groups: [PrefetchGroup]) {
+        let groups = groups.filter { !$0.refs.isEmpty && Self.validSize($0.size) }
+        let me = id
+        // Under the lock, in this order: the old batch stops and its waiting jobs go before the new
+        // batch can queue any (its task starts only after the swap).
+        prefetchTask.withLock { current in
+            current?.cancel()
+            queue.dropWaitingPrefetches { ($0.base as? JobKey)?.cache == me }
+            current = groups.isEmpty ? nil : Task.detached(priority: .utility) { [self] in
+                for group in groups { await prefetch(group) }
+            }
+        }
+    }
+
+    /// One group, for callers with a single size and set of marks. Like `prefetch(_ groups:)` it replaces
+    /// the running batch: send plain and marked tiles together, not in two calls (review M4).
     public func prefetch(_ refs: [PageRef], size: CGSize, highlightKey: String = "", highlightRanges: HighlightRanges? = nil,
                          highlightColor: RGBA = .yellow, ocr: (@Sendable (PageRef) async -> OCRPageText?)? = nil) {
-        guard !refs.isEmpty, Self.validSize(size) else { return }
-        Task.detached(priority: .utility) { [self] in
-            for ref in refs {
+        prefetch([PrefetchGroup(refs: refs, size: size, highlightKey: highlightKey, highlightRanges: highlightRanges,
+                                highlightColor: highlightColor, ocr: ocr)])
+    }
+
+    private func prefetch(_ group: PrefetchGroup) async {
+        let size = group.size, highlightKey = group.highlightKey, highlightRanges = group.highlightRanges
+        let highlightColor = group.highlightColor, ocr = group.ocr
+        for ref in group.refs {
+                guard !Task.isCancelled else { return }
                 // Without the OCR text the marks of a recognized page would be wrong (and cached so).
                 let text = highlightRanges == nil ? nil : await ocr?(ref)
                 guard let request = Request(ref: ref, size: size, highlightKey: highlightKey, highlightRanges: highlightRanges,
                                             color: highlightColor, ocr: text, cache: self),
                       images.withLock({ $0.value(for: request.key) }) == nil,
                       disk?.contains(request.diskName) != true else { continue }
+                guard !Task.isCancelled else { return }
                 queue.prefetch(key: JobKey(cache: id, key: request.key)) { [self] in render(request) }
-            }
         }
     }
 
@@ -134,17 +191,19 @@ public final class ThumbnailCache: Sendable {
     public func cachedImage(for ref: PageRef, size: CGSize, highlightKey: String = "", highlighted: Bool,
                             highlightColor: RGBA = .yellow) -> NSImage? {
         guard Self.validSize(size), let stamp = documents.knownStamp(ref.url) else { return nil }
-        let key = Self.key(ref: ref, stamp: stamp, size: size, highlightKey: highlightKey, highlighted: highlighted, color: highlightColor)
+        let key = Self.key(ref: ref, stamp: stamp, size: size, highlightKey: highlightKey, highlighted: highlighted, color: highlightColor,
+                           ocrVersion: knownForeignVersion(ref.url, ocrVersion: highlighted ? documents.knownOCRVersion(ref) ?? "" : ""))
         return images.withLock { $0.value(for: key) }
     }
 
     /// Everything one tile needs, checked and keyed.
-    private struct Request: Sendable {
+    struct Request: Sendable {
         let ref: PageRef
         let size: CGSize
         let stamp: FileStamp
         let key: ImageKey
-        let diskName: String
+        let diskName: TileDiskCache.Name
+        let source: TileDiskCache.Source
         let highlightRanges: HighlightRanges?
         let color: RGBA
         let ocr: OCRPageText?
@@ -159,37 +218,50 @@ public final class ThumbnailCache: Sendable {
             self.highlightRanges = highlightRanges
             self.color = color
             self.ocr = ocr
+            let ocrVersion = highlightRanges == nil ? "" : ThumbnailCache.ocrVersion(ocr)
+            if highlightRanges != nil { cache.documents.noteOCRVersion(ocrVersion, for: ref) }
             key = ThumbnailCache.key(ref: ref, stamp: stamp, size: size, highlightKey: highlightKey,
-                                     highlighted: highlightRanges != nil, color: color)
+                                     highlighted: highlightRanges != nil, color: color,
+                                     ocrVersion: cache.foreignVersion(ref.url, ocrVersion: ocrVersion))
+            let path = ref.url.standardizedFileURL.path
+            source = TileDiskCache.Source(path: path, modifiedAt: stamp.modifiedAt, size: stamp.size)
             // The exact pixel size and the OCR text's version belong in the name too: tiles on disk
             // outlive this run, and a page recognized later gets marks it did not have before.
             let pixels = ThumbnailCache.pixelSize(size, scale: cache.scale)
-            diskName = TileDiskCache.name(for: [
-                ref.url.standardizedFileURL.path, "\(ref.pageIndex)",
+            diskName = TileDiskCache.name(source: path, parts: [
+                "\(ref.pageIndex)",
                 stamp.modifiedAt.map { "\($0.timeIntervalSince1970)" } ?? "-", stamp.size.map(String.init) ?? "-",
                 "\(pixels.width)x\(pixels.height)", "\(Int((size.width * 10).rounded()))",
-                key.highlightKey ?? "<none>", key.colorKey, key.enlarged ? "e" : "x",
-                ocr.map { "\($0.text.utf8.count)/\($0.words.count)" } ?? "-",
+                key.highlightKey ?? "<none>", key.colorKey, key.enlarged ? "e" : "x", key.ocrVersion,
             ])
         }
     }
 
     private static func key(ref: PageRef, stamp: FileStamp, size: CGSize, highlightKey: String, highlighted: Bool,
-                            color: RGBA) -> ImageKey {
+                            color: RGBA, ocrVersion: String) -> ImageKey {
         ImageKey(ref: ref, stamp: stamp, width: round10(size.width), height: round10(size.height),
                  highlightKey: highlighted ? highlightKey : nil,
                  colorKey: highlighted ? color.key : "",
-                 enlarged: highlighted && HighlightGeometry.style(forTileWidth: size.width) == .enlarged)
+                 enlarged: highlighted && HighlightGeometry.style(forTileWidth: size.width) == .enlarged,
+                 ocrVersion: highlighted || isForeignVersion(ocrVersion) ? ocrVersion : "")
     }
 
-    private static func validSize(_ size: CGSize) -> Bool {
+    /// Hash of the OCR text and word boxes ("" = no OCR text): marks change with them (spec 1.2.4 §5).
+    static func ocrVersion(_ ocr: OCRPageText?) -> String {
+        guard let ocr = OCRHighlights.usable(ocr) else { return "" }
+        // Stable across launches (the disk name uses it): SHA-256 of the text and the boxes.
+        let text = ocr.text + ocr.words.map { "\($0.range.location),\($0.range.length),\($0.box.minX),\($0.box.minY),\($0.box.width),\($0.box.height)" }.joined(separator: ";")
+        return TileDiskCache.name(source: "ocr", parts: [text]).file.prefix(16).description
+    }
+
+    static func validSize(_ size: CGSize) -> Bool {
         size.width >= 1 && size.height >= 1 && size.width <= maxPointSide && size.height <= maxPointSide
     }
 
     private static func round10(_ v: CGFloat) -> Int { Int((v / 10).rounded()) * 10 }
 
-    static func pixelSize(_ size: CGSize, scale: CGFloat) -> (width: Int, height: Int) {
-        let scale = min(scale, maxRenderPixelSide / max(size.width, size.height))
+    static func pixelSize(_ size: CGSize, scale: CGFloat, maxPixelSide: CGFloat = maxRenderPixelSide) -> (width: Int, height: Int) {
+        let scale = min(scale, maxPixelSide / max(size.width, size.height))
         return (Int((size.width * scale).rounded()), Int((size.height * scale).rounded()))
     }
 
@@ -199,9 +271,44 @@ public final class ThumbnailCache: Sendable {
                          size: (attributes[.size] as? NSNumber)?.intValue)
     }
 
+    /// Height ÷ width of the file's first page as shown (rotation and EXIF orientation applied), for the shape
+    /// of its tiles (1.3.4); nil when unknown (unreadable, locked, Word/PowerPoint not laid out yet). A PDF is
+    /// opened through the pool like for a tile, so its first tile reuses the document. Blocks: not on the main actor.
+    public func pageAspect(of url: URL) -> CGFloat? {
+        if ImagePages.isImage(url) { return Self.imageAspect(url) }
+        if foreign?.handles(url) == true {
+            return foreignDocument(for: url, page: 0, maxPixel: 64)?.page(at: 0).flatMap(Self.aspect(of:))
+        }
+        guard let stamp = Self.stamp(of: url), let document = documents.checkout(url, stamp: stamp) else { return nil }
+        defer { documents.checkin(document, for: url, stamp: stamp) }
+        guard document.pageCount > 0 else { return nil }
+        return document.page(at: 0).flatMap(Self.aspect(of:))
+    }
+
+    /// Height ÷ width of a page's crop box as shown (quarter turns swap the sides).
+    static func aspect(of page: PDFPage) -> CGFloat? {
+        let box = page.bounds(for: .cropBox)
+        let quarterTurns = ((page.rotation % 360) + 360) % 360 / 90
+        let shown = quarterTurns % 2 == 1 ? CGSize(width: box.height, height: box.width) : box.size
+        guard shown.width > 0, shown.height > 0 else { return nil }
+        return shown.height / shown.width
+    }
+
+    /// From the image header only (no decoding); EXIF orientations 5…8 turn the image a quarter.
+    static func imageAspect(_ url: URL) -> CGFloat? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.doubleValue,
+              let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue,
+              width > 0, height > 0 else { return nil }
+        let orientation = (properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
+        return (5...8).contains(orientation) ? CGFloat(width / height) : CGFloat(height / width)
+    }
+
     private func forget(_ url: URL) {
         documents.forget(url)
         images.withLock { $0.removeAll { $0.ref.url == url } }
+        forgetForeignVersion(url)
     }
 
     /// Runs on a render thread.
@@ -217,6 +324,11 @@ public final class ThumbnailCache: Sendable {
             let pixels = Int((max(size.width, size.height) * scale).rounded(.up))
             guard let document = ImageDocument.make(ref.url, maxPixel: min(pixels, Int(Self.maxRenderPixelSide))) else { return nil }
             rendered = draw(document, request)
+        } else if foreign?.handles(ref.url) == true {
+            // Word/PowerPoint: a one-page document from the provider, not pooled (like images).
+            guard let document = foreignDocument(for: ref.url, page: ref.pageIndex, maxPixel: Self.foreignMaxPixel(size, scale: scale))
+            else { return nil }
+            rendered = draw(document, request, pageIndex: 0)
         } else {
             guard let document = documents.checkout(ref.url, stamp: request.stamp) else { return nil }
             rendered = draw(document, request)
@@ -225,20 +337,22 @@ public final class ThumbnailCache: Sendable {
         guard let rendered else { return nil }
         let image = NSImage(cgImage: rendered.image, size: size)
         images.withLock { $0.insert(image, for: request.key, cost: rendered.bytes) }
-        disk?.store(rendered.image, named: request.diskName)
+        disk?.store(rendered.image, named: request.diskName, source: request.source)
         return image
     }
 
-    private func draw(_ document: PDFDocument, _ request: Request) -> (image: CGImage, bytes: Int)? {
-        guard request.ref.pageIndex >= 0, request.ref.pageIndex < document.pageCount,
-              let page = document.page(at: request.ref.pageIndex) else { return nil }
-        return render(page, size: request.size, highlightRanges: request.highlightRanges, color: request.color, ocr: request.ocr)
+    func draw(_ document: PDFDocument, _ request: Request, pageIndex: Int? = nil,
+              maxPixelSide: CGFloat = maxRenderPixelSide) -> (image: CGImage, bytes: Int)? {
+        let pageIndex = pageIndex ?? request.ref.pageIndex
+        guard pageIndex >= 0, pageIndex < document.pageCount, let page = document.page(at: pageIndex) else { return nil }
+        return render(page, size: request.size, highlightRanges: request.highlightRanges, color: request.color, ocr: request.ocr,
+                      maxPixelSide: maxPixelSide)
     }
 
     private func render(_ page: PDFPage, size: CGSize, highlightRanges: HighlightRanges?, color: RGBA,
-                        ocr: OCRPageText?) -> (image: CGImage, bytes: Int)? {
-        let scale = min(self.scale, Self.maxRenderPixelSide / max(size.width, size.height))
-        let (pixelWidth, pixelHeight) = Self.pixelSize(size, scale: self.scale)
+                        ocr: OCRPageText?, maxPixelSide: CGFloat) -> (image: CGImage, bytes: Int)? {
+        let scale = min(self.scale, maxPixelSide / max(size.width, size.height))
+        let (pixelWidth, pixelHeight) = Self.pixelSize(size, scale: self.scale, maxPixelSide: maxPixelSide)
         guard let ctx = CGContext(data: nil, width: pixelWidth, height: pixelHeight, bitsPerComponent: 8, bytesPerRow: 0,
                                   space: CGColorSpace(name: CGColorSpace.sRGB)!,
                                   bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
@@ -314,12 +428,17 @@ final class DocumentPool: @unchecked Sendable {
     private var entries: LRUCache<URL, Entry>
     /// Last stamp seen per file, for `ThumbnailCache.cachedImage`.
     private var stamps: [URL: ThumbnailCache.FileStamp] = [:]
+    /// Last OCR version seen per highlighted page, for `ThumbnailCache.cachedImage`.
+    private var ocrVersions: [PageRef: String] = [:]
     private let instancesPerFile: Int
+    /// Idle documents beyond the first of each file, over all files.
+    private let extraLimit: Int
     private var opened = 0
 
-    init(limit: Int, instancesPerFile: Int) {
+    init(limit: Int, instancesPerFile: Int, extraLimit: Int = .max) {
         entries = LRUCache(limit: limit)
         self.instancesPerFile = max(instancesPerFile, 1)
+        self.extraLimit = max(extraLimit, 0)
     }
 
     var count: Int { lock.withLock { entries.count } }
@@ -327,6 +446,10 @@ final class DocumentPool: @unchecked Sendable {
 
     func noteStamp(_ stamp: ThumbnailCache.FileStamp, for url: URL) { lock.withLock { stamps[url] = stamp } }
     func knownStamp(_ url: URL) -> ThumbnailCache.FileStamp? { lock.withLock { stamps[url] } }
+    func noteOCRVersion(_ version: String, for ref: PageRef) { lock.withLock { ocrVersions[ref] = version } }
+    func knownOCRVersion(_ ref: PageRef) -> String? { lock.withLock { ocrVersions[ref] } }
+    /// Idle documents kept for a file (tests).
+    func idleCount(_ url: URL) -> Int { lock.withLock { entries.value(for: url)?.idle.count ?? 0 } }
 
     /// An open document of this version of the file, or nil if it cannot be opened or is locked.
     func checkout(_ url: URL, stamp: ThumbnailCache.FileStamp) -> PDFDocument? {
@@ -357,13 +480,23 @@ final class DocumentPool: @unchecked Sendable {
         return document
     }
 
-    /// Returns a document for reuse; dropped if the file changed or left the pool meanwhile.
+    /// Returns a document for reuse; dropped if the file changed or left the pool meanwhile, or if the
+    /// file already has `instancesPerFile` idle ones (an extra opened for a parallel render is closed).
     func checkin(_ document: PDFDocument, for url: URL, stamp: ThumbnailCache.FileStamp) {
         lock.withLock {
             guard var entry = entries.value(for: url), entry.stamp == stamp, !entry.unreadable,
                   entry.idle.count < instancesPerFile else { return }
             entry.idle.append(document)
             entries.insert(entry, for: url)
+            // Too many extras over all files: the least recently used files give theirs back first.
+            var extras = entries.keysLeastRecentFirst.reduce(0) { $0 + max((entries.peek($1)?.idle.count ?? 0) - 1, 0) }
+            for key in entries.keysLeastRecentFirst where extras > extraLimit {
+                guard var other = entries.peek(key), other.idle.count > 1 else { continue }
+                let drop = min(other.idle.count - 1, extras - extraLimit)
+                other.idle.removeLast(drop)
+                extras -= drop
+                entries.replace(other, for: key)
+            }
         }
     }
 
@@ -371,6 +504,7 @@ final class DocumentPool: @unchecked Sendable {
         lock.withLock {
             entries.removeValue(for: url)
             stamps.removeValue(forKey: url)
+            ocrVersions = ocrVersions.filter { $0.key.url != url }
         }
     }
 }
@@ -390,6 +524,18 @@ struct LRUCache<Key: Hashable, Value> {
     }
 
     var count: Int { storage.count }
+
+    /// Keys from least to most recently used.
+    var keysLeastRecentFirst: [Key] { order }
+
+    /// The value without marking it used.
+    func peek(_ key: Key) -> Value? { storage[key]?.value }
+
+    /// Replaces a value without marking it used (no-op for an unknown key).
+    mutating func replace(_ value: Value, for key: Key) {
+        guard let old = storage[key] else { return }
+        storage[key] = (value, old.cost)
+    }
 
     mutating func value(for key: Key) -> Value? {
         guard let entry = storage[key] else { return nil }

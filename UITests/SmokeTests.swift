@@ -121,8 +121,200 @@ final class SmokeTests: XCTestCase {
         let after = rows.frame
         XCTAssertGreaterThan(after.height, before.height, "taller")
         XCTAssertGreaterThanOrEqual(after.width, before.width * 1.3, "wider by the font, so not cut off (\(before.width) → \(after.width))")
-        let window = app.windows.firstMatch.frame
-        XCTAssertTrue(window.contains(after), "inside the window")
+        // The main window by its id: `windows.firstMatch` can be the settings window while it closes.
+        let window = app.windows.matching(identifier: "main").firstMatch.frame
+        XCTAssertTrue(window.contains(after), "inside the window (\(after) in \(window))")
+    }
+
+    /// 1.2.4: every settings tab shows its last element without scrolling; the window can be enlarged and keeps
+    /// its size after a restart.
+    func testSettingsTabsFitAndSizeIsKept() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["-uiTestFolder", folder.path]
+        app.launch()
+        XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 15), "window")
+        app.typeKey(",", modifierFlags: .command)
+        // The settings window by its id: `windows.element(boundBy: 0)` became the main window after the drag, so
+        // the test resized and measured the main window (found when „Allgemein“ fitted again).
+        let window = app.windows.matching(identifier: "com_apple_SwiftUI_Settings_window").firstMatch
+        XCTAssertTrue(window.waitForExistence(timeout: 5), "settings window")
+        let lastElements: [(tab: String, element: XCUIElement)] = [
+            ("Allgemein", app.descendants(matching: .any)["debouncePicker"]),
+            ("Vorschau", app.buttons["Zurücksetzen"]),
+            ("Darstellung", app.descendants(matching: .any)["toolbarFontReset"]),
+            ("Word/PowerPoint", app.buttons["Folien-Cache leeren"]),
+            ("Speicher", app.buttons["Kachel-Cache leeren"]),
+            ("Tastatur", app.descendants(matching: .any)["tabIncludesSearchToggle"]),
+        ]
+        var settingsWindow = window.frame
+        for (tab, last) in lastElements {
+            let button = app.toolbars.buttons[tab].exists ? app.toolbars.buttons[tab] : app.buttons[tab]
+            XCTAssertTrue(button.waitForExistence(timeout: 5), "tab \(tab)")
+            button.click()
+            XCTAssertTrue(last.waitForExistence(timeout: 5), "last element of \(tab)")
+            settingsWindow = window.frame
+            XCTAssertTrue(settingsWindow.contains(last.frame), "\(tab): last element inside the window without scrolling")
+        }
+        // Enlarge from the bottom-right corner, close, restart: the size is kept.
+        let corner = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 1)).withOffset(CGVector(dx: -3, dy: -3))
+        corner.press(forDuration: 0.3, thenDragTo: corner.withOffset(CGVector(dx: 80, dy: 40)))
+        Thread.sleep(forTimeInterval: 0.5)
+        let enlarged = window.frame
+        XCTAssertGreaterThan(enlarged.width, settingsWindow.width + 40, "the settings window can be resized")
+        // Another tab keeps the size the user chose (review I3).
+        let general = app.toolbars.buttons["Allgemein"].exists ? app.toolbars.buttons["Allgemein"] : app.buttons["Allgemein"]
+        general.click()
+        Thread.sleep(forTimeInterval: 0.5)
+        XCTAssertEqual(window.frame.height, enlarged.height, accuracy: 3, "switching tabs keeps the height")
+        XCTAssertEqual(window.frame.width, enlarged.width, accuracy: 3, "switching tabs keeps the width")
+        app.typeKey("w", modifierFlags: .command)
+        app.terminate()
+        app.launchArguments = ["-uiTestFolder", folder.path, "-uiTestKeepDefaults", "YES"]
+        app.launch()
+        XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 15))
+        app.typeKey(",", modifierFlags: .command)
+        XCTAssertTrue(window.waitForExistence(timeout: 5), "settings window after restart")
+        Thread.sleep(forTimeInterval: 1)
+        let restored = window.frame
+        XCTAssertEqual(restored.width, enlarged.width, accuracy: 3, "width kept")
+        XCTAssertEqual(restored.height, enlarged.height, accuracy: 3, "height kept")
+    }
+
+    /// Ordnerleiste: show the bar, click a folder → only its files; ✕ → all again.
+    func testFolderBarFiltersAndClears() throws {
+        let tree = try PDFFixtures.tempDirectory()
+        defer { try? FileManager.default.removeItem(at: tree) }
+        let sub = tree.appendingPathComponent("Verträge", isDirectory: true)
+        try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+        try PDFFixtures.makePDF(at: sub.appendingPathComponent("mietvertrag.pdf"), pages: ["Der Vertrag"])
+        try PDFFixtures.makePDF(at: tree.appendingPathComponent("angebot.pdf"), pages: ["Ein Angebot"])
+        let app = XCUIApplication()
+        app.launchArguments = ["-uiTestFolder", tree.path]
+        app.launch()
+        XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 15), "window")
+        let rows = app.descendants(matching: .any).matching(identifier: "documentRow")
+        XCTAssertTrue(rows.firstMatch.waitForExistence(timeout: 20), "browse rows")
+        let toggle = app.descendants(matching: .any)["folderBarToggle"]
+        XCTAssertTrue(toggle.waitForExistence(timeout: 5), "toolbar button")
+        toggle.click()
+        // A row without a disclosure triangle reports its text as value, one with a triangle as label (macOS 26).
+        let folder = app.descendants(matching: .any).matching(NSPredicate(
+            format: "identifier == 'folderRow' AND (label BEGINSWITH 'Verträge' OR value BEGINSWITH 'Verträge')")).firstMatch
+        XCTAssertTrue(folder.waitForExistence(timeout: 10), "folder „Verträge“ in the bar")
+        folder.click()
+        let header = app.descendants(matching: .any)["folderFilterHeader"]
+        XCTAssertTrue(header.waitForExistence(timeout: 5), "filter header")
+        let deadline = Date().addingTimeInterval(10)
+        while rows.count != 1, Date() < deadline { Thread.sleep(forTimeInterval: 0.2) }
+        XCTAssertEqual(rows.count, 1, "only the folder's file")
+        XCTAssertTrue(rows.firstMatch.label.hasPrefix("mietvertrag.pdf"))
+        app.descendants(matching: .any)["folderFilterClear"].click()
+        let back = Date().addingTimeInterval(10)
+        while rows.count != 2, Date() < back { Thread.sleep(forTimeInterval: 0.2) }
+        XCTAssertEqual(rows.count, 2, "all files again")
+        XCTAssertFalse(header.exists, "no header without a filter")
+    }
+
+    /// The tree opens down to a chosen folder: choose a deep folder below 40 others, close its parent, scroll
+    /// up, hide and show the bar (⌃⌘S) → the parent is open again and the folder scrolled into view.
+    func testFolderBarRevealsChosenFolder() throws {
+        let tree = try PDFFixtures.tempDirectory()
+        defer { try? FileManager.default.removeItem(at: tree) }
+        let deep = tree.appendingPathComponent("Verträge/2024", isDirectory: true)
+        try FileManager.default.createDirectory(at: deep, withIntermediateDirectories: true)
+        try PDFFixtures.makePDF(at: deep.appendingPathComponent("mietvertrag.pdf"), pages: ["Der Vertrag"])
+        try PDFFixtures.makePDF(at: tree.appendingPathComponent("angebot.pdf"), pages: ["Ein Angebot"])
+        for i in 0..<40 {                                                    // above „Verträge“, without subfolders
+            let other = tree.appendingPathComponent(String(format: "Akte %02d", i), isDirectory: true)
+            try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: tree.appendingPathComponent("angebot.pdf"), to: other.appendingPathComponent("a.pdf"))
+        }
+        let app = XCUIApplication()
+        app.launchArguments = ["-uiTestFolder", tree.path]
+        app.launch()
+        XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 15), "window")
+        XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "documentRow").firstMatch.waitForExistence(timeout: 20))
+        let toggle = app.descendants(matching: .any)["folderBarToggle"]
+        XCTAssertTrue(toggle.waitForExistence(timeout: 5))
+        toggle.click()
+        func row(_ name: String) -> XCUIElement {
+            app.descendants(matching: .any).matching(NSPredicate(
+                format: "identifier == 'folderRow' AND (label BEGINSWITH %@ OR value BEGINSWITH %@)", name, name)).firstMatch
+        }
+        let vertraege = row("Verträge")
+        XCTAssertTrue(vertraege.waitForExistence(timeout: 10), "„Verträge“ under the open source root")
+        XCTAssertFalse(row("2024").exists, "subfolders start closed")
+        let outline = app.outlines.firstMatch
+        let triangle = outline.disclosureTriangles.element(boundBy: 1)       // 0: the source root, 1: „Verträge“
+        XCTAssertTrue(triangle.waitForExistence(timeout: 5), "disclosure triangle of „Verträge“")
+        triangle.click()
+        XCTAssertTrue(row("2024").waitForExistence(timeout: 5), "„2024“ after opening „Verträge“")
+        row("2024").click()
+        XCTAssertTrue(app.descendants(matching: .any)["folderFilterHeader"].waitForExistence(timeout: 5))
+        triangle.click()                                                     // close „Verträge“ again
+        let gone = Date().addingTimeInterval(5)
+        while row("2024").exists, Date() < gone { Thread.sleep(forTimeInterval: 0.2) }
+        XCTAssertFalse(row("2024").exists, "hidden in the closed parent")
+        outline.scroll(byDeltaX: 0, deltaY: 5000)                            // back to the top
+        XCTAssertTrue(row("Akte 00").isHittable, "scrolled to the top")
+        XCTAssertFalse(row("Verträge").isHittable, "„Verträge“ below the visible part")
+        toggle.click()                                                       // hide the bar …
+        Thread.sleep(forTimeInterval: 0.5)
+        toggle.click()                                                       // … and show it: opened to the filter
+        XCTAssertTrue(row("2024").waitForExistence(timeout: 5), "the tree opened down to the chosen folder")
+        XCTAssertTrue(row("2024").isHittable, "visible")
+    }
+
+    /// A folder chosen by code (as a place click does) below 40 others: the tree opens and scrolls to it —
+    /// right after the start, before the tree is built (waits for it), and later with the bar already shown.
+    func testFolderChosenByCodeIsRevealedAtOnce() throws { try folderChosenByCode(delay: 0) }
+    func testFolderChosenByCodeIsRevealedLater() throws { try folderChosenByCode(delay: 3) }
+
+    private func folderChosenByCode(delay: Double) throws {
+        let tree = try PDFFixtures.tempDirectory()
+        defer { try? FileManager.default.removeItem(at: tree) }
+        let deep = tree.appendingPathComponent("Verträge/2024", isDirectory: true)
+        try FileManager.default.createDirectory(at: deep, withIntermediateDirectories: true)
+        try PDFFixtures.makePDF(at: deep.appendingPathComponent("mietvertrag.pdf"), pages: ["Der Vertrag"])
+        for i in 0..<40 {
+            let other = tree.appendingPathComponent(String(format: "Akte %02d", i), isDirectory: true)
+            try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: deep.appendingPathComponent("mietvertrag.pdf"), to: other.appendingPathComponent("a.pdf"))
+        }
+        let app = XCUIApplication()
+        app.launchArguments = ["-uiTestFolder", tree.path, "-uiTestSelectFolder", deep.path, "-uiTestSelectFolderDelay", "\(delay)"]
+        app.launch()
+        XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 15), "window")
+        let row = app.descendants(matching: .any).matching(NSPredicate(
+            format: "identifier == 'folderRow' AND (label BEGINSWITH '2024' OR value BEGINSWITH '2024')")).firstMatch
+        XCTAssertTrue(row.waitForExistence(timeout: 20), "the tree opened down to „2024“")
+        let deadline = Date().addingTimeInterval(5)
+        while !row.isHittable, Date() < deadline { Thread.sleep(forTimeInterval: 0.2) }
+        XCTAssertTrue(row.isHittable, "scrolled into view below the 40 other folders")
+        XCTAssertTrue(app.descendants(matching: .any)["folderFilterHeader"].exists, "filtered")
+    }
+
+    /// 1.3.2: a document whose name alone matches shows with „Treffer im Dateinamen“; one whose text matches does not.
+    func testFileNameHitIsMarked() throws {
+        let dir = try PDFFixtures.tempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try PDFFixtures.makePDF(at: dir.appendingPathComponent("Rechnung März.pdf"), pages: ["Nur Zahlen 123"])
+        try PDFFixtures.makePDF(at: dir.appendingPathComponent("Protokoll.pdf"), pages: ["Die Rechnung kommt"])
+        let app = XCUIApplication()
+        app.launchArguments = ["-uiTestFolder", dir.path]
+        app.launch()
+        XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 15), "window")
+        let rows = app.descendants(matching: .any).matching(identifier: "documentRow")
+        XCTAssertTrue(rows.firstMatch.waitForExistence(timeout: 20), "browse rows")
+        let field = app.descendants(matching: .any)["searchField"]
+        field.click()
+        field.typeText("Rechnung")
+        let deadline = Date().addingTimeInterval(10)
+        while rows.count != 2, Date() < deadline { Thread.sleep(forTimeInterval: 0.2) }
+        XCTAssertEqual(rows.count, 2, "the name hit and the text hit")
+        let hint = app.descendants(matching: .any)["nameHitHint"]
+        XCTAssertTrue(hint.waitForExistence(timeout: 5), "„Treffer im Dateinamen“")
+        XCTAssertEqual(app.descendants(matching: .any).matching(identifier: "nameHitHint").count, 1, "only on the name-only row")
     }
 
     /// 1.2.1 §2: window size and the preview divider survive a restart.
@@ -218,7 +410,8 @@ final class SmokeTests: XCTestCase {
     }
 
     /// 1.2.1 bug: first start (fresh settings), folder loaded, a word typed without clicking anywhere — ↓ must
-    /// go to the grid at once and select the first hit page (Return then ticks it).
+    /// go to the grid at once and select the first hit page (Return then ticks it). Since 1.3.3 the search
+    /// already shows that page; the first ↓ enters the grid on it (Chris: „Erst auf den ersten Treffer“).
     func testFirstStartTypeThenArrowSelectsFirstHit() throws {
         let app = XCUIApplication()
         app.launchArguments = ["-uiTestFolder", folder.path]
@@ -232,12 +425,52 @@ final class SmokeTests: XCTestCase {
         XCTAssertEqual(field.value as? String, "Vertrag", "typed text lands in the search field")
         let hitRow = app.descendants(matching: .any).matching(NSPredicate(format: "identifier == 'documentRow' AND label CONTAINS 'Treffer'")).firstMatch
         XCTAssertTrue(hitRow.waitForExistence(timeout: 10), "hits")
+        let firstName = String(hitRow.label.split(separator: " (")[0])
+        let shown = app.staticTexts.matching(NSPredicate(format: "value BEGINSWITH %@", firstName + " · S. ")).firstMatch
+        XCTAssertTrue(shown.waitForExistence(timeout: 5), "the preview shows the first document's hit (\(firstName))")
+        let shownLabel = shown.value as? String
         app.typeKey(.downArrow, modifierFlags: [])
         XCTAssertFalse(field.value(forKey: "hasKeyboardFocus") as? Bool ?? false, "↓ left the search field")
+        XCTAssertTrue(shown.exists, "the preview still shows the first document's hit")
+        XCTAssertEqual(shown.value as? String, shownLabel, "the first ↓ keeps the shown page")
         app.typeKey(.return, modifierFlags: [])
         let count = app.staticTexts["selectionCount"]
         XCTAssertTrue(count.waitForExistence(timeout: 5))
         XCTAssertEqual(count.value as? String ?? count.label, "1 Seite ausgewählt", "↓ selected the first hit page")
+    }
+
+    /// 1.3.3: a typed term with hits shows its first hit page in the large preview at once, without an arrow;
+    /// the keyboard stays in the search field (typing goes on). The first ↓ enters the grid on that page, the
+    /// second moves on to the next document.
+    func testSearchShowsFirstHitInPreviewAtOnce() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["-uiTestFolder", folder.path]
+        app.launch()
+        XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 15), "window")
+        let row = app.descendants(matching: .any).matching(identifier: "documentRow").firstMatch
+        XCTAssertTrue(row.waitForExistence(timeout: 20), "browse rows")
+        let field = app.textFields["searchField"]
+        field.click()
+        field.typeText("Vertrag")
+        let shown = app.staticTexts.matching(NSPredicate(format: "value CONTAINS ' · S. '")).firstMatch
+        XCTAssertTrue(shown.waitForExistence(timeout: 10), "the preview shows a hit page without ↓")
+        XCTAssertTrue(field.value(forKey: "hasKeyboardFocus") as? Bool ?? false, "the search field keeps the keyboard")
+        field.typeText(" ")           // same term (partial words are off: „Vertra“ alone finds nothing)
+        XCTAssertEqual(field.value as? String, "Vertrag ", "typing goes on in the field")
+        let firstRow = app.descendants(matching: .any).matching(NSPredicate(format: "identifier == 'documentRow' AND label CONTAINS 'Treffer'")).firstMatch
+        XCTAssertTrue(firstRow.waitForExistence(timeout: 10), "hits")
+        let firstLabel = shown.value as? String ?? ""
+        XCTAssertTrue(firstRow.label.hasPrefix(String(firstLabel.split(separator: " · ").first ?? "")),
+                      "the preview shows the first document of the list (\(firstLabel) / \(firstRow.label))")
+        app.typeKey(.downArrow, modifierFlags: [])
+        XCTAssertFalse(field.value(forKey: "hasKeyboardFocus") as? Bool ?? false, "↓ left the search field")
+        Thread.sleep(forTimeInterval: 0.5)
+        XCTAssertEqual(shown.value as? String, firstLabel, "the first ↓ enters the grid on the shown first hit")
+        app.typeKey(.downArrow, modifierFlags: [])
+        let deadline = Date().addingTimeInterval(5)
+        let preview = app.staticTexts.matching(NSPredicate(format: "value CONTAINS ' · S. '")).firstMatch
+        while (preview.value as? String) == firstLabel, Date() < deadline { Thread.sleep(forTimeInterval: 0.2) }
+        XCTAssertNotEqual(preview.value as? String, firstLabel, "the second ↓ moved to the next document")
     }
 
     /// Spec 1.1 §3 (review of Task 9): moving the preview keeps the keyboard focus in the grid.

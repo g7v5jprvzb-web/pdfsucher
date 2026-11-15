@@ -1,6 +1,7 @@
 import Foundation
 import PDFKit
 import IndexKit
+import OfficeKit
 import OutputKit
 import SearchKit
 import Testing
@@ -33,8 +34,8 @@ struct OCRQueueTests {
 
     func model(_ indexes: [String: FakeIndex], defaults: UserDefaults? = nil) -> AppModel {
         AppModel(settings: makeSettings(), defaults: defaults ?? UserDefaults(suiteName: "OCRQ-\(UUID().uuidString)")!,
-                 environment: FakeEnvironment(), debounce: .zero,
-                 openIndex: { root in indexes[root.lastPathComponent]! })
+                 environment: FakeEnvironment(), slideCache: testSlideCache, debounce: .zero,
+                 openIndex: { root in indexes[root.lastPathComponent]! }, officeRendering: PowerPointDisplaySetting())
     }
 
     @Test func phase1OfAllFoldersBeforeRecognition() async {
@@ -170,11 +171,11 @@ struct OCRQueueTests {
                               to: folder.appendingPathComponent("foto.png"), type: .png)
         let indexURL = base.appendingPathComponent("scans.sqlite")
         let m = AppModel(settings: makeSettings(), defaults: UserDefaults(suiteName: "OCRQ-\(UUID().uuidString)")!,
-                         environment: FakeEnvironment(), debounce: .zero,
-                         openIndex: { try FolderIndex.shared(root: $0, indexURL: indexURL) })
+                         environment: FakeEnvironment(), slideCache: testSlideCache, debounce: .zero,
+                         openIndex: { try FolderIndex.shared(root: $0, indexURL: indexURL, slideCache: testSlideCache) }, officeRendering: PowerPointDisplaySetting())
         await m.add([folder])
         await m.waitUntilIdle()
-        let index = try FolderIndex.shared(root: folder, indexURL: indexURL)
+        let index = try FolderIndex.shared(root: folder, indexURL: indexURL, slideCache: testSlideCache)
         #expect(try index.ocrCounts() == (pages: 1, images: 1), "\(m.indexStatus)")
         m.queryText = "Kündigungsfrist"
         await m.waitUntilIdle()
@@ -375,7 +376,7 @@ struct OCRQueueTests {
         let settings = makeSettings()
         settings.sort = .fileName
         let m = AppModel(settings: settings, defaults: UserDefaults(suiteName: "OCRQ-\(UUID().uuidString)")!,
-                         environment: env, debounce: .zero, openIndex: { try FolderIndex.shared(root: $0, indexURL: indexURL) })
+                         environment: env, slideCache: testSlideCache, debounce: .zero, openIndex: { try FolderIndex.shared(root: $0, indexURL: indexURL, slideCache: testSlideCache) }, officeRendering: PowerPointDisplaySetting())
         await m.add([folder])
         await m.waitUntilIdle()
         m.queryText = "Vertrag"

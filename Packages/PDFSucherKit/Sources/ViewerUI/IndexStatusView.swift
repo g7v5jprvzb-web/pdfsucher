@@ -30,6 +30,11 @@ struct IndexStatusView: View {
                 case .building:
                     ProgressView().controlSize(.small)
                     Text(status).foregroundStyle(.secondary)
+                case .layingOut:
+                    // No ✕ of its own: removing the source, the Word/PowerPoint switch or quitting stops it.
+                    ProgressView().controlSize(.small)
+                    Text(status).foregroundStyle(.secondary)
+                        .accessibilityIdentifier("layoutStatus")
                 case .recognizing:
                     ProgressView().controlSize(.small)
                     Text(status).foregroundStyle(.secondary)

@@ -73,10 +73,14 @@ public struct SourceList: Equatable, Sendable {
     }
 }
 
-/// Sorts opened or dropped URLs into sources (folders and PDFs, symlinks resolved) and ignored items.
+/// Sorts opened or dropped URLs into sources (folders and supported files, symlinks resolved) and ignored items.
 public enum SourceClassifier {
-    /// - Parameter includeImages: images (`DocumentKind.imageExtensions`) count as single-file sources (spec 1.2).
-    public static func classify(_ urls: [URL], includeImages: Bool = true) -> (sources: [LoadedSourceRef], ignored: [URL]) {
+    /// - Parameters:
+    ///   - includeImages: images (`DocumentKind.imageExtensions`) count as single-file sources (spec 1.2).
+    ///   - includeOffice: Word/PowerPoint files count as single-file sources (spec 1.3).
+    /// Office lock files (`~$…`) are ignored whatever their extension, as in the folder scan.
+    public static func classify(_ urls: [URL], includeImages: Bool = true,
+                                includeOffice: Bool = true) -> (sources: [LoadedSourceRef], ignored: [URL]) {
         var sources: [LoadedSourceRef] = []
         var ignored: [URL] = []
         for url in urls {
@@ -88,7 +92,8 @@ public enum SourceClassifier {
             if values?.isDirectory == true, values?.isPackage != true {
                 sources.append(LoadedSourceRef(url: URL(fileURLWithPath: resolved.path, isDirectory: true), isFolder: true))
             } else if values?.isRegularFile == true,
-                      SupportedSourceTypes.accepts(fileExtension: resolved.pathExtension, includeImages: includeImages) {
+                      SupportedSourceTypes.accepts(fileName: resolved.lastPathComponent, includeImages: includeImages,
+                                                    includeOffice: includeOffice) {
                 sources.append(LoadedSourceRef(url: URL(fileURLWithPath: resolved.path, isDirectory: false), isFolder: false))
             } else {
                 ignored.append(url)

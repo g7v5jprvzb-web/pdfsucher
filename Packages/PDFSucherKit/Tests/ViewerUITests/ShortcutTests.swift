@@ -120,18 +120,33 @@ struct ShortcutTests {
         #expect(k.shortcut(for: .fitPage) == ShortcutAction.fitPage.defaultShortcut)         // a fixed shortcut
     }
 
-    @Test func tabSkipsSearchDefaultFollowsTypeToSearchUntilSet() {
+    @Test func tabStopsDefaultOffAndPersist() {
         let defaults = UserDefaults(suiteName: "Keys-\(UUID())")!
         let k = keyboard(defaults)
-        #expect(k.tabSkipsSearch)
+        #expect(!k.tabIncludesSearch && !k.tabIncludesPreview)
+        #expect(k.tabOrderText() == "Tab: Ordner → Kacheln")
+        #expect(k.tabOrderText(folderBarVisible: false) == "Tab: Kacheln → Vorschau")
         k.typeToSearch = false
-        #expect(!k.tabSkipsSearch)
-        k.tabSkipsSearch = true
-        k.typeToSearch = true
-        k.typeToSearch = false
-        #expect(k.tabSkipsSearch)
-        #expect(defaults.bool(forKey: "keyboard.tabSkipsSearch"))
-        #expect(defaults.object(forKey: "search.typeToSearch") != nil)
+        #expect(!k.tabIncludesSearch, "no longer follows „Tippen sucht sofort“")
+        k.tabIncludesSearch = true
+        k.tabIncludesPreview = true
+        #expect(k.tabOrderText() == "Tab: Suchfeld → Ordner → Kacheln → Vorschau")
+        let again = keyboard(defaults)
+        #expect(again.tabIncludesSearch && again.tabIncludesPreview)
+        #expect(defaults.bool(forKey: "keyboard.tabIncludesSearch") && defaults.bool(forKey: "keyboard.tabIncludesPreview"))
+    }
+
+    /// „Tab überspringt das Suchfeld“ explicitly off before: the search field stays in the Tab cycle.
+    @Test func tabSkipsSearchMigration() {
+        let off = UserDefaults(suiteName: "Keys-\(UUID())")!
+        off.set(false, forKey: "keyboard.tabSkipsSearch")
+        #expect(keyboard(off).tabIncludesSearch)
+        let on = UserDefaults(suiteName: "Keys-\(UUID())")!
+        on.set(true, forKey: "keyboard.tabSkipsSearch")
+        #expect(!keyboard(on).tabIncludesSearch)
+        // The new key wins once set.
+        off.set(false, forKey: "keyboard.tabIncludesSearch")
+        #expect(!keyboard(off).tabIncludesSearch)
     }
 
     @Test func displayStrings() {

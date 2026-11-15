@@ -26,8 +26,8 @@ struct IndexStoreOCRTests {
         try store.upsert(file(path, size: size), pages: [PageText(pageIndex: 0, text: "", needsOCR: true)], status: .noText)
     }
 
-    @Test func schemaVersionIsTwo() {
-        #expect(IndexStore.schemaVersion == 2)
+    @Test func schemaVersionIsThree() {
+        #expect(IndexStore.schemaVersion == 3)
     }
 
     @Test func schemaVersion1FileIsRebuilt() throws {

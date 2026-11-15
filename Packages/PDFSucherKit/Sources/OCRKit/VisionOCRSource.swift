@@ -36,6 +36,8 @@ public struct VisionOCRSource: OCRSource {
             switch kind {
             case .image:
                 image = try ImageLoader.cgImage(contentsOf: url, maxPixel: Self.maxPixel)
+            case .word, .powerpoint:
+                throw OCRSourceError.unreadable(url) // Office documents are never recognised
             case .pdf:
                 guard let document = PDFDocument(url: url) else { throw OCRSourceError.unreadable(url) }
                 if document.isLocked, !document.unlock(withPassword: "") { throw OCRSourceError.unreadable(url) }

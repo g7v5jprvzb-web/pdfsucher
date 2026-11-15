@@ -1,5 +1,6 @@
 import Foundation
 import IndexKit
+import OfficeKit
 import OutputKit
 import SearchKit
 import Testing
@@ -41,7 +42,7 @@ struct AppModelTests {
         #expect(model.query.isEmpty)
     }
 
-    @Test func focusResetsWhenHitDisappears() async {
+    @Test func focusMovesToTheFirstHitWhenItsPageDisappears() async {
         let index = FakeIndex()
         index.hits = [doc("a.pdf", pages: [0, 1])]
         let model = makeModel(index: index)
@@ -50,13 +51,13 @@ struct AppModelTests {
         await model.waitUntilIdle()
         let a = model.hits[0]
         model.focusedPage = PageRef(url: a.url, pageIndex: 0)
-        model.queryText = "Vertrag Miete"     // page 0 still a hit: focus kept
+        model.queryText = "Vertrag Miete"     // page 0 still a hit (and the first one)
         await model.waitUntilIdle()
         #expect(model.focusedPage == PageRef(url: a.url, pageIndex: 0))
         index.hits = [doc("a.pdf", pages: [1])]
         model.queryText = "Miete"
         await model.waitUntilIdle()
-        #expect(model.focusedPage == nil)
+        #expect(model.focusedPage == PageRef(url: a.url, pageIndex: 1), "1.3.3: page 0 is gone, the new term's first hit")
     }
 
     @Test func sortChangeDoesNotRequery() async {
@@ -198,8 +199,8 @@ struct AppModelTests {
         first.holdUpdates = true
         let second = FakeIndex()
         let model = AppModel(settings: makeSettings(), defaults: UserDefaults(suiteName: "AppCoreTests-\(UUID().uuidString)")!,
-                             environment: FakeEnvironment(), debounce: .zero,
-                             openIndex: { $0.lastPathComponent == "eins" ? first : second })
+                             environment: FakeEnvironment(), slideCache: testSlideCache, debounce: .zero,
+                             openIndex: { $0.lastPathComponent == "eins" ? first : second }, officeRendering: PowerPointDisplaySetting())
         Task { await model.open(folder: URL(fileURLWithPath: "/eins")) }
         #expect(await eventually { first.events == ["update-start"] })
         await model.open(folder: URL(fileURLWithPath: "/zwei"))
@@ -212,16 +213,16 @@ struct AppModelTests {
     @Test func remembersLastFolder() async throws {
         let defaults = UserDefaults(suiteName: "AppCoreTests-\(UUID().uuidString)")!
         let index = FakeIndex()
-        let model = AppModel(settings: makeSettings(), defaults: defaults, environment: FakeEnvironment(),
-                             debounce: .zero, openIndex: { _ in index })
+        let model = AppModel(settings: makeSettings(), defaults: defaults, environment: FakeEnvironment(), slideCache: testSlideCache,
+                             debounce: .zero, openIndex: { _ in index }, officeRendering: PowerPointDisplaySetting())
         let folder = try PDFFixtures.tempDirectory().appendingPathComponent("Verträge", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         await model.open(folder: folder)
         #expect(defaults.stringArray(forKey: "sources") == [folder.standardizedFileURL.path])
 
         let opened = URLRecorder()
-        let next = AppModel(settings: makeSettings(), defaults: defaults, environment: FakeEnvironment(),
-                            debounce: .zero, openIndex: { opened.append($0); return index })
+        let next = AppModel(settings: makeSettings(), defaults: defaults, environment: FakeEnvironment(), slideCache: testSlideCache,
+                            debounce: .zero, openIndex: { opened.append($0); return index }, officeRendering: PowerPointDisplaySetting())
         await next.restoreSources()
         await next.waitUntilIdle()
         #expect(opened.urls.map(\.path) == [folder.resolvingSymlinksInPath().path])

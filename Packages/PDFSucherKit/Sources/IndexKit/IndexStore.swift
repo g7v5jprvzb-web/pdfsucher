@@ -14,6 +14,8 @@ public enum IndexStoreError: Error, Equatable {
 
 /// The SQLite index of one PDF folder (schema: spec §4.1, extended by spec 1.2 §4).
 ///
+/// - Schema 3 (Office, spec 1.3): `documents.renderer`/`layout_version`/`needs_layout` and
+///   `page_text.source = 'layout'` for pages of laid-out Office documents; older indexes are rebuilt.
 /// - Schema 2 (OCR): `documents.kind` (`pdf`/`image`); `page_text.source` (`text`/`ocr`: OCR
 ///   ran on the page) and `page_text.needs_ocr` (the phase-2 queue); `ocr_words` holds the word boxes of recognized pages. An index
 ///   of schema 1 is rebuilt on open (spec 1.2 §4).
@@ -30,7 +32,7 @@ public enum IndexStoreError: Error, Equatable {
 ///   is thrown and the file is left alone. `wasRebuilt` reports whether a rebuild happened.
 /// - `modified_at` is seconds since 1970.
 public final class IndexStore: IndexReading, @unchecked Sendable {
-    public static let schemaVersion = 2
+    public static let schemaVersion = 3
 
     /// `~/Library/Application Support/PDFSucher/Indexes/<sha256 hex of standardized folder path>.sqlite`
     public static func location(forFolder root: URL) -> URL {
@@ -203,8 +205,12 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
           modified_at REAL NOT NULL,
           page_count INTEGER NOT NULL,
           status TEXT NOT NULL,
-          kind TEXT NOT NULL DEFAULT 'pdf'
+          kind TEXT NOT NULL DEFAULT 'pdf',
+          renderer TEXT,
+          layout_version INTEGER,
+          needs_layout INTEGER NOT NULL DEFAULT 0
         );
+        CREATE INDEX documents_needs_layout ON documents(needs_layout) WHERE needs_layout = 1;
         CREATE TABLE page_text(
           id INTEGER PRIMARY KEY,
           doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
@@ -271,32 +277,51 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
 
     /// Several upserts in one transaction (used by the `Indexer`).
     func upsertBatch(_ items: [(file: ScannedFile, pages: [PageText], status: DocumentStatus)]) throws {
+        try upsertBatch(items.map { ($0.file, $0.pages, $0.status, false) })
+    }
+
+    /// Several upserts in one transaction; items with `needsLayout` are stored like
+    /// `upsertAwaitingLayout` (used by the `Indexer` for Office files).
+    func upsertBatch(_ items: [(file: ScannedFile, pages: [PageText], status: DocumentStatus, needsLayout: Bool)]) throws {
         guard !items.isEmpty else { return }
         try using(.writer) { db in
             try db.transaction {
-                for item in items { try Self.upsert(item.file, pages: item.pages, status: item.status, in: db) }
+                for item in items {
+                    try Self.upsert(item.file, pages: item.pages, status: item.status, needsLayout: item.needsLayout, in: db)
+                }
             }
         }
     }
 
-    private static func upsert(_ file: ScannedFile, pages: [PageText], status: DocumentStatus, in db: SQLiteConnection) throws {
+    /// Stores an Office document that still waits for layout: no pages, status `noText` (so search
+    /// ignores it), `needs_layout = 1`; an earlier layout (renderer, version, pages) is dropped.
+    public func upsertAwaitingLayout(_ file: ScannedFile) throws {
+        try using(.writer) { db in
+            try db.transaction { try Self.upsert(file, pages: [], status: .noText, needsLayout: true, in: db) }
+        }
+    }
+
+    private static func upsert(_ file: ScannedFile, pages: [PageText], status: DocumentStatus,
+                               needsLayout: Bool = false, in db: SQLiteConnection) throws {
         let existing = try db.query("SELECT id FROM documents WHERE path = ?", [.text(file.relativePath)])
         let docId: Int64
         let meta: [SQLiteValue] = [
             .int(file.fileSize), .double(file.modifiedAt.timeIntervalSince1970),
             .int(Int64(pages.count)), .text(status.rawValue), .text(file.kind.rawValue),
+            .int(needsLayout ? 1 : 0),
         ]
         if case .int(let id)? = existing.first?["id"] {
             docId = id
             try db.run("DELETE FROM page_text WHERE doc_id = ?", [.int(id)])
             try db.run("""
-                UPDATE documents SET file_size = ?, modified_at = ?, page_count = ?, status = ?, kind = ?
+                UPDATE documents SET file_size = ?, modified_at = ?, page_count = ?, status = ?, kind = ?,
+                  needs_layout = ?, renderer = NULL, layout_version = NULL
                 WHERE id = ?
                 """, meta + [.int(id)])
         } else {
             docId = try db.run("""
-                INSERT INTO documents(path, file_size, modified_at, page_count, status, kind)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO documents(path, file_size, modified_at, page_count, status, kind, needs_layout)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, [.text(file.relativePath)] + meta)
         }
         for page in pages {
@@ -385,7 +410,7 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
     /// „Texterkennung für diese Quelle neu ausführen“ (spec 1.2 §7): every page OCR ran on is
     /// queued again. Its current text stays searchable until the new result replaces it.
     public func resetOCR() throws {
-        try using(.writer) { db in
+        _ = try using(.writer) { db in
             try db.run("UPDATE page_text SET needs_ocr = 1 WHERE source = 'ocr'", [])
         }
     }
@@ -427,6 +452,201 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
               status = CASE WHEN EXISTS (SELECT 1 FROM page_text WHERE doc_id = ?1 AND text <> '') THEN 'ok' ELSE 'no_text' END
             WHERE id = ?1
             """, [.int(docId)])
+    }
+
+    // MARK: Layout (spec 1.3)
+
+    /// Every Office document waiting for layout, ordered by path.
+    public func pendingLayoutJobs() throws -> [LayoutJob] {
+        try using(.writer) { db in try db.query("""
+            SELECT id, path, kind, file_size, modified_at FROM documents WHERE needs_layout = 1 ORDER BY path
+            """, []).compactMap { row in
+                guard let kind = DocumentKind(rawValue: row.text("kind")), kind.isOffice else {
+                    Self.log.error("Skipping layout job with unexpected kind for \(row.text("path"), privacy: .private)")
+                    return nil
+                }
+                return LayoutJob(docId: row.int("id"), relativePath: row.text("path"), kind: kind,
+                                 fileSize: row.int("file_size"),
+                                 modifiedAt: Date(timeIntervalSince1970: row.double("modified_at")))
+            } }
+    }
+
+    /// Replaces all pages and word boxes of the document with the laid-out `result` (pages get
+    /// `source = 'layout'`), records renderer and version, and finishes the document: status `ok`,
+    /// or `noText` when every page is empty. One transaction; the FTS triggers follow the deletes
+    /// and inserts.
+    ///
+    /// Returns false and writes nothing when the job is stale: the document is gone or its file
+    /// size or date differ from the job (the file changed during layout).
+    @discardableResult
+    public func storeLayout(_ job: LayoutJob, result: LayoutResult) throws -> Bool {
+        try using(.writer) { db in
+            try db.transaction {
+                guard try Self.isCurrent(job, in: db) else { return false }
+                try db.run("DELETE FROM page_text WHERE doc_id = ?", [.int(job.docId)])
+                for (index, page) in result.pages.enumerated() {
+                    let length = (page.text as NSString).length
+                    let words = page.words.filter { $0.range.location >= 0 && $0.range.length >= 0 && NSMaxRange($0.range) <= length }
+                    if words.count != page.words.count {
+                        Self.log.error("Dropped \(page.words.count - words.count) layout words outside the text of page \(index) in \(job.relativePath, privacy: .private)")
+                    }
+                    let pageId = try db.run("""
+                        INSERT INTO page_text(doc_id, page_index, text, source) VALUES (?, ?, ?, 'layout')
+                        """, [.int(job.docId), .int(Int64(index)), .text(page.text)])
+                    for word in words {
+                        try db.run("""
+                            INSERT INTO ocr_words(page_text_id, start_utf16, length_utf16, x, y, w, h)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """, [.int(pageId), .int(Int64(word.range.location)), .int(Int64(word.range.length)),
+                                  .double(word.box.minX), .double(word.box.minY),
+                                  .double(word.box.width), .double(word.box.height)])
+                    }
+                }
+                let hasText = result.pages.contains { !$0.text.isEmpty }
+                try db.run("""
+                    UPDATE documents SET page_count = ?, status = ?, renderer = ?, layout_version = ?, needs_layout = 0
+                    WHERE id = ?
+                    """, [.int(Int64(result.pages.count)),
+                          .text((hasText ? DocumentStatus.ok : .noText).rawValue),
+                          .text(result.renderer), .int(Int64(result.layoutVersion)), .int(job.docId)])
+                return true
+            }
+        }
+    }
+
+    /// Layout of the document failed: status `error`, no longer waiting; earlier pages, word boxes,
+    /// renderer and version are dropped (not readable, so no stale text and no re-queueing by
+    /// `requestLayout`). Returns false and changes nothing when the job is stale (see `storeLayout`).
+    @discardableResult
+    public func markLayoutFailed(_ job: LayoutJob, reason: String) throws -> Bool {
+        Self.log.notice("Layout failed for \(job.relativePath, privacy: .private): \(reason, privacy: .private)")
+        return try using(.writer) { db in
+            try db.transaction {
+                guard try Self.isCurrent(job, in: db) else { return false }
+                try db.run("DELETE FROM page_text WHERE doc_id = ?", [.int(job.docId)])
+                try db.run("""
+                    UPDATE documents SET status = ?, needs_layout = 0, page_count = 0, renderer = NULL, layout_version = NULL
+                    WHERE id = ?
+                    """,
+                           [.text(DocumentStatus.error.rawValue), .int(job.docId)])
+                return true
+            }
+        }
+    }
+
+    /// Queues every document of `renderer` (and, if given, of `kind`) whose layout version is below
+    /// `version` for a new layout. Their current pages stay searchable until the new result replaces
+    /// them. `kind` matters when Word and PowerPoint share a renderer name but not its version.
+    public func requestLayout(renderer: String, olderThan version: Int, kind: DocumentKind? = nil) throws {
+        _ = try using(.writer) { db in
+            try db.run("UPDATE documents SET needs_layout = 1 WHERE renderer = ? AND layout_version < ? AND (?3 IS NULL OR kind = ?3)",
+                       [.text(renderer), .int(Int64(version)), kind.map { .text($0.rawValue) } ?? .null])
+        }
+    }
+
+    /// Queues every document of `kind` for a new layout — also failed ones (status `error`) and those
+    /// never laid out. Their current pages stay searchable until the new result replaces them. For
+    /// a renderer change and for a lost slide cache („Folien-Cache leeren“, cache miss; 1.3 Teil B).
+    public func requestLayout(kind: DocumentKind) throws {
+        _ = try using(.writer) { db in
+            try db.run("UPDATE documents SET needs_layout = 1 WHERE kind = ?", [.text(kind.rawValue)])
+        }
+    }
+
+    /// Every document of `kind` waits for a new layout like a fresh Office file (no pages, status `noText`, no renderer):
+    /// unlike `requestLayout(kind:)` no word of the old layout stays searchable meanwhile. For a renderer switch whose
+    /// tiles and highlights would no longer match the old words (1.3 Teil B Task 12, „PowerPoint-Darstellung“).
+    public func resetLayout(kind: DocumentKind) throws {
+        try using(.writer) { db in try db.transaction { try Self.resetLayout(kind: kind, in: db) } }
+    }
+
+    private static func resetLayout(kind: DocumentKind, in db: SQLiteConnection) throws {
+        try db.run("DELETE FROM page_text WHERE doc_id IN (SELECT id FROM documents WHERE kind = ?)", [.text(kind.rawValue)])
+        try db.run("""
+            UPDATE documents SET needs_layout = 1, page_count = 0, status = ?, renderer = NULL, layout_version = NULL
+            WHERE kind = ?
+            """, [.text(DocumentStatus.noText.rawValue), .text(kind.rawValue)])
+    }
+
+    /// Queues exactly this Word/PowerPoint document for a new layout („Neu einlesen“, 1.3 Teil B), also a failed
+    /// one. Its current pages stay searchable until the new result replaces them. PDFs, images and unknown paths:
+    /// nothing.
+    public func requestLayout(relativePath: String) throws {
+        _ = try using(.writer) { db in
+            try db.run("UPDATE documents SET needs_layout = 1 WHERE path = ? AND kind IN (?, ?)",
+                       [.text(relativePath), .text(DocumentKind.word.rawValue), .text(DocumentKind.powerpoint.rawValue)])
+        }
+    }
+
+    /// Whether any document is stored as laid out by `renderer` (1.3.2: Word with substitute fonts).
+    public func hasLayouts(byRenderer renderer: String) throws -> Bool {
+        try using(.reader) { db in
+            !(try db.query("SELECT 1 FROM documents WHERE renderer = ? LIMIT 1", [.text(renderer)]).isEmpty)
+        }
+    }
+
+    /// Word and PowerPoint documents by layout state (see `LayoutCounts`).
+    public func layoutCounts() throws -> LayoutCounts {
+        try using(.reader) { db in
+            let rows = try db.query("""
+                SELECT kind, needs_layout, status, count(*) AS n FROM documents
+                WHERE kind IN (?, ?) GROUP BY kind, needs_layout, status
+                """, [.text(DocumentKind.word.rawValue), .text(DocumentKind.powerpoint.rawValue)])
+            var counts = LayoutCounts()
+            for row in rows {
+                let n = Int(row.int("n"))
+                let word = row.text("kind") == DocumentKind.word.rawValue
+                if row.int("needs_layout") != 0 {
+                    counts.waiting += n
+                } else if row.text("status") == DocumentStatus.error.rawValue {
+                    if word { counts.wordFailed += n } else { counts.powerpointFailed += n }
+                } else {
+                    if word { counts.wordRead += n } else { counts.powerpointRead += n }
+                }
+            }
+            return counts
+        }
+    }
+
+    /// The renderer (`name:version`) the documents of `kind` are expected to be laid out with, nil
+    /// before the first layout phase (stored in `meta` as `layout.expected.<kind>`).
+    public func layoutRenderer(for kind: DocumentKind) throws -> String? {
+        try using(.writer) { db in
+            try db.query("SELECT value FROM meta WHERE key = ?", [.text(Self.rendererKey(kind))]).first?.optionalText("value")
+        }
+    }
+
+    /// Records `name`/`version` as the renderer for `kind`. When it differs from the recorded one
+    /// (other name or version, or none recorded yet) every document of `kind` is queued for layout
+    /// (see `requestLayout(kind:)`), in the same transaction. Returns whether the value changed.
+    /// On a fresh index nothing is queued that was not waiting already.
+    /// - Parameter clearingPages: on a change from a recorded renderer, also remove the old pages of `kind`
+    ///   (`resetLayout(kind:)`) in the same transaction: either both happen or neither (1.3 Teil B, PowerPoint).
+    @discardableResult
+    public func adoptLayoutRenderer(name: String, version: Int, for kind: DocumentKind, clearingPages: Bool = false) throws -> Bool {
+        let key = Self.rendererKey(kind)
+        let value = "\(name):\(version)"
+        return try using(.writer) { db in
+            try db.transaction {
+                let current = try db.query("SELECT value FROM meta WHERE key = ?", [.text(key)]).first?.optionalText("value")
+                guard current != value else { return false }
+                try db.run("UPDATE documents SET needs_layout = 1 WHERE kind = ?", [.text(kind.rawValue)])
+                if clearingPages, current != nil { try Self.resetLayout(kind: kind, in: db) }
+                try db.run("INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                           [.text(key), .text(value)])
+                return true
+            }
+        }
+    }
+
+    private static func rendererKey(_ kind: DocumentKind) -> String { "layout.expected.\(kind.rawValue)" }
+
+    private static func isCurrent(_ job: LayoutJob, in db: SQLiteConnection) throws -> Bool {
+        let rows = try db.query("SELECT file_size, modified_at FROM documents WHERE id = ? AND path = ?",
+                                [.int(job.docId), .text(job.relativePath)])
+        guard let row = rows.first else { return false }
+        return row.int("file_size") == job.fileSize
+            && abs(row.double("modified_at") - job.modifiedAt.timeIntervalSince1970) < 0.001
     }
 
     /// Removes the documents (and their pages); unknown paths are ignored.
@@ -472,17 +692,32 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
 
     public func documents() throws -> [StoredDocument] {
         try using(.reader) { db in
-            try db.query("SELECT id, path, file_size, modified_at, page_count, status, kind FROM documents ORDER BY path", [])
-            .map { row in
-                StoredDocument(
-                    id: row.int("id"),
-                    relativePath: row.text("path"),
-                    fileSize: row.int("file_size"),
-                    modifiedAt: Date(timeIntervalSince1970: row.double("modified_at")),
-                    pageCount: Int(row.int("page_count")),
-                    status: DocumentStatus(rawValue: row.text("status")) ?? .error,
-                    kind: DocumentKind(rawValue: row.text("kind")) ?? .pdf)
-            } }
+            try db.query("SELECT \(Self.documentColumns) FROM documents ORDER BY path", []).map(Self.storedDocument)
+        }
+    }
+
+    /// The stored document at `relativePath` (as stored: precomposed), nil when there is none (1.3 Teil B: is a
+    /// file edited during the session still the stored version?).
+    public func document(relativePath: String) throws -> StoredDocument? {
+        try using(.reader) { db in
+            try db.query("SELECT \(Self.documentColumns) FROM documents WHERE path = ?", [.text(relativePath)])
+                .first.map(Self.storedDocument)
+        }
+    }
+
+    private static let documentColumns = "id, path, file_size, modified_at, page_count, status, kind, renderer, layout_version"
+
+    private static func storedDocument(_ row: [String: SQLiteValue]) -> StoredDocument {
+        StoredDocument(
+            id: row.int("id"),
+            relativePath: row.text("path"),
+            fileSize: row.int("file_size"),
+            modifiedAt: Date(timeIntervalSince1970: row.double("modified_at")),
+            pageCount: Int(row.int("page_count")),
+            status: DocumentStatus(rawValue: row.text("status")) ?? .error,
+            kind: DocumentKind(rawValue: row.text("kind")) ?? .pdf,
+            renderer: row.optionalText("renderer"),
+            layoutVersion: row.optionalInt("layout_version").map(Int.init))
     }
 
     /// All pages matching an FTS5 query in the given table (no LIMIT, documents of any status),
@@ -553,13 +788,14 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
             """, []).map(Self.rawMatch) }
     }
 
-    /// Stored text and word boxes of a recognized page (spec 1.2 §5); nil for pages with a text layer.
+    /// Stored text and word boxes of a recognized page (spec 1.2 §5) or of a laid-out Word/PowerPoint
+    /// page (spec 1.3: highlighted like a recognized image, merge Task 12); nil for pages with a text layer.
     public func ocrPage(relativePath: String, pageIndex: Int) throws -> (text: String, words: [OCRWord])? {
         // One read: text and words of the same version (a recognition storing meanwhile cannot mix them).
         try using(.reader) { db -> (text: String, words: [OCRWord])? in
             guard let row = try db.query("""
                 SELECT p.id AS id, p.text AS text FROM page_text p JOIN documents d ON d.id = p.doc_id
-                WHERE d.path = ? AND p.page_index = ? AND p.source = 'ocr'
+                WHERE d.path = ? AND p.page_index = ? AND p.source IN ('ocr', 'layout')
                 """, [.text(relativePath), .int(Int64(pageIndex))]).first else { return nil }
             let words = try db.query("""
                 SELECT start_utf16 AS s, length_utf16 AS l, x, y, w, h FROM ocr_words WHERE page_text_id = ? ORDER BY rowid
@@ -604,6 +840,16 @@ private extension Dictionary where Key == String, Value == SQLiteValue {
         case .int(let v)?: Double(v)
         default: 0
         }
+    }
+
+    func optionalText(_ key: String) -> String? {
+        if case .text(let v)? = self[key] { return v }
+        return nil
+    }
+
+    func optionalInt(_ key: String) -> Int64? {
+        if case .int(let v)? = self[key] { return v }
+        return nil
     }
 
     func text(_ key: String) -> String {

@@ -23,6 +23,13 @@ import Observation
     static let key = "preview.zoom"
     /// The scale the view shows right now, in percent (reported by the view; for `.percent` equal to it).
     public var currentPercent = 100
+    /// The largest zoom without zooming beyond the width (spec 1.3.2 §11), set by the view; nil = no limit.
+    public var maxPercent: Int?
+    /// The shown page's size in points, rotation applied (reported by the view; the preview's width follows it).
+    public var pageSize: CGSize?
+    /// The reference width B in points (spec 1.3.2 §9), set by the split; nil = the view's own width (preview on
+    /// top, or the width does not follow the zoom).
+    public var referenceWidth: CGFloat?
 
     public init(defaults: UserDefaults? = nil) {
         self.defaults = defaults
@@ -50,15 +57,23 @@ import Observation
         }
     }
 
-    /// Percent shown in the zoom bar.
+    /// Percent shown in the zoom bar. A percentage above the width limit (stored earlier, the switch turned off,
+    /// a narrower pane) is shown as the limit: the view clamps it there too.
     public var shownPercent: Int {
-        if case .percent(let p) = mode { return p }
+        if case .percent(let p) = mode { return maxPercent.map { min(p, $0) } ?? p }
         return currentPercent
     }
 
-    /// Next step above what is shown (from „Ganze Seite“ or a level: above the current scale).
+    /// Whether a larger zoom is possible (not at the last step, not at the width limit).
+    public var canZoomIn: Bool {
+        shownPercent < Self.steps[Self.steps.count - 1] && (maxPercent.map { shownPercent < $0 } ?? true)
+    }
+
+    /// Next step above what is shown (from „Ganze Seite“ or a level: above the current scale). With a width limit
+    /// a step beyond it becomes the limit itself, the page width (not ⌘1: level 1 may be set below 100 %).
     public func zoomIn() {
-        if let next = Self.steps.first(where: { $0 > shownPercent }) { mode = .percent(next) }
+        guard canZoomIn, let next = Self.steps.first(where: { $0 > shownPercent }) else { return }
+        if let limit = maxPercent, next > limit { mode = .percent(limit) } else { mode = .percent(next) }
     }
 
     public func zoomOut() {

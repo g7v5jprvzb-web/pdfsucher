@@ -4,7 +4,21 @@ import Foundation
 
 /// Reiter des Einstellungsfensters (der zuletzt gewählte wird gemerkt).
 public enum SettingsTab: String, CaseIterable, Sendable {
-    case general, preview, appearance, ocr, keyboard, shortcuts
+    case general, preview, appearance, ocr, office, storage, keyboard, shortcuts
+}
+
+/// Size of the settings window (1.2.4): one size in which every tab fits without scrolling, at most 85 % of the
+/// visible screen height. „Index“ and „Kachel-Cache“ live in „Speicher“: in „Allgemein“ they made it 985 pt.
+public enum SettingsLayout {
+    public static let defaultContentSize = CGSize(width: 680, height: 920)
+    public static let minContentSize = CGSize(width: 640, height: 420)
+    /// Room the tab bar takes inside the content in a plain window (the settings window puts it in the toolbar).
+    static let tabChrome: CGFloat = 40
+
+    public static func contentSize(forVisibleScreen screen: CGSize) -> CGSize {
+        CGSize(width: min(defaultContentSize.width, screen.width),
+               height: min(defaultContentSize.height, (screen.height * 0.85).rounded(.down)))
+    }
 }
 
 /// Where a remembered window goes when it is opened again (pure).
@@ -25,11 +39,16 @@ public enum WindowPlacement {
         }
         guard let main = visibleFrames.first else { return frame }
         let titleBar = CGRect(x: frame.minX, y: frame.maxY - visibleTitleBar.height, width: frame.width, height: visibleTitleBar.height)
-        if visibleFrames.contains(where: { screen in
+        if let screen = visibleFrames.first(where: { screen in
             let shown = screen.intersection(titleBar)
             return !shown.isNull && shown.width >= visibleTitleBar.width && shown.height >= visibleTitleBar.height - 0.5
         }) {
-            return frame
+            // Taller or wider than this screen (it came from a larger one): shrunk into it (review I4).
+            guard frame.width > screen.width || frame.height > screen.height else { return frame }
+            let size = CGSize(width: min(frame.width, screen.width), height: min(frame.height, screen.height))
+            let x = min(max(frame.minX, screen.minX), screen.maxX - size.width)
+            let y = min(max(frame.maxY - size.height, screen.minY), screen.maxY - size.height)
+            return CGRect(origin: CGPoint(x: x, y: y), size: size)
         }
         let size = CGSize(width: min(frame.width, main.width), height: min(frame.height, main.height))
         let x = min(max(frame.minX, main.minX), main.maxX - size.width)

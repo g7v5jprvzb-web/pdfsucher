@@ -1,5 +1,6 @@
 import Foundation
 import IndexKit
+import OfficeKit
 import OutputKit
 import SearchKit
 import Testing
@@ -42,8 +43,8 @@ struct MultiSourceTests {
                environment: FakeEnvironment = FakeEnvironment(), settings: GridSettings? = nil) -> AppModel {
         AppModel(settings: settings ?? makeSettings(),
                  defaults: defaults ?? UserDefaults(suiteName: "AppCoreTests-\(UUID().uuidString)")!,
-                 environment: environment, debounce: .zero,
-                 openIndex: { root in indexes[root.lastPathComponent]! })
+                 environment: environment, slideCache: testSlideCache, debounce: .zero,
+                 openIndex: { root in indexes[root.lastPathComponent]! }, officeRendering: PowerPointDisplaySetting())
     }
 
     @Test func twoFoldersSearchMergesAndSorts() async {
@@ -293,11 +294,11 @@ struct MultiSourceTests {
 
     func failingModel(_ indexes: [String: FakeIndex], failing: String, defaults: UserDefaults? = nil) -> AppModel {
         AppModel(settings: makeSettings(), defaults: defaults ?? UserDefaults(suiteName: "AppCoreTests-\(UUID().uuidString)")!,
-                 environment: FakeEnvironment(), debounce: .zero,
+                 environment: FakeEnvironment(), slideCache: testSlideCache, debounce: .zero,
                  openIndex: { root in
                      if root.lastPathComponent == failing { throw OpenFailed() }
                      return indexes[root.lastPathComponent]!
-                 })
+                 }, officeRendering: PowerPointDisplaySetting())
     }
 
     @Test func failedIndexOpenInMiddleKeepsTheRest() async {

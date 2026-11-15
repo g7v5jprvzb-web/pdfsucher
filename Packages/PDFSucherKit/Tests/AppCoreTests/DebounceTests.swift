@@ -1,3 +1,4 @@
+import OfficeKit
 import Foundation
 import Testing
 import ViewerUI
@@ -10,7 +11,7 @@ struct DebounceTests {
     @Test func modelFollowsSetting() {
         let settings = makeSettings()
         let model = AppModel(settings: settings, defaults: UserDefaults(suiteName: "AppCoreTests-\(UUID().uuidString)")!,
-                             environment: FakeEnvironment(), openIndex: { _ in FakeIndex() })
+                             environment: FakeEnvironment(), slideCache: testSlideCache, openIndex: { _ in FakeIndex() }, officeRendering: PowerPointDisplaySetting())
         #expect(model.typingDelay == .milliseconds(50))
         settings.debounceMs = 150
         #expect(model.typingDelay == .milliseconds(150))

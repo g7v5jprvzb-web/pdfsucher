@@ -3,6 +3,7 @@ import SwiftUI
 import Testing
 @testable import ViewerUI
 
+#if DEBUG   // SampleViewerModel exists only in debug builds (release perf runs)
 /// 1.2.2 §2: font size of the toolbar, its persistence and the layout at 10–20 pt.
 @MainActor @Suite("Toolbar font")
 struct ToolbarFontTests {
@@ -57,3 +58,4 @@ struct ToolbarFontTests {
         if size > 13 { #expect(needed.width > normal.width, "a larger font makes the controls wider") }
     }
 }
+#endif

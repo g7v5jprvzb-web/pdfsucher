@@ -1,3 +1,4 @@
+import OfficeKit
 import Foundation
 import OutputKit
 import Testing
@@ -10,14 +11,14 @@ import ViewerUI
 struct ViewStatePersistenceTests {
     @Test func zoomKeptSearchAndTicksNot() async {
         let defaults = UserDefaults(suiteName: "ViewStateApp-\(UUID().uuidString)")!
-        let first = AppModel(settings: GridSettings(defaults: defaults), defaults: defaults, environment: FakeEnvironment(),
-                             debounce: .zero, openIndex: { _ in FakeIndex() })
+        let first = AppModel(settings: GridSettings(defaults: defaults), defaults: defaults, environment: FakeEnvironment(), slideCache: testSlideCache,
+                             debounce: .zero, openIndex: { _ in FakeIndex() }, officeRendering: PowerPointDisplaySetting())
         first.previewZoom.setLevel(3)
         first.queryText = "Vertrag"
         first.selection.toggle(PageRef(url: URL(fileURLWithPath: "/tmp/a.pdf"), pageIndex: 0))
         await first.waitUntilIdle()
-        let second = AppModel(settings: GridSettings(defaults: defaults), defaults: defaults, environment: FakeEnvironment(),
-                              debounce: .zero, openIndex: { _ in FakeIndex() })
+        let second = AppModel(settings: GridSettings(defaults: defaults), defaults: defaults, environment: FakeEnvironment(), slideCache: testSlideCache,
+                              debounce: .zero, openIndex: { _ in FakeIndex() }, officeRendering: PowerPointDisplaySetting())
         #expect(second.previewZoom.mode == .pageWidth(level: 3))
         #expect(second.queryText.isEmpty, "starts browsing: empty search field")
         #expect(second.selection.count == 0)

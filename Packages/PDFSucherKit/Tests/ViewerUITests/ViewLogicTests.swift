@@ -33,6 +33,10 @@ struct CopyTests {
         #expect(ViewerText.indexStatus(.problems(failed: ["a.pdf"], noText: [])) == "Index: aktuell · 1 Datei nicht lesbar")
         #expect(ViewerText.indexStatus(.problems(failed: ["a.pdf"], noText: ["b.pdf", "c.pdf"])) == "Index: aktuell · 1 Datei nicht lesbar · 2 Dateien ohne erkannten Text")   // 1.2 §8
         #expect(ViewerText.indexStatus(.unreachable) == "Ordner nicht erreichbar · Suche im gespeicherten Index")
+        // 1.3 Part B: the layout phase of Word/PowerPoint documents.
+        #expect(ViewerText.indexStatus(.layingOut(folder: 1, folders: 1, done: 12, total: 340)) == "Word/PowerPoint 12/340")
+        #expect(ViewerText.indexStatus(.layingOut(folder: 1, folders: 2, done: 12, total: 340)) == "Word/PowerPoint Ordner 1/2: 12/340")
+        #expect(ViewerText.indexStatus(.layingOut(folder: 1, folders: 1, done: 1200, total: 3400)) == "Word/PowerPoint 1.200/3.400")
     }
 
     @Test func selectionText() {

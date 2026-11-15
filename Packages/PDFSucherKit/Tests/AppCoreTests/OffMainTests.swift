@@ -1,3 +1,4 @@
+import OfficeKit
 import Foundation
 import Testing
 import TestSupport
@@ -13,8 +14,8 @@ struct OffMainTests {
         let index = FakeIndex()
         let onMain = Locked(false)
         let model = AppModel(settings: makeSettings(), defaults: UserDefaults(suiteName: "AppCoreTests-\(UUID().uuidString)")!,
-                             environment: FakeEnvironment(), debounce: .zero,
-                             openIndex: { _ in onMain.set(Thread.isMainThread); return index })
+                             environment: FakeEnvironment(), slideCache: testSlideCache, debounce: .zero,
+                             openIndex: { _ in onMain.set(Thread.isMainThread); return index }, officeRendering: PowerPointDisplaySetting())
         await model.open(folder: dir)
         #expect(onMain.value == false)
         #expect(model.canDeleteIndex)
@@ -43,14 +44,14 @@ struct OffMainTests {
         fastIndex.hits = [doc("neu.pdf", pages: [0])]
         let release = Locked(false)
         let model = AppModel(settings: makeSettings(), defaults: UserDefaults(suiteName: "AppCoreTests-\(UUID().uuidString)")!,
-                             environment: FakeEnvironment(), debounce: .zero,
+                             environment: FakeEnvironment(), slideCache: testSlideCache, debounce: .zero,
                              openIndex: { url in
                                  if url.lastPathComponent == "langsam" {
                                      waitFor(release)
                                      return slowIndex
                                  }
                                  return fastIndex
-                             })
+                             }, officeRendering: PowerPointDisplaySetting())
         let first = Task { await model.open(folder: slow) }
         try await Task.sleep(for: .milliseconds(50))
         await model.open(folder: fast)
@@ -67,11 +68,11 @@ struct OffMainTests {
         defer { try? FileManager.default.removeItem(at: base) }
         let release = Locked(false)
         let model = AppModel(settings: makeSettings(), defaults: UserDefaults(suiteName: "AppCoreTests-\(UUID().uuidString)")!,
-                             environment: FakeEnvironment(), debounce: .zero,
+                             environment: FakeEnvironment(), slideCache: testSlideCache, debounce: .zero,
                              openIndex: { _ in
                                  waitFor(release)
                                  return FakeIndex()
-                             })
+                             }, officeRendering: PowerPointDisplaySetting())
         let first = Task { await model.open(folder: base) }
         try await Task.sleep(for: .milliseconds(50))
         model.open(file: base.appendingPathComponent("a.pdf"))

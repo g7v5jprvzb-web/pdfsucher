@@ -1,5 +1,6 @@
 import Foundation
 import IndexKit
+import OfficeKit
 import OutputKit
 import SearchKit
 import Testing
@@ -17,7 +18,7 @@ struct SingleFileOCRTests {
 
     func model(defaults: UserDefaults? = nil) -> AppModel {
         AppModel(settings: makeSettings(), defaults: defaults ?? UserDefaults(suiteName: "SFO-\(UUID().uuidString)")!,
-                 environment: FakeEnvironment(), debounce: .zero, openIndex: { _ in FakeIndex() })
+                 environment: FakeEnvironment(), slideCache: testSlideCache, debounce: .zero, openIndex: { _ in FakeIndex() }, officeRendering: PowerPointDisplaySetting())
     }
 
     func image(_ name: String, _ lines: [String]) throws -> URL {

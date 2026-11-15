@@ -24,24 +24,30 @@ let outputLog = Logger(subsystem: "local.pdfsucher", category: "output")
 public struct Merger: Sendable {
     /// Writes the PDF bytes to a file; replaceable in tests to simulate failures (e.g. a full volume).
     private let writeData: @Sendable (Data, URL) throws -> Void
+    /// Pages of files it `handles` (Word, PowerPoint); nil = only PDFs and images, as before 1.3.
+    private let foreign: (any ForeignPageProvider)?
 
-    public init() {
-        self.init(writeData: { data, url in try data.write(to: url) })
+    public init(foreign: (any ForeignPageProvider)? = nil) {
+        self.init(writeData: { data, url in try data.write(to: url) }, foreign: foreign)
     }
 
-    init(writeData: @escaping @Sendable (Data, URL) throws -> Void) {
+    init(writeData: @escaping @Sendable (Data, URL) throws -> Void, foreign: (any ForeignPageProvider)? = nil) {
         self.writeData = writeData
+        self.foreign = foreign
     }
 
     /// Pages that cannot be merged or printed now: file missing, not a readable unlocked PDF (or, for
     /// image files, not decodable by ImageIO), or the page index beyond the file's current page count
-    /// (images have exactly page 0) — the same checks as `makeDocument`.
-    public static func unavailable(_ refs: [PageRef]) -> Set<PageRef> {
+    /// (images have exactly page 0) — the same checks as `makeDocument`. Files `foreign` handles have the pages its
+    /// `pageCount(of:)` reports (nil → all unavailable).
+    public static func unavailable(_ refs: [PageRef], foreign: (any ForeignPageProvider)? = nil) -> Set<PageRef> {
         var pageCounts: [URL: Int?] = [:]
         var result: Set<PageRef> = []
         for ref in refs {
             if pageCounts[ref.url] == nil {
-                if ImagePages.isImage(ref.url) {
+                if let foreign, foreign.handles(ref.url) {
+                    pageCounts[ref.url] = .some(foreign.pageCount(of: ref.url))
+                } else if ImagePages.isImage(ref.url) {
                     // An image is a document with exactly one page (spec 1.2 §4).
                     pageCounts[ref.url] = .some(ImagePages.isReadable(ref.url) ? 1 : nil)
                 } else {
@@ -58,7 +64,8 @@ public struct Merger: Sendable {
     }
 
     /// A new in-memory document with the pages of `refs`, in exactly that order. Refs to image files
-    /// (`ImagePages.isImage`, pageIndex 0) become A4 image pages (`ImagePages.makePage`).
+    /// (`ImagePages.isImage`, pageIndex 0) become A4 image pages (`ImagePages.makePage`); refs to files the
+    /// `foreign` provider handles come from it (`cannotOpen` when it reports no page count, `pageOutOfRange` beyond it).
     /// Each source file is opened once. Throws before producing anything if any page is unavailable.
     /// Internal links point to the merged copy of their target page (its first occurrence)
     /// and are removed when that page is not part of the merge.
@@ -68,7 +75,17 @@ public struct Merger: Sendable {
         var outputIndex: [PageRef: Int] = [:]
         var links: [(annotation: PDFAnnotation, target: PageRef?, point: CGPoint)] = []
         let result = PDFDocument()
+        var foreignCounts: [URL: Int?] = [:]
         for ref in refs {
+            if let foreign, foreign.handles(ref.url) {
+                // Foreign pages carry no internal links.
+                let count = foreignCounts[ref.url] ?? foreign.pageCount(of: ref.url)
+                foreignCounts[ref.url] = .some(count)
+                let page = try Self.foreignPage(ref, count: count, from: foreign)
+                if outputIndex[ref] == nil { outputIndex[ref] = result.pageCount }
+                result.insert(page, at: result.pageCount)
+                continue
+            }
             if ImagePages.isImage(ref.url) {
                 // Image files become their own A4 page (spec 1.2 §6); they carry no links.
                 guard ref.pageIndex == 0 else {
@@ -124,6 +141,25 @@ public struct Merger: Sendable {
             }
         }
         return result
+    }
+
+    private static func foreignPage(_ ref: PageRef, count: Int?, from foreign: any ForeignPageProvider) throws -> PDFPage {
+        guard let count else {
+            outputLog.error("Cannot open \(ref.url.path, privacy: .public) (no pages)")
+            throw OutputError.cannotOpen(ref.url)
+        }
+        guard ref.pageIndex >= 0, ref.pageIndex < count else {
+            outputLog.error("Page \(ref.pageIndex) out of range (\(count) pages) in \(ref.url.path, privacy: .public)")
+            throw OutputError.pageOutOfRange(ref)
+        }
+        do {
+            return try foreign.makePage(ref)
+        } catch let error as OutputError {
+            throw error
+        } catch {
+            outputLog.error("Cannot make page \(ref.pageIndex) of \(ref.url.path, privacy: .public): \(String(describing: error), privacy: .public)")
+            throw OutputError.cannotOpen(ref.url)
+        }
     }
 
     private static func internalDestination(of annotation: PDFAnnotation) -> PDFDestination? {

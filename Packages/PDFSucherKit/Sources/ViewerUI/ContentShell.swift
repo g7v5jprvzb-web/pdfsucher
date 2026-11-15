@@ -1,4 +1,5 @@
 // ContentShell.swift — Task 4.3
+import AppKit
 import SearchKit
 import SwiftUI
 
@@ -10,7 +11,8 @@ public struct ContentShell: View {
     static let toolbarPadding: CGFloat = 12
     private let model: any ViewerModel
     private let highlighter: @MainActor (ParsedQuery) -> HighlightRanges?
-    @State private var cache = ThumbnailCache(disk: .standard)
+    @State private var cache: ThumbnailCache
+    private let tileDisk: TileDiskCache
     @State private var isDropTargeted = false
     @State private var searchHandle = SearchFieldHandle()
     /// Keyboard focus of preview and grid; the search field (AppKit) is asked through `searchHandle`.
@@ -20,9 +22,13 @@ public struct ContentShell: View {
 
     /// - Parameter highlighter: turns the current query into a `HighlightRanges` closure. Phase 5
     ///   passes `{ q in { PageMatcher(q).ranges(in: $0) ?? [] } }`; the default draws no highlights.
-    public init(model: some ViewerModel, highlighter: @escaping @MainActor (ParsedQuery) -> HighlightRanges? = { _ in nil }) {
+    /// - Parameter tileDisk: the tiles on disk; screenshot tests pass one in a temp folder.
+    public init(model: some ViewerModel, highlighter: @escaping @MainActor (ParsedQuery) -> HighlightRanges? = { _ in nil },
+                tileDisk: TileDiskCache = .standard) {
         self.model = model
         self.highlighter = highlighter
+        self.tileDisk = tileDisk
+        _cache = State(initialValue: ThumbnailCache(disk: tileDisk, foreign: model.foreignPages))
     }
 
     private var highlight: (key: String, ranges: HighlightRanges?) {
@@ -31,7 +37,7 @@ public struct ContentShell: View {
     }
 
     private var preview: some View {
-        PageDetailView(model: model, highlightKey: highlight.key, highlightRanges: highlight.ranges)
+        PageDetailView(model: model, cache: cache, highlightKey: highlight.key, highlightRanges: highlight.ranges)
             .focusable()
             .focused($focus, equals: .preview)
             .focusEffectDisabled()
@@ -47,8 +53,19 @@ public struct ContentShell: View {
             .padding(.horizontal, Self.toolbarPadding)
             .padding(.vertical, 8)
             Divider()
-            // The divider position is remembered per preview position (1.2.1 §2).
-            PreviewSplit(position: model.settings.previewPosition, settings: model.settings) { preview } grid: { grid }
+            // Ordnerleiste at the left, full height under the toolbar; the folder filter header over preview and grid.
+            HStack(spacing: 0) {
+                if model.folderBar.isVisible {
+                    FolderSidebar(model: model)
+                        .frame(width: CGFloat(model.folderBar.width))
+                    FolderBarHandle(settings: model.folderBar)
+                }
+                VStack(spacing: 0) {
+                    FolderFilterHeader(model: model)
+                    // The divider position is remembered per preview position (1.2.1 §2).
+                    PreviewSplit(position: model.settings.previewPosition, settings: model.settings, zoom: model.previewZoom) { preview } grid: { grid }
+                }
+            }
             Divider()
             SelectionBar(model: model)
                 .padding(.horizontal, 12)
@@ -59,6 +76,13 @@ public struct ContentShell: View {
                                       save: { [settings = model.settings] in settings.mainWindowFrame = $0 }))
         .acceptsFileDrops(isTargeted: $isDropTargeted) { model.addSources($0) }
         .onChange(of: focus) { _, area in if let area { lastFocus = area } }
+        // Another PowerPoint renderer or font choice: a new tile cache with the new provider (its tiles in memory were
+        // drawn by the old one; on disk the content version keeps them apart).
+        // The old cache's prefetch stops first, so it does not reopen decks with the old fonts.
+        .onChange(of: model.foreignPagesRevision) { _, _ in
+            cache.prefetch([])
+            cache = ThumbnailCache(disk: tileDisk, foreign: model.foreignPages)
+        }
         .onChange(of: model.settings.previewPosition) { _, _ in
             let area = lastFocus
             Task { @MainActor in focus = area }      // after the rebuilt views are in the window
@@ -81,6 +105,33 @@ public struct ContentShell: View {
     }
 }
 
+/// The folder bar's right edge: drag to change its width (remembered).
+struct FolderBarHandle: View {
+    let settings: FolderBarSettings
+    @State private var start: Double?
+    @State private var hovering = false
+
+    var body: some View {
+        Rectangle().fill(Color(nsColor: .separatorColor)).frame(width: 1)
+            .padding(.horizontal, 3)
+            .contentShape(Rectangle())
+            .onHover { inside in
+                guard inside != hovering else { return }
+                hovering = inside
+                if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+            }
+            .onDisappear { if hovering { hovering = false; NSCursor.pop() } }
+            .gesture(DragGesture(minimumDistance: 1)
+                .onChanged { value in
+                    let base = start ?? settings.width
+                    if start == nil { start = base }
+                    settings.width = base + value.translation.width
+                }
+                .onEnded { _ in start = nil })
+            .accessibilityIdentifier("folderBarHandle")
+    }
+}
+
 /// Second toolbar line: how the grid and the preview look (1.1: more controls than fit next to the
 /// status, which now has its own third line).
 struct ViewControls: View {
@@ -88,6 +139,13 @@ struct ViewControls: View {
 
     var body: some View {
         HStack(spacing: 12) {
+            Button { model.folderBar.toggle() } label: {
+                Image(systemName: "sidebar.left")
+            }
+            .buttonStyle(.borderless)
+            .help(model.folderBar.isVisible ? ViewerText.hideFolderBar + " (⌃⌘S)" : ViewerText.showFolderBar + " (⌃⌘S)")
+            .accessibilityLabel(model.folderBar.isVisible ? ViewerText.hideFolderBar : ViewerText.showFolderBar)
+            .accessibilityIdentifier("folderBarToggle")
             GridControls(settings: model.settings)
             Spacer(minLength: 0)
         }

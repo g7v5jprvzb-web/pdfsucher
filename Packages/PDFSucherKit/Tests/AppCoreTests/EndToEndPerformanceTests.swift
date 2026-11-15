@@ -1,3 +1,4 @@
+import OfficeKit
 import AppKit
 import Foundation
 import Testing
@@ -31,8 +32,8 @@ struct EndToEndPerformanceTests {
         let indexURL = base.appendingPathComponent("index.sqlite")
         let model = AppModel(settings: GridSettings(defaults: UserDefaults(suiteName: "E2E-\(UUID().uuidString)")!),
                              defaults: UserDefaults(suiteName: "E2E-\(UUID().uuidString)")!,
-                             environment: SilentEnvironment(), debounce: .zero,
-                             openIndex: { try FolderIndex.shared(root: $0, indexURL: indexURL) })
+                             environment: SilentEnvironment(), slideCache: testSlideCache, debounce: .zero,
+                             openIndex: { try FolderIndex.shared(root: $0, indexURL: indexURL, slideCache: testSlideCache) }, officeRendering: PowerPointDisplaySetting())
         let clock = ContinuousClock()
         let indexing = await clock.measure {
             await model.open(folder: root)
@@ -100,8 +101,8 @@ struct EndToEndPerformanceTests {
         try FileManager.default.createDirectory(at: indexDir, withIntermediateDirectories: true)
         let model = AppModel(settings: GridSettings(defaults: UserDefaults(suiteName: "E2E3-\(UUID().uuidString)")!),
                              defaults: UserDefaults(suiteName: "E2E3-\(UUID().uuidString)")!,
-                             environment: SilentEnvironment(), debounce: .zero,
-                             openIndex: { try FolderIndex.shared(root: $0, indexURL: indexDir.appendingPathComponent($0.lastPathComponent + ".sqlite")) })
+                             environment: SilentEnvironment(), slideCache: testSlideCache, debounce: .zero,
+                             openIndex: { try FolderIndex.shared(root: $0, indexURL: indexDir.appendingPathComponent($0.lastPathComponent + ".sqlite"), slideCache: testSlideCache) }, officeRendering: PowerPointDisplaySetting())
         let clock = ContinuousClock()
         let indexing = await clock.measure {
             await model.add(folders)
@@ -179,5 +180,6 @@ private final class FirstRows: @unchecked Sendable {
     func chooseSaveLocation(defaultName: String) -> URL? { nil }
     func runPrint(_ operation: NSPrintOperation) {}
     func openInPreview(_ url: URL) {}
+    func openWithDefaultApp(_ url: URL) {}
     func confirmDeleteIndex(question: String) -> Bool { false }
 }

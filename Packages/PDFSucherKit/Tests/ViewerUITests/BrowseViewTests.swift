@@ -67,17 +67,22 @@ struct BrowseViewTests {
         #expect(FocusNavigator.step(from: nil, by: 1, hits: hits) == PageRef(url: a, pageIndex: 0))
     }
 
+    /// 200 steps ‹ › over 10,000 files. The best of 5 runs is compared: isolated a run takes about 295 ms
+    /// every time, under the load of the parallel test suite the first one took up to 620 ms (decisions.md,
+    /// 1.2.4 Nachtrag). The best run measures the code, not the machine's load; the limit stays 500 ms.
     @Test func stepIsFastWithTenThousandFiles() {
         let hits = (0..<10_000).map { entry("d\($0).pdf", pages: 20) }
         let clock = ContinuousClock()
-        let elapsed = clock.measure {
-            var ref = PageRef(url: hits[5_000].url, pageIndex: 19)
-            for _ in 0..<200 {
-                _ = FocusNavigator.canStep(from: ref, by: 1, hits: hits)
-                ref = FocusNavigator.step(from: ref, by: 1, hits: hits) ?? ref
+        let runs = (0..<5).map { _ in
+            clock.measure {
+                var ref = PageRef(url: hits[5_000].url, pageIndex: 19)
+                for _ in 0..<200 {
+                    _ = FocusNavigator.canStep(from: ref, by: 1, hits: hits)
+                    ref = FocusNavigator.step(from: ref, by: 1, hits: hits) ?? ref
+                }
             }
         }
-        #expect(elapsed < .milliseconds(500), "\(elapsed)")
+        #expect(runs.min()! < .milliseconds(500), "runs: \(runs)")
     }
 
     @Test func showAllIgnoresOutOfRangeHitPages() {

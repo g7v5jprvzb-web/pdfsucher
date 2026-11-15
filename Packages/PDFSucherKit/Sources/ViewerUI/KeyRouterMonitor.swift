@@ -22,8 +22,17 @@ import SwiftUI
             if area == .search { focusSearch() } else { setFocus(area) }
         case .showHistory:
             openHistory()
+        case .focusFolderTree:
+            break                                           // the monitor does it (it has the window)
         case .navigate(let direction):
             setFocus(.grid)
+            // 1.3.3 (Chris): the search shows its first hit by itself; the first ↓ from the field enters the grid
+            // on exactly that tile, so „type, ↓, Return“ ticks the first hit. Set again: now the user's choice.
+            if direction == .down, model.focusIsAutomatic, let shown = model.focusedPage {
+                model.focusedPage = shown
+                model.noteSearchArrived()
+                break
+            }
             if let next = FocusNavigator.next(from: model.focusedPage, direction: direction, hits: model.hits,
                                               showAllPages: model.settings.showAllPages) {
                 model.focusedPage = next
@@ -138,12 +147,15 @@ struct KeyRouterInstaller: NSViewRepresentable {
             let otherText = !searchFocused && window.firstResponder is NSText
             let editor = window.firstResponder as? NSTextView
             let dialogOpen = NSApp.modalWindow != nil || window.attachedSheet != nil || !window.isKeyWindow
-            let context = KeyContext(typeToSearch: model.keyboard.typeToSearch, tabSkipsSearch: model.keyboard.tabSkipsSearch,
+            let context = KeyContext(typeToSearch: model.keyboard.typeToSearch, tabIncludesSearch: model.keyboard.tabIncludesSearch,
+                                     tabIncludesPreview: model.keyboard.tabIncludesPreview,
                                      focus: searchFocused ? .search : focus(), otherTextFieldFocused: otherText,
                                      dialogOpen: dialogOpen, fullKeyboardAccess: NSApp.isFullKeyboardAccessEnabled,
                                      composing: editor?.hasMarkedText() == true,
                                      searchFocusIsExplicit: searchFocused && search.focusIsExplicit,
                                      responderTakesArrows: Self.responderTakesArrows(window.firstResponder, searchFocused: searchFocused),
+                                     folderTreeFocused: window.firstResponder is NSTableView,     // the folder bar's list
+                                     folderBarVisible: shortcut.key == "tab" && Self.folderTree(in: window) != nil,   // only for Tab: walks the views
                                      shortcuts: model.keyboard.all)
             let decision = KeyRouting.decide(KeyInput(shortcut: shortcut, characters: event.characters ?? ""), in: context)
             guard decision != .passThrough else { return event }
@@ -157,6 +169,11 @@ struct KeyRouterInstaller: NSViewRepresentable {
             if case .navigate = decision, searchFocused {
                 window.makeFirstResponder(nil)
             }
+            if decision == .focusFolderTree, let tree = Self.folderTree(in: window) {
+                setFocus(nil)
+                window.makeFirstResponder(tree)
+                return nil
+            }
             KeyRouterApplier.apply(decision, to: model, setFocus: setFocus, focusSearch: { search.focusSelectingAll() },
                                    openHistory: { search.openHistory?() })
             return nil
@@ -165,6 +182,16 @@ struct KeyRouterInstaller: NSViewRepresentable {
 
     static func dismantleNSView(_ view: HostView, coordinator: Coordinator) {
         coordinator.remove()
+    }
+
+    /// The folder bar's list (the only table view in the main window).
+    static func folderTree(in window: NSWindow) -> NSTableView? {
+        func find(_ view: NSView) -> NSTableView? {
+            if let table = view as? NSTableView, !table.isHiddenOrHasHiddenAncestor { return table }
+            for sub in view.subviews { if let found = find(sub) { return found } }
+            return nil
+        }
+        return window.contentView.flatMap(find)
     }
 
     /// An AppKit control (not the search field) or the PDF view, or a view inside it, has the keyboard.
@@ -193,7 +220,7 @@ struct SearchTextField: NSViewRepresentable {
     var fontSize: CGFloat?
 
     /// ⌄ and „?“ (symbols ≈ 1.2 × the font size), their spacing and the padding.
-    static func trailingInset(fontSize: CGFloat) -> CGFloat { max(42, (2 * fontSize * 1.2 + 9).rounded(.up)) }
+    nonisolated static func trailingInset(fontSize: CGFloat) -> CGFloat { max(42, (2 * fontSize * 1.2 + 9).rounded(.up)) }
 
     final class Field: NSTextField {
         weak var handle: SearchFieldHandle?

@@ -15,11 +15,15 @@ private final class ContractViewerModel: ViewerModel {
     let settings: GridSettings
     init(defaults: UserDefaults) { settings = GridSettings(defaults: defaults) }
     var indexStatus: IndexStatus = .none
+    var layoutRevision = 0
     var summary = ""
     var isSearching = false
     var isBrowsing = false
+    var hiddenByFilter = 0
     let previewZoom = PreviewZoom()
     let ocrPreferences = OCRPreferences(defaults: UserDefaults(suiteName: "PDFSucher.Sample.OCR") ?? .standard)
+    let officePreferences = OfficePreferences(defaults: UserDefaults(suiteName: "PDFSucher.Sample.Office") ?? .standard)
+    let foreignPages: (any ForeignPageProvider)? = nil
     func stopRecognition() {}
     var isRecognitionStopped = false
     func resumeRecognition() {}
@@ -36,6 +40,16 @@ private final class ContractViewerModel: ViewerModel {
     let searchHistory = SearchHistory(defaults: UserDefaults(suiteName: "Sample-\(UUID())")!)
     func noteSearchArrived() {}
     func chooseHistoryEntry(_ term: String) { queryText = term }
+    var folderTree: [FolderNode] = []
+    var folderFilter = FolderFilter()
+    var filterHeader: String? { nil }
+    let folderBar = FolderBarSettings(defaults: UserDefaults(suiteName: "SampleFolderBar-\(UUID())")!)
+    func selectFolder(_ folder: URL, adding: Bool) { folderFilter.select(folder, adding: adding) }
+    func selectSingleFiles(adding: Bool) {}
+    func clearFolderFilter() { folderFilter.clear() }
+    func setFolderFilter(_ filter: FolderFilter) { folderFilter = filter }
+    func openPlace(_ folder: URL) async {}
+    func requestDeleteIndex(for source: URL?) {}
     var addPrompt: AddPrompt?
     func answerAddPrompt(_ choice: AddChoice, remember: Bool) {}
     func removeSource(_ url: URL) {}
@@ -43,6 +57,7 @@ private final class ContractViewerModel: ViewerModel {
     func printSelection() {}
     func saveSelection() {}
     func openInPreview(_ r: PageRef) {}
+    func slidesMissing(for ref: PageRef) {}
 }
 
 @Suite("ViewerUI public contract")

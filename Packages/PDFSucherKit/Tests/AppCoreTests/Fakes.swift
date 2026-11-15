@@ -1,15 +1,37 @@
 import AppKit
 import Foundation
 import IndexKit
+import OfficeKit
 import OutputKit
 import SearchKit
+import Testing
 import ViewerUI
 @testable import AppCore
+
+/// A held fake run that nobody releases or cancels within this time is a test bug (or a regression in the
+/// queue's pre-emption): it records an issue and throws instead of hanging the suite.
+let fakeHoldDeadline: Duration = .seconds(20)
+
+struct FakeHoldTimedOut: Error {}
+
+/// Records an issue and throws once `deadline` has passed.
+func checkFakeHold(_ what: String, deadline: ContinuousClock.Instant) throws {
+    guard ContinuousClock.now > deadline else { return }
+    Issue.record("\(what) was held longer than \(fakeHoldDeadline) without release or cancellation")
+    throw FakeHoldTimedOut()
+}
 
 /// Stand-in for a folder index: scripted search results, a counter, and an `update` that can be
 /// held open until the test releases it (or the task is cancelled).
 final class FakeIndex: FolderIndexing, @unchecked Sendable {
     private let lock = NSLock()
+    /// Renderer names this index reports stored layouts of (`hasLayouts(byRenderer:)`, 1.3.2).
+    var storedRenderers: Set<String> {
+        get { lock.withLock { _storedRenderers } }
+        set { lock.withLock { _storedRenderers = newValue } }
+    }
+    private var _storedRenderers: Set<String> = []
+    func hasLayouts(byRenderer renderer: String) throws -> Bool { storedRenderers.contains(renderer) }
     private var _hits: [DocumentHit] = []
     private var _searchCount = 0
     private var _searchErrors: [Error] = []
@@ -66,6 +88,15 @@ final class FakeIndex: FolderIndexing, @unchecked Sendable {
         set { lock.withLock { _partialHits = newValue } }
     }
 
+    private var _searchNames: [Bool] = []
+    /// `searchNames` of every search (1.3.2: file name search).
+    var searchNamesSeen: [Bool] { lock.withLock { _searchNames } }
+
+    func search(_ q: ParsedQuery, sort: SortMode, searchNames: Bool, onPartial: (@Sendable ([DocumentHit]) -> Void)?) throws -> [DocumentHit] {
+        lock.withLock { _searchNames.append(searchNames) }
+        return try search(q, sort: sort, onPartial: onPartial)
+    }
+
     func search(_ q: ParsedQuery, sort: SortMode, onPartial: (@Sendable ([DocumentHit]) -> Void)?) throws -> [DocumentHit] {
         let error: Error? = lock.withLock {
             _searchCount += 1
@@ -80,7 +111,13 @@ final class FakeIndex: FolderIndexing, @unchecked Sendable {
         return sortHits(hits, by: sort)
     }
 
+    /// Called (off the main actor) at the start of every `update` with its number, 1 for the first.
+    var beforeUpdate: (@Sendable (Int) -> Void)?
+    private var _updateCount = 0
+
     func update(progress: @Sendable (IndexProgress) -> Void) async throws -> IndexReport {
+        let number = lock.withLock { _updateCount += 1; return _updateCount }
+        beforeUpdate?(number)
         record("update-start")
         ocrLog?.append("\(name):update-start")
         progress(IndexProgress(done: 0, total: 3, currentFile: nil))
@@ -129,17 +166,21 @@ final class FakeIndex: FolderIndexing, @unchecked Sendable {
         set { lock.withLock { _hitsAfterRecognition = newValue } }
     }
     private(set) var configured: [OCRSettings] = []
+    /// `includeOffice` of every `configure` call (1.3 Part B).
+    private(set) var configuredOffice: [Bool] = []
 
     func recognize(progress: @Sendable (IndexProgress) -> Void) async throws -> OCRReport {
         lock.withLock { _ocrCount += 1 }
         ocrLog?.append("\(name):ocr-start")
         progress(IndexProgress(done: 0, total: lock.withLock { _ocrTotal }, currentFile: nil, phase: .ocr))
+        let deadline = ContinuousClock.now + fakeHoldDeadline
         while holdRecognition {
             for p in lock.withLock({ defer { _progress.removeAll() }; return _progress }) { progress(p) }
             if Task.isCancelled {
                 ocrLog?.append("\(name):ocr-cancelled")
                 throw CancellationError()
             }
+            try checkFakeHold("\(name) recognition", deadline: deadline)
             try? await Task.sleep(for: .milliseconds(2))
         }
         if let after = hitsAfterRecognition { hits = after }
@@ -147,7 +188,9 @@ final class FakeIndex: FolderIndexing, @unchecked Sendable {
         return ocrReport
     }
 
-    func configure(_ settings: OCRSettings) { lock.withLock { configured.append(settings) } }
+    func configure(_ settings: OCRSettings, includeOffice: Bool) {
+        lock.withLock { configured.append(settings); configuredOffice.append(includeOffice) }
+    }
     var counts = (pages: 0, images: 0)
     func ocrCounts() throws -> (pages: Int, images: Int) { counts }
     func resetOCR() throws { ocrLog?.append("\(name):reset-ocr") }
@@ -174,6 +217,97 @@ final class FakeIndex: FolderIndexing, @unchecked Sendable {
     }
     /// Reported by a held `update` (as if the indexer had made progress).
     func emitProgress(_ p: IndexProgress) { lock.withLock { _progress.append(p) } }
+
+    // MARK: Phase „layout“ (Word/PowerPoint, 1.3 Part B)
+
+    /// Layout events "<name>:layout-start|end|cancelled" (not in `ocrLog`, so 1.2 tests keep their sequences;
+    /// layout tests pass the same log for both).
+    var layoutLog: StringLog?
+    private var _holdLayout = false
+    private var _layoutReport = LayoutReport()
+    private var _layoutCount = 0
+    private var _layoutRequests: [String] = []
+    var holdLayout: Bool {
+        get { lock.withLock { _holdLayout } }
+        set { lock.withLock { _holdLayout = newValue } }
+    }
+    var layoutReport: LayoutReport {
+        get { lock.withLock { _layoutReport } }
+        set { lock.withLock { _layoutReport = newValue } }
+    }
+    var layoutCount: Int { lock.withLock { _layoutCount } }
+    private var _finishLayoutDespiteCancel = false
+    /// A cancelled held `layOut` ignores the cancellation and still returns `layoutReport` once released
+    /// (a run that ends successfully just after it was stopped).
+    var finishLayoutDespiteCancel: Bool {
+        get { lock.withLock { _finishLayoutDespiteCancel } }
+        set { lock.withLock { _finishLayoutDespiteCancel = newValue } }
+    }
+    /// `requestLayout` calls: "kind:<kind>" or "path:<relativePath>"; `adoptPowerPointRenderer`: "adopt:powerpoint".
+    var layoutRequests: [String] { lock.withLock { _layoutRequests } }
+
+    private var _layoutTotal = 2
+    /// The documents the first progress of `layOut` reports (like the indexer's pending jobs; 0 = no Office files).
+    var layoutTotal: Int {
+        get { lock.withLock { _layoutTotal } }
+        set { lock.withLock { _layoutTotal = newValue } }
+    }
+
+    func layOut(progress: @Sendable (IndexProgress) -> Void) async throws -> LayoutReport {
+        lock.withLock { _layoutCount += 1 }
+        layoutLog?.append("\(name):layout-start")
+        progress(IndexProgress(done: 0, total: layoutTotal, currentFile: nil, phase: .layout))
+        let deadline = ContinuousClock.now + fakeHoldDeadline
+        while holdLayout {
+            for p in lock.withLock({ defer { _progress.removeAll() }; return _progress }) { progress(p) }
+            if Task.isCancelled, !finishLayoutDespiteCancel {
+                layoutLog?.append("\(name):layout-cancelled")
+                throw CancellationError()
+            }
+            try checkFakeHold("\(name) layout", deadline: deadline)
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+        layoutLog?.append("\(name):layout-end")
+        return layoutReport
+    }
+    var layoutCountsValue = LayoutCounts()
+    func layoutCounts() throws -> LayoutCounts { layoutCountsValue }
+    func requestLayout(kind: DocumentKind) throws { lock.withLock { _layoutRequests.append("kind:\(kind.rawValue)") } }
+    func requestLayout(relativePath: String) throws { lock.withLock { _layoutRequests.append("path:\(relativePath)") } }
+    private var _holdAdopt = false
+    private var _adoptStarted = 0
+    /// `adoptPowerPointRenderer` calls begun (also held ones).
+    var adoptStarted: Int { lock.withLock { _adoptStarted } }
+    /// Holds `adoptPowerPointRenderer` (runs detached) until cleared.
+    var holdAdopt: Bool {
+        get { lock.withLock { _holdAdopt } }
+        set { lock.withLock { _holdAdopt = newValue } }
+    }
+    func adoptPowerPointRenderer() throws {
+        lock.withLock { _adoptStarted += 1 }
+        let deadline = ContinuousClock.now + fakeHoldDeadline
+        while holdAdopt {
+            try checkFakeHold("\(name) adopt", deadline: deadline)
+            Thread.sleep(forTimeInterval: 0.002)
+        }
+        lock.withLock { _layoutRequests.append("adopt:powerpoint") }
+    }
+
+    private var _outdated: Set<String> = []
+    private var _outdatedChecks: [String] = []
+    /// Relative paths whose file on disk differs from the stored version (`isOutdated`).
+    var outdatedPaths: Set<String> {
+        get { lock.withLock { _outdated } }
+        set { lock.withLock { _outdated = newValue } }
+    }
+    /// Every `isOutdated` call, by relative path.
+    var outdatedChecks: [String] { lock.withLock { _outdatedChecks } }
+    func isOutdated(relativePath: String) throws -> Bool {
+        lock.withLock {
+            _outdatedChecks.append(relativePath)
+            return _outdated.contains(relativePath)
+        }
+    }
 }
 
 @MainActor final class FakeEnvironment: AppEnvironment {
@@ -187,6 +321,8 @@ final class FakeIndex: FolderIndexing, @unchecked Sendable {
     func chooseSaveLocation(defaultName: String) -> URL? { saveURL }
     func runPrint(_ operation: NSPrintOperation) { printed.append(operation) }
     func openInPreview(_ url: URL) { opened.append(url) }
+    var openedWithDefaultApp: [URL] = []
+    func openWithDefaultApp(_ url: URL) { openedWithDefaultApp.append(url) }
     var confirmations: [String] = []
     func confirmDeleteIndex(question: String) -> Bool { confirmations.append(question); return confirmAnswer }
 }
@@ -211,13 +347,19 @@ final class StringLog: @unchecked Sendable {
     GridSettings(defaults: UserDefaults(suiteName: "AppCoreTests-\(UUID().uuidString)")!)
 }
 
+/// The slide cache of every test model and test folder index (1.3 Teil B Task 9, M1): a folder in the temp
+/// directory, never the user's `~/Library/Application Support/PDFSucher/SlideCache`.
+let testSlideCache = SlideCache(root: FileManager.default.temporaryDirectory
+    .appendingPathComponent("AppCoreTests-SlideCache-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true))
+
 @MainActor func makeModel(index: FakeIndex, environment: FakeEnvironment = FakeEnvironment(),
                           settings: GridSettings? = nil) -> AppModel {
     AppModel(settings: settings ?? makeSettings(),
              defaults: UserDefaults(suiteName: "AppCoreTests-\(UUID().uuidString)")!,
              environment: environment,
+             slideCache: testSlideCache,
              debounce: .zero,
-             openIndex: { _ in index })
+             openIndex: { _ in index }, officeRendering: PowerPointDisplaySetting())
 }
 
 /// Polls `condition` on the main actor (for states reached while another task is held open).

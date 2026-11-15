@@ -5,9 +5,11 @@ import IndexKit
 import Observation
 import os
 import OCRKit
+import OfficeKit
 import OutputKit
 import PDFKit
 import SearchKit
+import Synchronization
 import ViewerUI
 
 /// The app's `ViewerModel`: holds the loaded sources (folders with their index, single PDFs), indexes
@@ -27,21 +29,96 @@ import ViewerUI
     public var queryText = "" {
         didSet {
             guard queryText != oldValue else { return }
+            lastTyping = .now                     // defers a font registration start (fonts-start c)
             historyTask?.cancel()                 // a pause only counts once typing stopped (1.2.2 §1)
             historyArmed = true                   // only a typed term arms the pause (not a refresh, review I2)
             scheduleSearch(debounced: true)
         }
     }
+    /// The shown documents: `allHits` through the grid filters (spec 1.3 §8a): the folder filter
+    /// (Ordnerleiste), further filters (`extraFilters`) and the file types, ANDed.
     public private(set) var hits: [DocumentHit] = []
+    /// Every document of the last search or browse, sorted, before the grid filters. Gives ticked pages of
+    /// hidden documents their place in the output (`orderedSelection`).
+    @ObservationIgnored var allHits: [DocumentHit] = []
+    /// How `summary` is made from the shown documents.
+    enum SummaryStyle { case empty, search, browse }
+    @ObservationIgnored var summaryStyle = SummaryStyle.empty
+    /// Documents inside the chosen folders that the file types hide (spec 1.3 §8a: the empty grid and the summary
+    /// say so). Files outside the chosen folders are not counted: the folder header says „x von y“.
+    public private(set) var hiddenByFilter = 0
+    /// Ordnerleiste: folders of the sources (from the document list) and the chosen folders.
+    public internal(set) var folderTree: [FolderNode] = []
+    public var folderFilter = FolderFilter() {
+        didSet { if folderFilter != oldValue { publishFiltered(keepFocus: false) } }
+    }
+    public let folderBar: FolderBarSettings
+    /// Further filters on the grid, combined with the folder filter and the file types (AND).
+    public var extraFilters: [any DocumentFilter] = [] {
+        didSet { publishFiltered(keepFocus: false) }
+    }
+    /// The files of the last browse list (the tree's source).
+    @ObservationIgnored var browseFiles: [URL] = []
+    /// Watches the folder sources on disk (FSEvents in the app; nil in tests unless a fake is set).
+    @ObservationIgnored public var folderWatcher: (any FolderWatching)? {
+        didSet {
+            folderWatcher?.onChange = { [weak self] roots, urgent in self?.foldersChangedOnDisk(roots, urgent: urgent) }
+            updateWatchedFolders()
+        }
+    }
+    /// Sources changed on disk whose run has not succeeded yet.
+    @ObservationIgnored var changedOnDisk: Set<String> = []
+    /// Sources whose run after a change on disk succeeded: at the next tree, chosen folders below them that
+    /// the tree no longer has leave the filter.
+    @ObservationIgnored var checkFilterAfterTree: Set<String> = []
+    /// A source changed on disk is indexed again at most once per cooldown (a long copy into Downloads must
+    /// not index it every 1.5 s and keep the text recognition from running); later reports wait for its end.
+    @ObservationIgnored var diskChangeCooldown: Duration = .seconds(10)
+    @ObservationIgnored private var lastDiskRun: [String: ContinuousClock.Instant] = [:]
+    @ObservationIgnored private var diskChangeDue: Set<String> = []
+    @ObservationIgnored private var diskChangeTask: Task<Void, Never>?
+    /// A place clicked while it was not loaded: filtered to once it is (after the add prompt).
+    @ObservationIgnored var pendingPlaceFilter: URL?
     public private(set) var query = ParsedQuery(terms: [])
     /// A tick or a tile chosen with the mouse or the arrows means the search arrived (1.2.2 §1).
     /// Only a single tick or untick counts; clearing or pruning several at once does not (review M1).
     public var selection = PageSelection() {
         didSet { if abs(selection.count - oldValue.count) == 1 { noteSearchArrived() } }
     }
+    /// The tile shown in the large preview. Set by the user (click, arrows, ‹ ›) or, during a search, by the model
+    /// itself: the first hit page (1.3.3, `show` and `refillEmptyPreview`).
     public var focusedPage: PageRef? {
-        didSet { if focusedPage != nil, focusedPage != oldValue { noteSearchArrived() } }
+        didSet {
+            guard !settingFocus else { return }
+            // Any page the user sets is their choice, even the one already shown (it was the automatic one).
+            focusChosenByUser = focusedPage != nil
+            if focusedPage != nil, focusedPage != oldValue { noteSearchArrived() }
+        }
     }
+    /// The user chose the focused page for the current search term: new results of that term keep it (1.3.3).
+    @ObservationIgnored private(set) var focusChosenByUser = false
+    /// The shown page is the search's first hit, set by the model (1.3.3): the first ↓ from the search field enters
+    /// the grid on it (`KeyRouterApplier`). Not while browsing: there ↓ moves on as before.
+    public var focusIsAutomatic: Bool {
+        focusedPage != nil && !focusChosenByUser && summaryStyle == .search && !query.isEmpty
+    }
+    /// A new term waits for its final result to show the first hit (1.3.3; early rows do not, review 2).
+    @ObservationIgnored private var firstHitPending = false
+    /// The model sets `focusedPage` itself: neither the user's choice nor an arrival for the history.
+    @ObservationIgnored private var settingFocus = false
+
+    /// Every write of `focusedPage` inside the model goes through here; a direct write counts as the user's
+    /// choice and as an arrival for the search history (review 5).
+    private func setFocusByModel(_ page: PageRef?) {
+        if page == nil { focusChosenByUser = false }      // nothing shown: nobody's choice (review 3)
+        guard focusedPage != page else { return }
+        settingFocus = true
+        focusedPage = page
+        settingFocus = false
+    }
+    /// Tiles on disk of the window's grid (spec 1.2.4 §3: cleaned after indexing and „Index löschen“);
+    /// the app sets it, tests leave it nil.
+    public var tileDisk: TileDiskCache?
     /// The last search terms (1.2.2 §1).
     public let searchHistory: SearchHistory
     /// A finished search with hits is remembered after this pause without typing.
@@ -53,6 +130,9 @@ import ViewerUI
     public let previewZoom: PreviewZoom
     public let keyboard: KeyboardSettings
     public private(set) var indexStatus: IndexStatus = .none
+    /// Rises when newly laid-out Word/PowerPoint pages are stored: at most once a second during a layout
+    /// run, and at the end of every run (spec 1.3).
+    public private(set) var layoutRevision = 0
     public private(set) var summary = ""
     /// True from the start of a search (after the typing delay) until its result is shown.
     public private(set) var isSearching = false
@@ -79,6 +159,8 @@ import ViewerUI
     /// Kinds of hint, so each can be cleared by the event that makes it obsolete.
     enum Notice: Equatable {
         case corruptIndex, noText, unreadable, unreadableImage, noTextImage, noTextPDF, ocrOff, searchFailed(String), indexFailed(String)
+        /// Word/PowerPoint single files (1.3 Teil B Task 5).
+        case layoutUnreadable, noTextOffice
         case ignoredDrops(Int), alreadyContained(String, in: String), missingSources([String])
         var text: String {
             switch self {
@@ -88,6 +170,8 @@ import ViewerUI
             case .unreadableImage: Text.unreadableImage
             case .noTextImage: "Im Bild wurde kein Text erkannt"
             case .noTextPDF: "Im PDF wurde kein Text erkannt"
+            case .layoutUnreadable: "Word- oder PowerPoint-Datei kann nicht gelesen werden"
+            case .noTextOffice: "Im Dokument wurde kein Text gefunden"
             case .ocrOff: "Texterkennung ist aus: Bilder und Scans werden nicht durchsucht"
             case .searchFailed(let reason): "Suche fehlgeschlagen: \(reason)"
             case .indexFailed(let reason): "Indexieren fehlgeschlagen: \(reason)"
@@ -109,6 +193,64 @@ import ViewerUI
     /// Fixed delay for tests; `nil` follows `settings.debounceMs`.
     @ObservationIgnored private let debounce: Duration?
     @ObservationIgnored private let openIndex: @Sendable (URL) throws -> any FolderIndexing
+    /// Lays out Word/PowerPoint single files (in memory, spec 1.3).
+    @ObservationIgnored private let officeLayout: any PageLayoutSource
+    /// Rendered slides of PowerPoint files (one cache for all sources; tests pass their own).
+    @ObservationIgnored private let slideCache: SlideCache
+    /// „PowerPoint-Darstellung“ / „Fehlende Schriften“ as the layout sources read it (1.3 Teil B Task 12).
+    @ObservationIgnored private let officeRendering: PowerPointDisplaySetting
+    @ObservationIgnored private var lastRendering = OfficeRendering.default
+    /// The last display switch (stop layout, reset PowerPoint, queue); each waits for the one before.
+    @ObservationIgnored private var renderingTask: Task<Void, Never>?
+    /// Prepares Office's fonts (`OfficeDisplay.prewarmFonts()`; reading Office's font cache may bring up the macOS
+    /// prompt „Daten anderer Apps“) and answers whether that succeeded. Started lazily, once (`officeFonts`), on a GCD
+    /// queue: with the first Word/PowerPoint layout, the first Word document or SlideKit deck shown
+    /// (`officeDocumentShown`), or at launch after an earlier success (`startOfficeFontsIfRegisteredBefore`); tests
+    /// replace it.
+    @ObservationIgnored public var prewarmFonts: @Sendable () -> Bool = { OfficeDisplay.prewarmFonts() }
+    /// Calls its argument when a registration that missed `prewarmFonts`' answer (deadline passed, e.g. a prompt
+    /// answered late) finishes complete later (`OfficeDisplay.whenFontsComplete`); tests replace it.
+    @ObservationIgnored public var fontsCompleteLater: @Sendable (@escaping @Sendable () -> Void) -> Void = {
+        OfficeDisplay.whenFontsComplete($0)
+    }
+    /// Starts `prewarmFonts` at most once for this model (the app has one; `FontResolver.prewarm()` itself is
+    /// idempotent per process).
+    @ObservationIgnored private let officeFonts = OfficeFontPrewarm()
+    /// UserDefaults key: Office's font registration once succeeded in this app (set only on success, never on a
+    /// timeout); then the next launches start it at once (`startOfficeFontsIfRegisteredBefore`).
+    public nonisolated static let fontsRegisteredOnceKey = "office.fontsRegisteredOnce"
+    /// How long the search field must be idle before a start asked for by a shown document runs (fonts-start c: the
+    /// prompt never pops up mid-typing). Tests shorten it.
+    @ObservationIgnored var typingIdleDelay: Duration = .seconds(1)
+    /// The last change of `queryText` (typing, a history entry).
+    @ObservationIgnored private var lastTyping: ContinuousClock.Instant?
+    /// A start waiting for typing to pause.
+    @ObservationIgnored private var fontStartWaiter: Task<Void, Never>?
+    /// A Word document was shown before the registration succeeded: its tiles/preview may carry substitute fonts.
+    @ObservationIgnored private var wordShownBeforeFonts = false
+    /// The registration succeeded in this process (`fontsRegistered`).
+    @ObservationIgnored private var fontsAreRegistered = false
+    /// Where Quick Look leaves preview folders of crashed runs (tests pass their own).
+    @ObservationIgnored var quickLookLeftoverRoot = QuickLookHTML.leftoverRoot
+    /// Test hook: awaited by the start maintenance before it touches anything.
+    @ObservationIgnored var maintenanceGate: (@Sendable () async -> Void)?
+    /// The last slide-cache job (start maintenance, „Folien-Cache leeren“); each waits for the one before. The queue
+    /// waits for all of them before any layout step, so no slide is written while the cache is pruned or cleared.
+    @ObservationIgnored private var cacheWork: Task<Void, Never>?
+    /// Slide-cache jobs not finished yet.
+    @ObservationIgnored private var cacheJobs = 0
+    @ObservationIgnored private var maintenanceStarted = false
+    /// Files whose missing slides or outdated index entry were already acted on, as "slides|…" / "index|…" with path
+    /// and file version: at most once per file version and session (tiles report up to once a second).
+    @ObservationIgnored private var requestedRelayouts: Set<String> = []
+    /// Paths with a check queued or running (`checkOfficeFile`); further reports meanwhile are dropped.
+    @ObservationIgnored private var checksQueued: Set<String> = []
+    /// The last of those checks; each waits for the one before.
+    @ObservationIgnored private var officeCheckTask: Task<Void, Never>?
+    /// Folders asked to lay out one more document while their layout runs: queued again when that run ends.
+    @ObservationIgnored private var layoutAgain: Set<String> = []
+    /// Longest layout of one single file; a longer one counts as unreadable.
+    @ObservationIgnored var fileLayoutTimeout: Duration = .seconds(120)
     @ObservationIgnored private var searchTask: Task<Void, Never>?
     /// Identifies the current search; early results of an older one are dropped.
     @ObservationIgnored private var searchToken = 0
@@ -141,7 +283,19 @@ import ViewerUI
     @ObservationIgnored private var fileOCR: [String: [Int: OCRPageText]] = [:]
     /// The file version each `fileOCR` entry was recognized from.
     @ObservationIgnored private var fileOCRStamps: [String: FileStamp] = [:]
-    private enum Phase { case text, ocr }
+    /// Folders waiting for the phase „layout“ (Word/PowerPoint, spec 1.3), after every phase 1 and
+    /// before any phase 2; only while „office.include“ is on.
+    @ObservationIgnored private var layoutPending: [String] = []
+    @ObservationIgnored private var currentLayout: Task<Result<LayoutReport, Error>, Never>?
+    /// Word/PowerPoint single files by path (laid out in memory, kept for the session; 1.3 Teil B Task 5).
+    @ObservationIgnored private var fileLayouts: [String: FileLayoutState] = [:]
+    @ObservationIgnored private var currentFileLayout: Task<Result<FileLayoutState, Error>, Never>?
+    /// Outcome of each folder's last finished layout run; its problem lists describe the whole index.
+    @ObservationIgnored private var layoutReports: [String: LayoutReport] = [:]
+    /// Throttles `layoutRevision` during a layout run (at most once a second).
+    @ObservationIgnored private var layoutBumpTask: Task<Void, Never>?
+    @ObservationIgnored private var lastLayoutBump = ContinuousClock.now - .seconds(1)
+    private enum Phase { case text, layout, ocr }
     @ObservationIgnored private var currentPhase = Phase.text
     /// „Texterkennung anhalten“ until a new source, „neu ausführen“ or the next start.
     public private(set) var isRecognitionStopped = false
@@ -151,6 +305,15 @@ import ViewerUI
     }
     /// OCR settings (spec 1.2 §7).
     public let ocrPreferences: OCRPreferences
+    /// Word/PowerPoint setting „office.include“ (spec 1.3).
+    public let officePreferences: OfficePreferences
+    /// Word/PowerPoint pages for tiles, preview, saving and printing (1.3 Teil B): built for the current display choice
+    /// (`OfficeDisplay.pages`) and replaced when it changes, unless given to `init`.
+    public private(set) var foreignPages: (any ForeignPageProvider)?
+    /// Rises whenever `foreignPages` is replaced; views rebuild what holds the old provider (the tile cache).
+    public private(set) var foreignPagesRevision = 0
+    /// The layout source whose renderer names go into the Word/Quick Look tile versions; nil = `foreignPages` was given.
+    @ObservationIgnored private let pageRenderers: (any PageLayoutSource)?
     @ObservationIgnored private var unreachable: Set<String> = []
     /// Folders whose indexing failed or whose index is being rebuilt, with their hint; the hint stays
     /// until that folder succeeds or is removed (another folder's success does not hide it).
@@ -171,7 +334,10 @@ import ViewerUI
     @ObservationIgnored private var rememberedMissing: [String] = []
     @ObservationIgnored private var lastSort: SortMode
     @ObservationIgnored private var lastPartialWords: Bool
+    @ObservationIgnored private var lastSearchFileNames: Bool
+    @ObservationIgnored private var lastFileKinds: Set<DocumentKind>
     @ObservationIgnored private var lastOCR = OCRSettings.default
+    @ObservationIgnored private var lastIncludeOffice = true
     @ObservationIgnored private var rerunTask: Task<Void, Never>?
     /// Indexes whose damage rebuild at open was already announced (`wasRebuilt` stays true).
     @ObservationIgnored private var announcedRebuilds: Set<ObjectIdentifier> = []
@@ -181,33 +347,51 @@ import ViewerUI
     public init(settings: GridSettings,
                 defaults: UserDefaults = .standard,
                 environment: any AppEnvironment,
+                slideCache: SlideCache = .shared,
                 debounce: Duration? = nil,
-                openIndex: @escaping @Sendable (URL) throws -> any FolderIndexing = { try FolderIndex.shared(root: $0) }) {
+                openIndex: @escaping @Sendable (URL) throws -> any FolderIndexing = { try FolderIndex.shared(root: $0) },
+                officeLayout: (any PageLayoutSource)? = nil,
+                foreignPages: (any ForeignPageProvider)? = nil,
+                officeRendering: PowerPointDisplaySetting = .shared) {
         self.settings = settings
         self.keyboard = KeyboardSettings(defaults: defaults)
         self.ocrPreferences = OCRPreferences(defaults: defaults)
+        self.officePreferences = OfficePreferences(defaults: defaults)
         self.previewZoom = PreviewZoom(defaults: defaults)
         self.searchHistory = SearchHistory(defaults: defaults)
+        self.folderBar = FolderBarSettings(defaults: defaults)
         self.defaults = defaults
         self.environment = environment
         self.debounce = debounce
         self.openIndex = openIndex
+        self.slideCache = slideCache
+        self.officeRendering = officeRendering
+        let standardLayout = OfficeLayoutSource.standard(cache: slideCache, rendering: officeRendering)
+        self.officeLayout = officeLayout ?? standardLayout
+        lastRendering = OfficeRendering(officePreferences)
+        officeRendering.value = lastRendering
+        self.pageRenderers = foreignPages == nil ? standardLayout : nil
+        self.foreignPages = foreignPages ?? OfficeDisplay.pages(for: lastRendering, cache: slideCache, renderers: standardLayout)
         lastSort = settings.sort
         lastPartialWords = settings.partialWords
+        lastSearchFileNames = settings.searchFileNames
+        lastFileKinds = settings.fileKinds
         lastOCR = OCRSettings(recognizeText: ocrPreferences.recognizeText, includeImages: ocrPreferences.includeImages)
+        lastIncludeOffice = officePreferences.includeOffice
         observeSettings()
     }
 
     // MARK: Sources
 
-    /// ⌘O: folders and PDFs, several at once; they are added to the loaded sources.
+    /// ⌘O: folders, PDFs, images and Word/PowerPoint files, several at once; they are added to the loaded sources.
     public func openSources() {
         let urls = environment.chooseSources()
         guard !urls.isEmpty else { return }
         addSources(urls)
     }
 
-    /// Opened or dropped items: folders, PDFs and images are added, everything else is ignored with a hint.
+    /// Opened or dropped items: folders, PDFs, images and Word/PowerPoint files (each per its setting) are
+    /// added, everything else is ignored with a hint.
     /// With sources loaded, asks first whether they are added or replace the loaded ones (1.2.1 §1).
     public func addSources(_ urls: [URL]) {
         let previous = addTask
@@ -217,7 +401,9 @@ import ViewerUI
     /// 1.2.1 §1: the „hinzufügen?“ sheet while it is shown.
     public private(set) var addPrompt: AddPrompt?
     @ObservationIgnored private var pendingAddURLs: [URL] = []
-    @ObservationIgnored private var addTask: Task<Void, Never>?
+    @ObservationIgnored var addTask: Task<Void, Never>?
+    /// Builds the folder tree from every source's document list, independent of the search (Ordnerleiste).
+    @ObservationIgnored var treeTask: Task<Void, Never>?
 
     /// Drop or ⌘O: adds at once without loaded sources or when nothing new would come in (the hints show);
     /// otherwise asks, or follows „Beim Hinzufügen von Quellen“.
@@ -226,9 +412,9 @@ import ViewerUI
         let openPrompt = addPrompt?.id
         let urls = openPrompt == nil ? dropped : pendingAddURLs + dropped
         guard sourceList.items.count + rememberedMissing.count > 0 else { await add(urls); return }
-        let includeImages = ocrPreferences.includeImages
+        let includeImages = ocrPreferences.includeImages, includeOffice = officePreferences.includeOffice
         let (candidates, _) = await Task.detached(priority: .userInitiated) {
-            SourceClassifier.classify(urls, includeImages: includeImages)
+            SourceClassifier.classify(urls, includeImages: includeImages, includeOffice: includeOffice)
         }.value
         var trial = sourceList
         let newItems = candidates.filter { !trial.add([$0]).added.isEmpty }
@@ -251,10 +437,11 @@ import ViewerUI
         addPrompt = nil
         pendingAddURLs = []
         if remember, choice != .cancel { settings.addSourcesPolicy = choice == .add ? .add : .replace }
+        if choice == .cancel { pendingPlaceFilter = nil }
         let previous = addTask
         switch choice {
-        case .add: addTask = Task { await previous?.value; await add(urls) }
-        case .replace: addTask = Task { await previous?.value; await replaceSources(with: urls) }
+        case .add: addTask = Task { await previous?.value; await add(urls); finishPendingPlace() }
+        case .replace: addTask = Task { await previous?.value; await replaceSources(with: urls); finishPendingPlace() }
         case .cancel: break
         }
     }
@@ -271,6 +458,7 @@ import ViewerUI
         await add(urls)
         guard !sourceList.items.isEmpty else {
             await add(previous)
+            pendingPlaceFilter = nil                         // the place could not be loaded
             rememberedMissing = previousMissing
             persistSources()
             selection = previousSelection
@@ -298,9 +486,9 @@ import ViewerUI
     public func add(_ urls: [URL]) async -> [URL] {
         let token = generation
         clearTransientNotice()
-        let includeImages = ocrPreferences.includeImages
+        let includeImages = ocrPreferences.includeImages, includeOffice = officePreferences.includeOffice
         let (candidates, ignored) = await Task.detached(priority: .userInitiated) {
-            SourceClassifier.classify(urls, includeImages: includeImages)
+            SourceClassifier.classify(urls, includeImages: includeImages, includeOffice: includeOffice)
         }.value
         guard token == generation else { return [] }
         if !ignored.isEmpty { noticeKind = .ignoredDrops(ignored.count) }
@@ -322,7 +510,10 @@ import ViewerUI
                 insert(candidate, index: nil)
             }
         }
+        requeueWaitingFileLayouts()
         startQueueIfNeeded()
+        applyPendingPlaceFilter()
+        refreshFolderTree()                              // new roots at once, also while a term is typed
         scheduleSearch(debounced: false)
         return failed
     }
@@ -346,6 +537,7 @@ import ViewerUI
         forget(path)
         persistSources()
         updateIndexStatus()
+        sourcesChangedForFolders()
         scheduleSearch(debounced: false)
     }
 
@@ -359,6 +551,7 @@ import ViewerUI
         persistSources()
         noticeKind = nil
         updateIndexStatus()
+        sourcesChangedForFolders()
         scheduleSearch(debounced: false)
     }
 
@@ -408,7 +601,10 @@ import ViewerUI
         restoredSources = true
         var paths = defaults.stringArray(forKey: Self.sourcesKey)
         if paths == nil, let last = defaults.string(forKey: Self.lastFolderKey), !last.isEmpty { paths = [last] }
-        guard let paths, !paths.isEmpty else { return }
+        guard let paths, !paths.isEmpty else {
+            tileDisk?.dropTiles(notUnder: [])           // no sources: no tiles to keep
+            return
+        }
         let urls = paths.map { URL(fileURLWithPath: $0) }
         let token = generation
         let missing = await Task.detached(priority: .userInitiated) {
@@ -421,6 +617,9 @@ import ViewerUI
         rememberedMissing = missing.map(\.path) + failed.map(\.standardizedFileURL.path)
         if !missing.isEmpty { noticeKind = .missingSources(missing.map(\.lastPathComponent)) }
         persistSources()
+        // 1.3.1: tiles of PDFs outside the sources go without asking those PDFs (no macOS access prompt for folders
+        // that are no source); an unplugged disk that is remembered keeps its tiles.
+        tileDisk?.dropTiles(notUnder: sourceList.items.map(\.url) + rememberedMissing.map { URL(fileURLWithPath: $0) })
     }
 
     private func openFolderIndex(_ root: URL) async -> (any FolderIndexing)? {
@@ -446,7 +645,7 @@ import ViewerUI
         guard !result.added.isEmpty else { return }
         let path = source.url.path
         if let index {
-            index.configure(currentOCRSettings)
+            index.configure(currentOCRSettings, includeOffice: officePreferences.includeOffice)
             indexes[path] = index
             restartedAfterDamage.remove(path)
             if index.wasRebuilt, announcedRebuilds.insert(ObjectIdentifier(index)).inserted {
@@ -455,15 +654,28 @@ import ViewerUI
             pending.removeAll { $0 == path }
             recognitionStopped = false              // a new source resumes a stopped recognition
             enqueueIndexing(path)
+        } else if let kind = SingleFileLayout.officeKind(source.url) {
+            // Word/PowerPoint: laid out in memory, never recognized. It goes first (behind other single files)
+            // and pre-empts a folder's recognition or layout, which resumes afterwards where it stopped.
+            fileLayouts[path] = .pending
+            singleSearches[path] = SingleFileLayout.search(source.url, kind: kind, state: .pending)
+            if let current = currentFolder, indexes[current] != nil {
+                if currentPhase == .ocr { preemptRecognition() } else if currentPhase == .layout { preemptLayout() }
+            }
+            enqueueFileLayout(path)
         } else {
             let isImage = ImagePages.isImage(source.url)
             singleSearches[path] = SingleDocumentSearch(source: OverlayTextSource(isImage: isImage, recognized: fileOCR[path] ?? [:],
-                                                                                  stamp: fileOCRStamps[path]), isImage: isImage)
+                                                                                  stamp: fileOCRStamps[path]), kind: isImage ? .image : .pdf)
             // Pages without text (or the image) are recognized in the background (spec 1.2 §2).
             recognitionStopped = false
             // A single file is small: it goes first and pre-empts a long folder recognition, which resumes
             // afterwards where it stopped (final review I1).
-            if let current = currentFolder, currentPhase == .ocr, indexes[current] != nil { preemptRecognition() }
+            // Also a folder's layout (core review I3): a dropped scan must not wait for all of the Office files.
+            // With recognition off it has nothing to do: nothing is stopped for it.
+            if canRecognize, let current = currentFolder, indexes[current] != nil {
+                if currentPhase == .ocr { preemptRecognition() } else if currentPhase == .layout { preemptLayout() }
+            }
             recognitionPending.removeAll { $0 == path }
             // After the single files already at the front: files dropped together keep their order.
             let slot = recognitionPending.firstIndex { indexes[$0] != nil } ?? recognitionPending.endIndex
@@ -481,14 +693,26 @@ import ViewerUI
         fileOCRStamps[path] = nil
         reports[path] = nil
         unreachable.remove(path)
+        changedOnDisk.remove(path)
+        checkFilterAfterTree.remove(path)
+        lastDiskRun[path] = nil
+        diskChangeDue.remove(path)
         pending.removeAll { $0 == path }
         recognitionPending.removeAll { $0 == path }
         ocrReports[path] = nil
+        layoutPending.removeAll { $0 == path }
+        layoutReports[path] = nil
+        fileLayouts[path] = nil
+        layoutAgain.remove(path)
         clearIndexProblem(path)
         if currentFolder == path {
             // Its cancelled run may take a moment to end: from now on it no longer counts.
             currentWork?.cancel()
             currentWork = nil
+            currentLayout?.cancel()
+            currentLayout = nil
+            currentFileLayout?.cancel()
+            currentFileLayout = nil
             currentRecognition?.cancel()
             currentRecognition = nil
             currentFolder = nil
@@ -518,13 +742,23 @@ import ViewerUI
         pending.removeAll()
         recognitionPending.removeAll()
         ocrReports.removeAll()
+        layoutPending.removeAll()
+        layoutReports.removeAll()
+        fileLayouts.removeAll()
         fileOCR.removeAll()
         fileOCRStamps.removeAll()
         restartedAfterDamage.removeAll()
         indexProblems.removeAll()
+        changedOnDisk.removeAll()
+        checkFilterAfterTree.removeAll()
+        lastDiskRun.removeAll()
+        diskChangeDue.removeAll()
+        diskChangeTask?.cancel()
+        diskChangeTask = nil
     }
 
     private func persistSources() {
+        updateWatchedFolders()
         let loaded = sourceList.items.map(\.url.path)
         defaults.set(loaded + rememberedMissing.filter { !loaded.contains($0) }, forKey: Self.sourcesKey)
     }
@@ -575,6 +809,8 @@ import ViewerUI
             }
             reports[path] = nil
             ocrReports[path] = nil
+            layoutReports[path] = nil
+            tileDisk?.removeTiles(under: URL(fileURLWithPath: path, isDirectory: true))   // spec 1.2.4 §3
         }
         guard token == generation else { return }   // other sources are loaded now: no re-index here
         for (path, _) in targets {
@@ -600,10 +836,13 @@ import ViewerUI
     /// Folders whose run did not finish go back to the front of `pending`.
     private func cancelQueue() {
         indexTask?.cancel()
+        wakeQueue()
         if let current = currentFolder, isLoaded(current) {
             // An unfinished run goes back to the front of its queue.
             if currentPhase == .ocr {
                 if !recognitionPending.contains(current) { recognitionPending.insert(current, at: 0) }
+            } else if currentPhase == .layout {
+                if !layoutPending.contains(current) { layoutPending.insert(current, at: 0) }
             } else if !pending.contains(current) {
                 pending.insert(current, at: 0)
             }
@@ -613,11 +852,79 @@ import ViewerUI
         indexRun += 1
     }
 
-    /// Phase 1 for `path` (new folder, re-index): a running text recognition makes way (spec 1.2: new files
-    /// must not wait behind a long recognition; finished pages are kept, the folder is recognized again later).
+    /// Phase 1 for `path` (new folder, re-index): a running text recognition or layout makes way (spec 1.2: new
+    /// files must not wait behind a long recognition; finished pages are kept, the folder continues later).
     private func enqueueIndexing(_ path: String) {
         if !pending.contains(path) { pending.append(path) }
         preemptRecognition()
+        preemptLayout()
+    }
+
+    /// A running folder layout stops (documents already stored stay) and the folder goes back to the front of
+    /// `layoutPending`.
+    /// A single file's layout is not pre-empted (it is short and was asked for).
+    private func preemptLayout() {
+        guard currentPhase == .layout, let current = currentFolder, indexes[current] != nil else { return }
+        if !layoutPending.contains(current) { layoutPending.insert(current, at: 0) }
+        currentLayout?.cancel()
+    }
+
+    /// Each folder's last stored layout report (tests).
+    var layoutReportsForTesting: [String: LayoutReport] { layoutReports }
+    /// Something changed below these folder sources (renamed, deleted, new files): index them again,
+    /// incrementally; the tree follows when the run ends (`finishIndexing`).
+    /// `urgent`: the root went away or came back (an ejected volume shows „nicht erreichbar“ at once).
+    ///
+    /// A source cools down for `diskChangeCooldown` after each run for a change on disk ends (the first
+    /// change after an add or launch is indexed at once); a report while it cools, waits in
+    /// the queue or is being indexed (phase 1) waits for one trailing run (re-review: counted from the end,
+    /// so a run longer than the cooldown is not followed at once by the next).
+    func foldersChangedOnDisk(_ roots: [String], urgent: Bool = false) {
+        let now = ContinuousClock.now
+        var any = false
+        for root in roots {
+            let path = URL(fileURLWithPath: root).standardizedFileURL.path
+            guard indexes[path] != nil else { continue }
+            changedOnDisk.insert(path)
+            if pending.contains(path) { continue }                       // its run has not started: it sees this
+            if urgent {
+                diskChangeDue.remove(path)
+                enqueueIndexing(path)
+                any = true
+                continue
+            }
+            let running = currentFolder == path && currentPhase == .text
+            if running || lastDiskRun[path].map({ now < $0 + diskChangeCooldown }) == true {
+                diskChangeDue.insert(path)
+                continue
+            }
+            diskChangeDue.remove(path)
+            enqueueIndexing(path)
+            any = true
+        }
+        scheduleDiskChanges()
+        if any { startQueueIfNeeded() }
+    }
+
+    /// One trailing run per waiting source once it has cooled down; sources still queued or being indexed
+    /// are scheduled when their run ends (`finishIndexing`).
+    private func scheduleDiskChanges() {
+        diskChangeTask?.cancel()
+        diskChangeTask = nil
+        let ready = diskChangeDue.filter { !pending.contains($0) && !(currentFolder == $0 && currentPhase == .text) }
+        guard let due = ready.map({ (lastDiskRun[$0] ?? .now) + diskChangeCooldown }).min() else { return }
+        diskChangeTask = Task { [weak self] in
+            try? await Task.sleep(until: due, clock: .continuous)
+            guard let self, !Task.isCancelled else { return }
+            self.diskChangeTask = nil
+            let waiting = self.diskChangeDue
+            self.diskChangeDue = []
+            self.foldersChangedOnDisk(waiting.sorted())                   // still cooling ones wait again
+        }
+    }
+
+    private func updateWatchedFolders() {
+        folderWatcher?.watch(folderSources.map(\.path), includeImages: ocrPreferences.includeImages)
     }
 
     /// Pending recognitions in queue order (tests).
@@ -634,17 +941,31 @@ import ViewerUI
     }
 
     /// Spec 1.2 §7: OCR off stops phase 2 at once (finished pages stay), on resumes it; images on/off lists
-    /// the folders again.
+    /// the folders again. Spec 1.3: Word/PowerPoint on/off („office.include“) lists the folders again too
+    /// (off: their Office files leave the index; loaded single Office files stay).
     private func ocrSettingsChanged() {
         let now = currentOCRSettings
-        guard now != lastOCR else { return }
-        let imagesChanged = now.includeImages != lastOCR.includeImages
+        let includeOffice = officePreferences.includeOffice
+        guard now != lastOCR || includeOffice != lastIncludeOffice else { return }
+        let rescan = now.includeImages != lastOCR.includeImages || includeOffice != lastIncludeOffice
+        let ocrChanged = now != lastOCR
         lastOCR = now
-        for (_, index) in indexes { index.configure(now) }
-        if imagesChanged {
+        lastIncludeOffice = includeOffice
+        for (_, index) in indexes { index.configure(now, includeOffice: includeOffice) }
+        if rescan {
             for url in folderSources { enqueueIndexing(url.path) }
+            updateWatchedFolders()
         }
-        if !now.recognizeText { preemptRecognition() } else { recognitionStopped = false }   // on again: resume after ✕
+        if !includeOffice {
+            // Office off: a running layout was stopped above; none follows, and the Office files leave the
+            // index with the rescan (their problems with them).
+            // Loaded Word/PowerPoint single files stay loaded and are still laid out.
+            layoutPending.removeAll { indexes[$0] != nil }
+            layoutReports.removeAll()
+        }
+        if ocrChanged {               // the Office switch alone leaves a stopped recognition stopped
+            if !now.recognizeText { preemptRecognition() } else { recognitionStopped = false }   // on again: resume after ✕
+        }
         startQueueIfNeeded()
         updateIndexStatus()
     }
@@ -681,9 +1002,25 @@ import ViewerUI
         return await Task.detached(priority: .userInitiated) { try? index.ocrCounts() }.value
     }
 
+    /// Word/PowerPoint documents of one folder source by layout state (settings „Word/PowerPoint“; nil: not a loaded
+    /// folder or unreadable).
+    public func layoutCounts(for source: URL) async -> LayoutCounts? {
+        let path = LoadedSourceRef(url: source, isFolder: true).url.path
+        guard let index = indexes[path] else { return nil }
+        return await Task.detached(priority: .userInitiated) { try? index.layoutCounts() }.value
+    }
+
     /// Stored text and word boxes of an OCR page (spec 1.2 §5), nil for a page with a text layer.
     public func ocrText(for page: PageRef) async -> OCRPageText? {
         let path = page.url.standardizedFileURL.path
+        if let state = fileLayouts[path] {
+            // Word/PowerPoint single file: the laid-out page while the file is the version it was made from.
+            guard case .laidOut(let result, let stamp) = state, result.pages.indices.contains(page.pageIndex) else { return nil }
+            let url = page.url, laid = result.pages[page.pageIndex]
+            let current = await Task.detached(priority: .userInitiated) { FileStamp.of(url) }.value
+            guard current == stamp else { return nil }
+            return OCRHighlights.usable(OCRPageText(text: laid.text, words: laid.words))
+        }
         if let recognized = fileOCR[path] {
             // A file changed since its recognition shows no old word boxes until it is recognized again.
             let stamp = fileOCRStamps[path], url = page.url
@@ -695,6 +1032,18 @@ import ViewerUI
         guard let folder = folderSources.first(where: { path.hasPrefix($0.path + "/") }),
               let index = indexes[folder.path] else { return nil }
         let relative = String(path.dropFirst(folder.path.count + 1))
+        if DocumentKind(fileExtension: page.url.pathExtension)?.isOffice == true {
+            // A Word/PowerPoint file edited since its layout: its stored word boxes belong to the old version (core
+            // review I2). None are shown; the folder is indexed again (once per file version).
+            let url = page.url
+            let outdated = await Task.detached(priority: .userInitiated) {
+                ((try? index.isOutdated(relativePath: relative)) ?? false) ? FileStamp.of(url) : nil
+            }.value
+            if let outdated {
+                reindexOutdated(folder.path, index: index, path: path, stamp: outdated)
+                return nil
+            }
+        }
         return await Task.detached(priority: .userInitiated) {
             OCRHighlights.usable((try? index.ocrPage(relativePath: relative, pageIndex: page.pageIndex)) ?? nil)
         }.value
@@ -715,24 +1064,40 @@ import ViewerUI
     }
 
     private var hasQueuedWork: Bool {
-        pending.contains { indexes[$0] != nil } || (canRecognize && recognitionPending.contains(where: isLoaded))
+        pending.contains { indexes[$0] != nil }
+            || (officePreferences.includeOffice && layoutPending.contains { indexes[$0] != nil })
+            || layoutPending.contains(where: needsFileLayout)
+            || (canRecognize && recognitionPending.contains(where: isLoaded))
     }
 
     private var canRecognize: Bool { ocrPreferences.recognizeText && !recognitionStopped }
 
     private func startQueueIfNeeded() {
+        if queueRunning { wakeQueue() }              // a queue waiting for the slide cache looks at the new work
         guard !queueRunning, hasQueuedWork else { return }
         queueRunning = true
         let previous = indexTask
         previous?.cancel()
         indexTask = Task { [weak self] in
             await previous?.value
-            // Phase 1 of every folder first, then phase 2 (spec 1.2 §3): a new folder is searchable at once.
+            // Phase 1 of every folder first, then the layout of Word/PowerPoint (spec 1.3), then phase 2
+            // (spec 1.2 §3): a new folder is searchable at once.
+            // Single files go before folders in both later phases (1.2 „single file first“, core review I3).
             while !Task.isCancelled, let self {
                 if let path = self.nextPending() {
                     await self.indexFolder(path)
+                } else if self.cacheJobs > 0, self.layoutWaiting {
+                    // Slide-cache job running: only layout steps wait. A dropped scan is recognized meanwhile;
+                    // otherwise sleep until the job ends or new work comes (`wakeQueue`), then look again.
+                    if let path = self.nextFileRecognition() { await self.recognizeFile(path) } else { await self.waitForWake() }
+                } else if let path = self.nextFileLayout() {
+                    await self.layoutFile(path)
+                } else if let path = self.nextFileRecognition() {
+                    await self.recognizeFile(path)
+                } else if let path = self.nextLayout() {
+                    await self.layoutFolder(path)
                 } else if let path = self.nextRecognition() {
-                    if self.indexes[path] != nil { await self.recognizeFolder(path) } else { await self.recognizeFile(path) }
+                    await self.recognizeFolder(path)
                 } else {
                     break
                 }
@@ -752,6 +1117,94 @@ import ViewerUI
         return nil
     }
 
+    /// The next folder layout (single files are taken first by `nextFileLayout`).
+    /// Runs after `nextFileLayout` in the same loop pass, so no single file waiting for its layout is left here.
+    private func nextLayout() -> String? {
+        while let path = layoutPending.first {
+            layoutPending.removeFirst()
+            if indexes[path] != nil, officePreferences.includeOffice { return path }
+        }
+        return nil
+    }
+
+    /// The first Word/PowerPoint single file waiting in `layoutPending`, wherever it stands.
+    private func nextFileLayout() -> String? {
+        guard let slot = layoutPending.firstIndex(where: needsFileLayout) else { return nil }
+        return layoutPending.remove(at: slot)
+    }
+
+    /// The first PDF/image single file waiting for recognition, before any folder's layout or recognition.
+    private func nextFileRecognition() -> String? {
+        guard canRecognize, let slot = recognitionPending.firstIndex(where: isSingleFile) else { return nil }
+        return recognitionPending.remove(at: slot)
+    }
+
+    private func isSingleFile(_ path: String) -> Bool { indexes[path] == nil && singleSearches[path] != nil }
+
+    /// A layout step (single file or folder) waits; it must not start while a slide-cache job runs.
+    private var layoutWaiting: Bool {
+        layoutPending.contains(where: needsFileLayout)
+            || (officePreferences.includeOffice && layoutPending.contains { indexes[$0] != nil })
+    }
+
+    /// The queue sleeps here while only layout steps are left and a slide-cache job runs.
+    @ObservationIgnored private var queueWake: CheckedContinuation<Void, Never>?
+
+    private func waitForWake() async {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled { continuation.resume(); return }
+                queueWake = continuation
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in self?.wakeQueue() }
+        }
+    }
+
+    /// Lets a sleeping queue look again: a slide-cache job ended, new work came, or the queue was cancelled.
+    private func wakeQueue() {
+        queueWake?.resume()
+        queueWake = nil
+    }
+
+    /// A loaded Word/PowerPoint single file that waits for its layout.
+    private func needsFileLayout(_ path: String) -> Bool {
+        singleSearches[path] != nil && fileLayouts[path]?.isPending == true
+    }
+
+    /// Queues a single file's layout at the front, behind the single files already there (files dropped
+    /// together keep their order).
+    private func enqueueFileLayout(_ path: String) {
+        layoutPending.removeAll { $0 == path }
+        let slot = layoutPending.firstIndex { indexes[$0] != nil } ?? layoutPending.endIndex
+        layoutPending.insert(path, at: slot)
+    }
+
+    /// Single files whose layout waits after an error (not „unreadable“) are tried again with the next add.
+    private func requeueWaitingFileLayouts() {
+        for source in sourceList.items where !source.isFolder {
+            let path = source.url.path
+            if needsFileLayout(path), currentFolder != path, !layoutPending.contains(path) { enqueueFileLayout(path) }
+        }
+    }
+
+    /// A laid-out or unreadable single file changed on disk: it waits again and is laid out anew (its old
+    /// words are gone; a file that was still being copied gets another chance).
+    private func relayOutChangedFile(_ path: String) {
+        guard fileLayouts[path]?.stamp != nil else { return }
+        requeueFileLayout(path)
+        startQueueIfNeeded()
+    }
+
+    /// A loaded Word/PowerPoint single file waits for a new layout (its old pages go; e.g. its slides left the cache).
+    private func requeueFileLayout(_ path: String) {
+        guard let source = sourceList.items.first(where: { $0.url.path == path && !$0.isFolder }),
+              let kind = SingleFileLayout.officeKind(source.url), fileLayouts[path] != nil else { return }
+        fileLayouts[path] = .pending
+        singleSearches[path] = SingleFileLayout.search(source.url, kind: kind, state: .pending)
+        if currentFolder != path { enqueueFileLayout(path) }
+    }
+
     private func nextRecognition() -> String? {
         guard canRecognize else { return nil }
         while let path = recognitionPending.first {
@@ -767,6 +1220,8 @@ import ViewerUI
     /// One folder's run: progress into `indexStatus`, then its result.
     private func indexFolder(_ path: String) async {
         guard let index = indexes[path] else { return }
+        // Changes reported until now are seen by this run; later ones stay marked for the next (re-review).
+        let sawChange = changedOnDisk.remove(path) != nil
         indexRun += 1
         let run = indexRun
         currentFolder = path
@@ -788,11 +1243,14 @@ import ViewerUI
             work.cancel()
         }
         let result = await work.value
-        guard !Task.isCancelled, indexRun == run else { return }
+        guard !Task.isCancelled, indexRun == run else {
+            if sawChange, indexes[path] != nil { changedOnDisk.insert(path) }   // it runs again later
+            return
+        }
         currentFolder = nil
         currentWork = nil
         guard indexes[path] != nil else { return }          // removed while it ran
-        finishIndexing(result, path: path)
+        finishIndexing(result, path: path, sawChange: sawChange)
     }
 
     /// One folder's text recognition (phase 2, spec 1.2 §3), cancellable without losing finished pages.
@@ -836,6 +1294,7 @@ import ViewerUI
                 restartedAfterDamage.insert(path)
                 reports[path] = nil
                 ocrReports[path] = nil
+                layoutReports[path] = nil
                 setIndexProblem(path, .corruptIndex)
                 enqueueIndexing(path)
             } else {
@@ -843,6 +1302,147 @@ import ViewerUI
                 setIndexProblem(path, .indexFailed(error.localizedDescription))
             }
         }
+    }
+
+    /// One folder's layout of Word/PowerPoint documents (spec 1.3), cancellable without losing stored ones.
+    /// No ✕ of its own: removing the source, the Word/PowerPoint switch or quitting stops it.
+    private func layoutFolder(_ path: String) async {
+        guard let index = indexes[path] else { return }
+        indexRun += 1
+        let run = indexRun
+        currentFolder = path
+        currentPhase = .layout
+        layoutAgain.remove(path)                     // this run takes every document waiting now
+        setLayingOut(path, done: 0, total: 0)
+        let (stream, continuation) = AsyncStream.makeStream(of: IndexProgress.self, bufferingPolicy: .bufferingNewest(1))
+        let startFonts = fontStarter(), office = officePreferences.includeOffice
+        let work = Task.detached(priority: .utility) { () -> Result<LayoutReport, Error> in
+            defer { continuation.finish() }
+            do {
+                return .success(try await index.layOut { progress in
+                    // The run's first progress counts its pending Word/PowerPoint documents, just before the layout
+                    // source gets the first one: only then Office's fonts are needed (none for PDFs/images). The
+                    // count has no kinds, so decks under Quick Look alone prewarm too (decisions „1.3.2“).
+                    if office, progress.total > 0 { startFonts() }
+                    continuation.yield(progress)
+                })
+            } catch { return .failure(error) }
+        }
+        currentLayout = work
+        var finished = 0
+        await withTaskCancellationHandler {
+            for await progress in stream where !Task.isCancelled {
+                guard self.indexRun == run, self.currentFolder == path else { continue }
+                self.setLayingOut(path, done: progress.done, total: progress.total)
+                if progress.done > finished {
+                    // New pages are stored: thumbnails and the browse list may show them.
+                    finished = progress.done
+                    self.bumpLayoutRevisionSoon()
+                    self.refreshBrowseSoon()
+                }
+            }
+        } onCancel: {
+            work.cancel()
+        }
+        let result = await work.value
+        bumpLayoutRevision()                         // what this run stored, also when it was stopped
+        guard !Task.isCancelled, indexRun == run else { return }
+        currentFolder = nil
+        currentLayout = nil
+        currentPhase = .text
+        guard indexes[path] != nil else { return }
+        switch result {
+        case .success(let report):
+            // A run that ends just after „Word/PowerPoint“ was switched off adds no problems back.
+            if officePreferences.includeOffice { layoutReports[path] = report }
+            if layoutAgain.remove(path) != nil, officePreferences.includeOffice {
+                // A document was asked for while this run had already fetched its work: one more run.
+                if !layoutPending.contains(path) { layoutPending.append(path) }
+            } else {
+                layoutPending.removeAll { $0 == path }
+            }
+            // Only new pages need a new search (a folder without Office files must not search once more).
+            if report.laidOut > 0 { scheduleRefreshAfterRecognition() }
+        case .failure(let error) where error is CancellationError:
+            break                                    // pre-empted: queued again already
+        case .failure(let error):
+            if case IndexStoreError.corruptIndexRebuilt = error, !restartedAfterDamage.contains(path) {
+                restartedAfterDamage.insert(path)
+                reports[path] = nil
+                ocrReports[path] = nil
+                layoutReports[path] = nil
+                setIndexProblem(path, .corruptIndex)
+                enqueueIndexing(path)
+            } else {
+                Self.log.error("Layout in \(path, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+                setIndexProblem(path, .indexFailed(error.localizedDescription))
+            }
+        }
+    }
+
+    /// Layout of a Word/PowerPoint single file (in memory, 1.3 Teil B Task 5): off the main actor with a
+    /// time limit; cancelled only by removing the file (or the whole queue).
+    private func layoutFile(_ path: String) async {
+        guard let source = sourceList.items.first(where: { $0.url.path == path && !$0.isFolder }),
+              let kind = SingleFileLayout.officeKind(source.url), needsFileLayout(path) else { return }
+        let url = source.url
+        indexRun += 1
+        let run = indexRun
+        currentFolder = path
+        currentPhase = .layout
+        indexStatus = .layingOut(folder: 1, folders: 1, done: 0, total: 1)
+        // Word always needs Office's fonts; a deck only under SlideKit (Quick Look draws it itself).
+        if officePreferences.includeOffice, kind == .word || !OfficeDisplay.usesSlideCache(officeRendering.value) {
+            fontStarter()()
+        }
+        let layout = officeLayout, timeout = fileLayoutTimeout
+        let work = Task.detached(priority: .utility) {
+            await SingleFileLayout.run(url, kind: kind, source: layout, timeout: timeout)
+        }
+        currentFileLayout = work
+        let result = await withTaskCancellationHandler { await work.value } onCancel: { work.cancel() }
+        guard !Task.isCancelled, indexRun == run else { return }
+        currentFolder = nil
+        currentFileLayout = nil
+        currentPhase = .text
+        guard singleSearches[path] != nil else { return }        // removed while it ran
+        switch result {
+        case .success(.pending):
+            enqueueFileLayout(path)                  // the file changed during its layout: once more
+        case .success(let state):
+            indexStatus = .layingOut(folder: 1, folders: 1, done: 1, total: 1)
+            fileLayouts[path] = state
+            singleSearches[path] = SingleFileLayout.search(url, kind: kind, state: state)
+            layoutPending.removeAll { $0 == path }
+            bumpLayoutRevision()
+            scheduleRefreshAfterRecognition()
+        case .failure(let error) where error is CancellationError:
+            break                                    // the queue was stopped: queued again already
+        case .failure(let error):
+            // Not „unreadable“: it waits until the next add or launch.
+            Self.log.error("Layout of \(path, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+            layoutPending.removeAll { $0 == path }
+        }
+    }
+
+    /// `layoutRevision` once the last rise is a second ago.
+    private func bumpLayoutRevisionSoon() {
+        guard layoutBumpTask == nil else { return }
+        let due = lastLayoutBump + .seconds(1)
+        if due <= .now { bumpLayoutRevision(); return }
+        layoutBumpTask = Task { [weak self] in
+            try? await Task.sleep(until: due, clock: .continuous)
+            guard let self, !Task.isCancelled else { return }
+            self.layoutBumpTask = nil
+            self.bumpLayoutRevision()
+        }
+    }
+
+    private func bumpLayoutRevision() {
+        layoutBumpTask?.cancel()
+        layoutBumpTask = nil
+        lastLayoutBump = .now
+        layoutRevision += 1
     }
 
     /// Text recognition of a single-file source (spec 1.2 §2): its pages without text, one after another;
@@ -904,7 +1504,7 @@ import ViewerUI
                     // Kept at once (a cancelled run loses nothing finished) and searchable at once.
                     self.fileOCR[path, default: [:]][page] = text
                     self.singleSearches[path] = SingleDocumentSearch(source: OverlayTextSource(
-                        isImage: isImage, recognized: self.fileOCR[path] ?? [:], stamp: self.fileOCRStamps[path]), isImage: isImage)
+                        isImage: isImage, recognized: self.fileOCR[path] ?? [:], stamp: self.fileOCRStamps[path]), kind: isImage ? .image : .pdf)
                 case .unreadable:
                     break                          // the search reports „Bild kann nicht gelesen werden“
                 }
@@ -953,13 +1553,34 @@ import ViewerUI
         indexStatus = .recognizing(folder: position, folders: max(folders.count, 1), done: done, total: total)
     }
 
-    private func finishIndexing(_ result: Result<IndexReport, Error>, path: String) {
+    private func setLayingOut(_ path: String, done: Int, total: Int) {
+        let folders = folderSources.map(\.path)
+        let position = (folders.firstIndex(of: path) ?? 0) + 1
+        indexStatus = .layingOut(folder: position, folders: max(folders.count, 1), done: done, total: total)
+    }
+
+    private func finishIndexing(_ result: Result<IndexReport, Error>, path: String, sawChange: Bool = false) {
+        if case .failure(let error) = result, error is CancellationError {
+            if sawChange { changedOnDisk.insert(path) }
+        } else if sawChange {
+            lastDiskRun[path] = .now                         // the cooldown counts from the end of a disk-change run
+        }
+        defer { scheduleDiskChanges() }                      // a change reported during the run
         switch result {
         case .success(let report):
             restartedAfterDamage.remove(path)
             unreachable.remove(path)
             reports[path] = report
             clearIndexProblem(path)
+            if officePreferences.includeOffice {
+                if !layoutPending.contains(path) { layoutPending.append(path) }
+            } else {
+                layoutReports[path] = nil                // its Office files left the index
+            }
+            if sawChange { checkFilterAfterTree.insert(path) }
+            refreshFolderTree()                              // the folder's files are listed now
+            // Tiles of documents that left the folder or changed (spec 1.2.4 §3).
+            tileDisk?.pruneStale(under: URL(fileURLWithPath: path, isDirectory: true))
             if !recognitionPending.contains(path) { recognitionPending.append(path) }
             scheduleSearch(debounced: false)
         case .failure(let error) where error is CancellationError:
@@ -972,6 +1593,7 @@ import ViewerUI
                 // The indexer wiped the damaged index; rebuild it now, so the notice is true.
                 restartedAfterDamage.insert(path)
                 setIndexProblem(path, .corruptIndex)
+                if sawChange { changedOnDisk.insert(path) }  // the rebuild run checks the filter then
                 pending.insert(path, at: 0)
             } else {
                 Self.log.error("Indexing \(path, privacy: .public) failed: \(String(describing: error), privacy: .public)")
@@ -984,6 +1606,8 @@ import ViewerUI
     /// Status when no folder is being indexed: unreachable if any folder is, otherwise the problems of
     /// all folders (paths prefixed with the folder name when there are several).
     private func updateIndexStatus() {
+        // A single file being laid out or recognized keeps the status its run sets (also without folders).
+        if queueRunning, let current = currentFolder, indexes[current] == nil, currentPhase != .text { return }
         let folders = folderSources.map(\.path)
         if folders.isEmpty { indexStatus = .none; return }
         if queueRunning {
@@ -992,12 +1616,17 @@ import ViewerUI
                 switch (currentPhase, indexStatus) {
                 case (.text, .building(_, _, let done, let total)): setBuilding(current, done: done, total: total)
                 case (.ocr, .recognizing(_, _, let done, let total)): setRecognizing(current, done: done, total: total)
+                case (.layout, .layingOut(_, _, let done, let total)): setLayingOut(current, done: done, total: total)
                 case (.text, _): setBuilding(current, done: 0, total: 0)
                 case (.ocr, _): setRecognizing(current, done: 0, total: 0)
+                case (.layout, _): setLayingOut(current, done: 0, total: 0)
                 }
                 return
             } else if let next = pending.first(where: { indexes[$0] != nil }) {
                 setBuilding(next, done: 0, total: 0)
+                return
+            } else if officePreferences.includeOffice, let next = layoutPending.first(where: { indexes[$0] != nil }) {
+                setLayingOut(next, done: 0, total: 0)
                 return
             } else if canRecognize, let next = recognitionPending.first(where: isLoaded) {
                 setRecognizing(next, done: 0, total: 0)
@@ -1013,11 +1642,13 @@ import ViewerUI
             anyReport = true
             let prefix = several ? (path as NSString).lastPathComponent + "/" : ""
             let ocr = ocrReports[path] ?? OCRReport()
+            // Word/PowerPoint: „nicht lesbar“ and „ohne Text“ of the whole index (its last layout run).
+            let layout = layoutReports[path] ?? LayoutReport()
             // With recognition on, phase 1's „ohne Text“ (scans waiting for OCR) does not count: only what
             // recognition found no text in (review of 1.2 Task 1).
             let withoutText = ocrPreferences.recognizeText ? ocr.noText : report.noText
-            failed += Self.unique(report.failed + ocr.failed).map { prefix + $0 }
-            noText += Self.unique(withoutText).map { prefix + $0 }
+            failed += Self.unique(report.failed + ocr.failed + layout.failed).map { prefix + $0 }
+            noText += Self.unique(withoutText + layout.noText).map { prefix + $0 }
         }
         if !anyReport { indexStatus = .none; return }
         indexStatus = failed.isEmpty && noText.isEmpty ? .upToDate : .problems(failed: failed, noText: noText)
@@ -1066,9 +1697,9 @@ import ViewerUI
     /// a folder whose list cannot be read contributes nothing.
     /// The list comes back sorted by `mode` (sorting 10,000 entries takes long enough to stutter on the
     /// main actor, final review of 1.1), each entry with its source path.
-    private nonisolated static func browse(_ targets: [SearchTarget], sortedBy mode: SortMode) async -> [(target: String, hit: DocumentHit)] {
+    private nonisolated static func browse(_ targets: [SearchTarget], sortedBy mode: SortMode) async -> (sorted: [(target: String, hit: DocumentHit)], stale: [String]) {
         let found = await browse(targets)
-        return sortedPairs(found, by: mode)
+        return (sortedPairs(found.map { ($0.target, $0.hits) }, by: mode), found.filter(\.stale).map(\.target))
     }
 
     /// All hits of all targets, sorted together, each with its target.
@@ -1078,37 +1709,66 @@ import ViewerUI
         return sortHits(found.flatMap(\.hits), by: mode).map { (targetOf[$0.id] ?? "", $0) }
     }
 
-    private nonisolated static func browse(_ targets: [SearchTarget]) async -> [(target: String, hits: [DocumentHit])] {
-        let work = Task.detached(priority: .userInitiated) { () -> [(target: String, hits: [DocumentHit])] in
-            await withTaskGroup(of: (String, [DocumentHit]).self) { group in
+    /// The folder tree from every source's document list, off the main actor; does not depend on the search.
+    func refreshFolderTree() {
+        treeTask?.cancel()
+        let targets: [SearchTarget] = sourceList.items.compactMap { source in
+            let path = source.url.path
+            if source.isFolder { return indexes[path].map { .folder(path, $0) } }
+            return singleSearches[path].map { .file(source.url, $0, fileLayouts[path]) }
+        }
+        treeTask = Task { [weak self] in
+            let found = await Self.browse(targets)
+            guard !Task.isCancelled, let self else { return }
+            self.rebuildFolderTree(files: found.flatMap { $0.hits.map(\.url) }, checkFilter: true)
+        }
+    }
+
+    /// `stale`: a laid-out Word/PowerPoint single file that changed since (listed as waiting, laid out again).
+    private nonisolated static func browse(_ targets: [SearchTarget]) async -> [(target: String, hits: [DocumentHit], stale: Bool)] {
+        let work = Task.detached(priority: .userInitiated) { () -> [(target: String, hits: [DocumentHit], stale: Bool)] in
+            await withTaskGroup(of: (String, [DocumentHit], Bool).self) { group in
                 for target in targets {
                     group.addTask {
                         switch target {
                         case .folder(let path, let index):
-                            do { return (path, try index.browse()) } catch {
+                            do { return (path, try index.browse(), false) } catch {
                                 log.error("Browsing \(path, privacy: .public) failed: \(String(describing: error), privacy: .public)")
-                                return (path, [])
+                                return (path, [], false)
                             }
-                        case .file(let url, _):
-                            return (url.path, [singleEntry(url)])
+                        case .file(let url, _, let layout):
+                            let stale = SingleFileLayout.isStale(url, layout)
+                            return (url.path, [singleEntry(url, layout: stale ? .pending : layout)], stale)
                         }
                     }
                 }
-                var all: [(target: String, hits: [DocumentHit])] = []
-                for await (path, found) in group { all.append((path, found)) }
+                var all: [(target: String, hits: [DocumentHit], stale: Bool)] = []
+                for await (path, found, stale) in group { all.append((path, found, stale)) }
                 return all
             }
         }
         return await withTaskCancellationHandler { await work.value } onCancel: { work.cancel() }
     }
 
-    private nonisolated static func singleEntry(_ url: URL) -> DocumentHit {
+    private nonisolated static func singleEntry(_ url: URL, layout: FileLayoutState?) -> DocumentHit {
         let modifiedAt = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+        if let layout, let kind = SingleFileLayout.officeKind(url) {
+            // Word/PowerPoint: waiting → no pages yet; unreadable; laid out → its pages (spec 1.3).
+            let pages: Int, unreadable: Bool
+            switch layout {
+            case .pending: (pages, unreadable) = (0, false)
+            case .failed: (pages, unreadable) = (0, true)
+            case .laidOut(let result, _): (pages, unreadable) = (result.pages.count, false)
+            }
+            return DocumentHit(url: url, relativePath: url.lastPathComponent, modifiedAt: modifiedAt ?? Date(timeIntervalSince1970: 0),
+                               pageHits: [], totalMatches: 0, relevance: 0, sourceRoot: url,
+                               pageCount: pages, isUnreadable: unreadable, kind: kind, isSimplified: SingleFileLayout.isSimplified(layout))
+        }
         if ImagePages.isImage(url) {
             let readable = ImagePages.isReadable(url)
             return DocumentHit(url: url, relativePath: url.lastPathComponent, modifiedAt: modifiedAt ?? Date(timeIntervalSince1970: 0),
                                pageHits: [], totalMatches: 0, relevance: 0, sourceRoot: url,
-                               pageCount: readable ? 1 : 0, isUnreadable: !readable, isImage: true)
+                               pageCount: readable ? 1 : 0, isUnreadable: !readable, kind: .image)
         }
         let document = PDFDocument(url: url)
         let readable = document.map { !$0.isLocked } ?? false
@@ -1125,8 +1785,8 @@ import ViewerUI
         let current = ViewerText.browseSortMode(settings.sort)
         if current != mode { entries = sortHits(entries, by: current) }     // the sort changed meanwhile
         isBrowsing = true
-        show(entries, for: parsed,
-             summary: ViewerText.browseSummary(files: entries.count, pages: entries.reduce(0) { $0 + $1.pageCount }))
+        rebuildFolderTree(files: entries.map(\.url))
+        show(entries, for: parsed, summary: .browse)
     }
 
     /// Test hook: main-actor time of the last browse list applied.
@@ -1140,7 +1800,8 @@ import ViewerUI
     /// What one search runs over: every folder index and every single PDF.
     private enum SearchTarget: Sendable {
         case folder(String, any FolderIndexing)
-        case file(URL, SingleDocumentSearch)
+        /// The layout state of a Word/PowerPoint single file; nil = PDF or image.
+        case file(URL, SingleDocumentSearch, FileLayoutState?)
     }
 
     private struct SearchOutcome: Sendable {
@@ -1150,6 +1811,8 @@ import ViewerUI
         var sorted: [(target: String, hit: DocumentHit)] = []
         var sort: SortMode = .matchCount
         var errors: [(target: String, error: Error)] = []
+        /// Single files whose text failed but whose name matched: shown by their name, no notice for their error.
+        var foundByName: Set<String> = []
     }
 
     /// - Parameter background: a browse refresh while indexing: no „Suche läuft…“.
@@ -1162,14 +1825,15 @@ import ViewerUI
         let targets: [SearchTarget] = sourceList.items.compactMap { source in
             let path = source.url.path
             if source.isFolder { return indexes[path].map { .folder(path, $0) } }
-            return singleSearches[path].map { .file(source.url, $0) }
+            return singleSearches[path].map { .file(source.url, $0, fileLayouts[path]) }
         }
         if targets.isEmpty {
             isBrowsing = false
-            show([], for: parsed, summary: "")
+            show([], for: parsed, summary: .empty)
             return
         }
         let sort = settings.sort
+        let searchNames = settings.searchFileNames      // spec 1.3.2 §4
         let delay = debounced ? typingDelay : .zero
         if parsed.isEmpty {
             browseRefreshTask?.cancel()
@@ -1189,7 +1853,8 @@ import ViewerUI
                 guard !Task.isCancelled else { return }
                 self.browseRunning = false
                 self.isSearching = false
-                self.applyBrowse(found, mode: mode, for: parsed)
+                self.applyBrowse(found.sorted, mode: mode, for: parsed)
+                for path in found.stale { self.relayOutChangedFile(path) }
                 if self.browseRefreshWanted {
                     self.browseRefreshWanted = false
                     self.refreshBrowseSoon()
@@ -1219,7 +1884,7 @@ import ViewerUI
                 }
             }
             let outcome = await withTaskCancellationHandler {
-                await Self.run(parsed, sort: sort, over: targets, early: collector)
+                await Self.run(parsed, sort: sort, searchNames: searchNames, over: targets, early: collector)
             } onCancel: { early.cancel() }
             collector.finish()
             early.cancel()
@@ -1238,17 +1903,17 @@ import ViewerUI
         guard token == searchToken, isSearching else { return }
         let loaded = Set(sourceList.items.map(\.url.path))
         let early = found.filter { loaded.contains($0.target) }.flatMap(\.hits)
-        guard !early.isEmpty else { return }
+        guard !filtered(early).isEmpty else { return }     // hidden early rows: keep the shown list (no empty flash)
         isBrowsing = false
-        show(sortHits(early, by: settings.sort), for: parsed, summary: nil, keepFocus: true)
+        show(sortHits(early, by: settings.sort), for: parsed, summary: .search, keepFocus: true)
     }
 
     /// Runs the search over all targets in parallel, off the main actor; cancelling the caller cancels
     /// the work. A failing target does not drop the others' hits.
-    private nonisolated static func run(_ q: ParsedQuery, sort: SortMode, over targets: [SearchTarget],
+    private nonisolated static func run(_ q: ParsedQuery, sort: SortMode, searchNames: Bool, over targets: [SearchTarget],
                                         early: EarlyResults? = nil) async -> SearchOutcome {
         let work = Task.detached(priority: .userInitiated) { () -> SearchOutcome in
-            await withTaskGroup(of: (String, Result<[DocumentHit], Error>).self) { group in
+            await withTaskGroup(of: (String, Result<[DocumentHit], Error>, DocumentHit?).self) { group in
                 for target in targets {
                     group.addTask {
                         switch target {
@@ -1256,17 +1921,28 @@ import ViewerUI
                             var report: (@Sendable ([DocumentHit]) -> Void)?
                             if let early { report = { hits in early.add(path, hits) } }
                             let onPartial = report
-                            return (path, Result { try index.search(q, sort: sort, onPartial: onPartial) })
-                        case .file(let url, let single):
-                            return (url.path, Result { try single.search(url: url, query: q).map { [$0] } ?? [] })
+                            return (path, Result { try index.search(q, sort: sort, searchNames: searchNames, onPartial: onPartial) }, nil)
+                        case .file(let url, let single, let layout):
+                            // A Word/PowerPoint file that changed since its layout throws `StaleFileLayout`.
+                            let result = Result { try single.search(url: url, query: q, searchNames: searchNames).map { [$0] } ?? [] }
+                            // Text not readable (locked, damaged, not laid out yet, changed): still found by its name,
+                            // shown as when browsing (Chris, 2026-11-14); the error is handled as before.
+                            guard case .failure(let error) = result, !(error is CancellationError), searchNames,
+                                  SingleDocumentSearch.nameMatches(url, q) else { return (url.path, result, nil) }
+                            let state: FileLayoutState? = error is StaleFileLayout ? .pending : layout
+                            return (url.path, result, singleEntry(url, layout: state).withNameMatch())
                         }
                     }
                 }
                 var outcome = SearchOutcome()
-                for await (path, result) in group {
+                for await (path, result, byName) in group {
                     switch result {
                     case .success(let found): outcome.hits.append((path, found))
                     case .failure(let error): outcome.errors.append((path, error))
+                    }
+                    if let byName {
+                        outcome.hits.append((path, [byName]))
+                        outcome.foundByName.insert(path)
                     }
                 }
                 outcome.sorted = sortedPairs(outcome.hits, by: sort)
@@ -1278,17 +1954,20 @@ import ViewerUI
     }
 
     private func apply(_ outcome: SearchOutcome, for parsed: ParsedQuery) {
-        let errors = outcome.errors.filter { !($0.error is CancellationError) }
+        // A changed Word/PowerPoint single file is laid out again; until then it has no hits and no hint.
+        for (target, error) in outcome.errors where error is StaleFileLayout { relayOutChangedFile(target) }
+        let errors = outcome.errors.filter { !($0.error is CancellationError) && !($0.error is StaleFileLayout)
+            && !outcome.foundByName.contains($0.target) }
         if errors.isEmpty, outcome.errors.contains(where: { $0.error is CancellationError }) { return }
         // Hits of sources removed (or replaced) while the search ran are dropped.
         let loaded = Set(sourceList.items.map(\.url.path))
         var found = outcome.sorted.filter { loaded.contains($0.target) }.map(\.hit)
         if outcome.sort != settings.sort { found = sortHits(found, by: settings.sort) }   // changed meanwhile
         if errors.isEmpty {
-            if let kind = noticeKind, [.noText, .unreadable, .unreadableImage, .noTextImage, .noTextPDF, .ocrOff].contains(kind) || Self.isSearchFailure(kind) { noticeKind = nil }
+            if let kind = noticeKind, [.noText, .unreadable, .unreadableImage, .noTextImage, .noTextPDF, .ocrOff, .layoutUnreadable, .noTextOffice].contains(kind) || Self.isSearchFailure(kind) { noticeKind = nil }
         }
         isBrowsing = false
-        show(found, for: parsed, summary: nil)
+        show(found, for: parsed, summary: .search)
         for (target, error) in errors where loaded.contains(target) {
             switch error {
             case IndexStoreError.corruptIndexRebuilt:
@@ -1299,6 +1978,11 @@ import ViewerUI
                     enqueueIndexing(target)
                     startQueueIfNeeded()
                 }
+            case SingleDocumentSearchError.noText where fileLayouts[target] != nil:
+                // Word/PowerPoint: waiting for its layout shows nothing yet; laid out without text says so.
+                if case .laidOut? = fileLayouts[target] { noticeKind = .noTextOffice }
+            case is TextSourceError where fileLayouts[target] != nil:
+                noticeKind = .layoutUnreadable
             case SingleDocumentSearchError.noText:
                 let isImage = ImagePages.isImage(URL(fileURLWithPath: target))
                 if !canRecognize {
@@ -1317,16 +2001,70 @@ import ViewerUI
         }
     }
 
-    /// `summary` nil = the usual „Gefunden in …“ text.
-    private func show(_ newHits: [DocumentHit], for parsed: ParsedQuery, summary: String?, keepFocus: Bool = false) {
-        hits = newHits
-        query = parsed
-        scheduleHistoryCommit()
-        self.summary = summary ?? ViewerText.summary(hits: newHits)
-        onHitsPublished?(newHits)
-        if !keepFocus, focusedPage != nil, !FocusNavigator.contains(focusedPage, in: newHits, showAllPages: settings.showAllPages) {
-            focusedPage = nil
+    /// The folder filter and `extraFilters` (Ordnerleiste).
+    private func folderFiltered(_ documents: [DocumentHit]) -> [DocumentHit] {
+        var filters = DocumentFilters()
+        filters.folder = folderFilter
+        filters.others = extraFilters
+        return filters.apply(documents)
+    }
+
+    /// Every grid filter, ANDed.
+    private func filtered(_ documents: [DocumentHit]) -> [DocumentHit] {
+        FileKindFilter(kinds: settings.fileKinds).apply(folderFiltered(documents))
+    }
+
+    /// Shows a new search or browse result (through the grid filters).
+    private func show(_ newHits: [DocumentHit], for parsed: ParsedQuery, summary style: SummaryStyle, keepFocus: Bool = false) {
+        allHits = newHits
+        summaryStyle = style
+        if parsed != query {                                  // another term: its first hit again (1.3.3)
+            focusChosenByUser = false
+            firstHitPending = true
         }
+        query = parsed
+        publishFiltered(keepFocus: keepFocus)
+        // The term's final result (early rows keep the focus): its first hit, once.
+        if style == .search, !keepFocus, firstHitPending {
+            firstHitPending = false
+            if !focusChosenByUser, let first = FocusNavigator.firstHit(in: hits) { setFocusByModel(first) }
+        }
+        scheduleHistoryCommit()
+    }
+
+    /// `hits` and `summary` from `allHits` through the grid filters, ANDed (the one place they apply, spec 1.3
+    /// §8a): the folder filter and `extraFilters` (Ordnerleiste), then the file types. Counts are of the shown
+    /// documents. A focused page no longer shown loses the focus. The selection is never filtered.
+    func publishFiltered(keepFocus: Bool = false) {
+        let inFolders = folderFiltered(allHits)
+        let shown = FileKindFilter(kinds: settings.fileKinds).apply(inFolders)
+        hits = shown
+        hiddenByFilter = inFolders.count - shown.count
+        switch summaryStyle {
+        case .empty: summary = ""
+        case .search: summary = ViewerText.withHidden(ViewerText.summary(hits: shown), hidden: hiddenByFilter)
+        case .browse:
+            summary = ViewerText.withHidden(ViewerText.browseSummary(files: shown.count, pages: shown.reduce(0) { $0 + $1.pageCount }),
+                                            hidden: hiddenByFilter)
+        }
+        onHitsPublished?(shown)
+        if !keepFocus, focusedPage != nil, !FocusNavigator.contains(focusedPage, in: shown, showAllPages: settings.showAllPages) {
+            setFocusByModel(nil)
+        }
+        refillEmptyPreview()
+    }
+
+    /// 1.3.3: a search with hits shows its first hit page in the large preview at once (the first document in
+    /// the shown order and filters), as ↓ did before; the keyboard focus stays where it is (the search field).
+    /// `show` sets it once per term, when the term's final result arrives (early rows of a slow search would
+    /// swap the preview twice, review 2). Later results of the same term (indexing, recognition, the Finder,
+    /// sort) leave a shown page alone, so the grid does not scroll away under the reader (review 1); only when
+    /// the shown page is gone (filtered out, file removed) does the first hit fill the empty preview here.
+    /// Each shown result is already debounced by the search (`typingDelay`). Browsing and no hits: as before.
+    private func refillEmptyPreview() {
+        guard focusedPage == nil, !firstHitPending, summaryStyle == .search, !query.isEmpty,
+              let first = FocusNavigator.firstHit(in: hits) else { return }
+        setFocusByModel(first)
     }
 
     // MARK: Search history (1.2.2 §1)
@@ -1355,12 +2093,13 @@ import ViewerUI
     /// A shown result with hits for a typed term is remembered after `historyDelay` without typing.
     private func scheduleHistoryCommit() {
         let term = queryText
-        guard historyArmed, !query.isEmpty, isQuery(term), !hits.isEmpty, searchHistory.isEnabled else { return }
+        // Hidden hits count: a term whose hits the „Dateitypen“ filter hides is still a real search.
+        guard historyArmed, !query.isEmpty, isQuery(term), !allHits.isEmpty, searchHistory.isEnabled else { return }
         historyTask?.cancel()
         let delay = historyDelay
         historyTask = Task { [weak self] in
             try? await Task.sleep(for: delay)
-            guard !Task.isCancelled, let self, self.queryText == term, !self.hits.isEmpty else { return }
+            guard !Task.isCancelled, let self, self.queryText == term, !self.allHits.isEmpty else { return }
             self.historyArmed = false
             self.searchHistory.commit(term, viaPause: true)
         }
@@ -1372,9 +2111,14 @@ import ViewerUI
         withObservationTracking {
             _ = settings.sort
             _ = settings.partialWords
+            _ = settings.searchFileNames
             _ = settings.showAllPages
+            _ = settings.fileKinds
             _ = ocrPreferences.recognizeText
             _ = ocrPreferences.includeImages
+            _ = officePreferences.includeOffice
+            _ = officePreferences.powerPointRenderer
+            _ = officePreferences.fontSubstitution
         } onChange: { [weak self] in
             // Called synchronously by the (main-actor) setter, before the new value is stored.
             MainActor.assumeIsolated {
@@ -1391,24 +2135,42 @@ import ViewerUI
     private func settingsChanged() {
         defer { observeSettings() }
         ocrSettingsChanged()
+        if OfficeRendering(officePreferences) != lastRendering {
+            lastRendering = OfficeRendering(officePreferences)
+            let previous = renderingTask, rendering = lastRendering
+            renderingTask = Task { [weak self] in
+                await previous?.value
+                await self?.renderingChanged(to: rendering)
+            }
+        }
+        // „Dateitypen“ (spec 1.3 §8a): the shown documents change at once, without a new search or indexing.
+        if settings.fileKinds != lastFileKinds {
+            lastFileKinds = settings.fileKinds
+            rebuildFolderTree(files: browseFiles)          // the folder counts follow the filter
+            publishFiltered()
+        }
         // „Alle Seiten“ off: a focused page that is no longer shown moves to the nearest hit page.
         if let focused = focusedPage, !FocusNavigator.contains(focused, in: hits, showAllPages: settings.showAllPages) {
-            focusedPage = FocusNavigator.nearestShown(to: focused, hits: hits, showAllPages: settings.showAllPages)
+            setFocusByModel(FocusNavigator.nearestShown(to: focused, hits: hits, showAllPages: settings.showAllPages))
         }
-        if settings.partialWords != lastPartialWords {
+        if settings.partialWords != lastPartialWords || settings.searchFileNames != lastSearchFileNames {
             lastPartialWords = settings.partialWords
+            lastSearchFileNames = settings.searchFileNames
             lastSort = settings.sort
             scheduleSearch(debounced: false)
         } else if settings.sort != lastSort {
             lastSort = settings.sort
-            hits = sortHits(hits, by: isBrowsing ? ViewerText.browseSortMode(lastSort) : lastSort)   // same hits, no new query
+            // Same hits, no new query; sorted before the folder filter so a later filter change keeps the order.
+            allHits = sortHits(allHits, by: isBrowsing ? ViewerText.browseSortMode(lastSort) : lastSort)
+            publishFiltered(keepFocus: true)
         }
     }
 
 // MARK: Output
 
     private var orderedSelection: [PageRef] {
-        selection.ordered(documentOrder: hits.map(\.url))
+        // Every document, also hidden ones: a ticked page of a hidden kind keeps its place (spec 1.3 §8a).
+        selection.ordered(documentOrder: allHits.map(\.url))
     }
 
     private var defaultFileName: String {
@@ -1423,8 +2185,9 @@ import ViewerUI
         saveTask = Task { [weak self] in
             await previous?.value
             guard let refs = self?.orderedSelection, !refs.isEmpty else { return }
+            let foreign = self?.foreignPages
             let result = await Task.detached(priority: .userInitiated) {
-                Result { try Merger().write(refs, to: url) }
+                Result { try Merger(foreign: foreign).write(refs, to: url) }
             }.value
             if case .failure(let error) = result {
                 Self.log.error("Saving \(url.path, privacy: .public) failed: \(String(describing: error), privacy: .public)")
@@ -1447,7 +2210,11 @@ import ViewerUI
             defer { self.isPreparingPrint = false }
             let refs = self.orderedSelection
             guard !refs.isEmpty else { return }
-            let built = await Task.detached(priority: .userInitiated) { Result { try PrintDocument.build(refs) } }.value
+            let foreign = self.foreignPages
+            // Built off the main actor: Word layout and slide decoding are slow (`Printer` doc comment).
+            let built = await Task.detached(priority: .userInitiated) {
+                Result { try PrintDocument.build(refs, foreign: foreign) }
+            }.value
             switch built {
             case .success(let print):
                 let operation = Printer.printOperation(for: print.document)
@@ -1474,15 +2241,351 @@ import ViewerUI
         alertMessage = nil
         let refs = selection.ordered(documentOrder: [])
         let previous = saveTask
+        let foreign = foreignPages
         saveTask = Task { [weak self] in
             await previous?.value
-            let missing = await Task.detached(priority: .userInitiated) { Merger.unavailable(refs) }.value
+            let missing = await Task.detached(priority: .userInitiated) { Merger.unavailable(refs, foreign: foreign) }.value
             self?.selection.remove(missing)
         }
     }
 
+    /// Double-click or „Original öffnen“: PDFs and images in Preview; Word/PowerPoint originals with the
+    /// app macOS assigns to them (1.3 Teil B), never Microsoft Office by name.
     public func openInPreview(_ r: PageRef) {
-        environment.openInPreview(r.url)
+        if DocumentKind(fileExtension: r.url.pathExtension)?.isOffice == true {
+            environment.openWithDefaultApp(r.url)
+        } else {
+            environment.openInPreview(r.url)
+        }
+    }
+
+    /// A laid-out PowerPoint tile without a slide picture. Checked off the main actor: a deck edited since it was
+    /// indexed → its folder runs phase 1 again (which lays the changed deck out); otherwise, when the slide cache
+    /// really has no entry → this deck is laid out again (`requestLayout(relativePath:)`, a single file waits again);
+    /// the latter only under Quick Look (SlideKit has no slide cache).
+    /// At most once per path and file version and session (tiles report up to once a second), so nothing loops.
+    public func slidesMissing(for ref: PageRef) {
+        guard DocumentKind(fileExtension: ref.url.pathExtension) == .powerpoint else { return }
+        checkOfficeFile(ref.url.standardizedFileURL)
+    }
+
+    private static func relayoutKey(_ kind: String, _ path: String, _ stamp: FileStamp?) -> String {
+        "\(kind)|\(path)|\(stamp?.size ?? -1)|\(stamp?.modifiedAt?.timeIntervalSince1970 ?? -1)"
+    }
+
+    /// See `slidesMissing(for:)`. Checks run one after another; a path already waiting for its check is skipped.
+    private func checkOfficeFile(_ url: URL) {
+        let path = url.path
+        guard checksQueued.insert(path).inserted else { return }
+        let previous = officeCheckTask
+        let foreign = foreignPages
+        officeCheckTask = Task { [weak self] in
+            await previous?.value
+            await self?.runOfficeCheck(url, foreign: foreign)
+            self?.checksQueued.remove(path)
+        }
+    }
+
+    private func runOfficeCheck(_ url: URL, foreign: (any ForeignPageProvider)?) async {
+        let path = url.path
+        // SlideKit draws slides on demand (no slide cache): a tile without a picture is an unreadable or changed deck,
+        // not a cache miss; a new layout would not help. Only the changed-file check below applies.
+        let slideCacheMiss = pageRenderers == nil || OfficeDisplay.usesSlideCache(officeRendering.value)
+        if fileLayouts[path] != nil {
+            // A single file: its own stamp says whether it changed (then it is laid out again anyway).
+            let (stamp, slides) = await Task.detached(priority: .utility) { (FileStamp.of(url), slideCacheMiss ? foreign?.pageCount(of: url) : nil) }.value
+            guard case .laidOut(_, let laidOut)? = fileLayouts[path], singleSearches[path] != nil else { return }
+            if stamp != laidOut { relayOutChangedFile(path); return }
+            guard slideCacheMiss, foreign != nil, slides == nil,
+                  requestedRelayouts.insert(Self.relayoutKey("slides", path, stamp)).inserted else { return }
+            requeueFileLayout(path)
+            startQueueIfNeeded()
+            return
+        }
+        guard let folder = folderSources.first(where: { path.hasPrefix($0.path + "/") }),
+              let index = indexes[folder.path], foreign != nil else { return }
+        let relative = String(path.dropFirst(folder.path.count + 1))
+        // Under SlideKit only the changed-file check is left: once per path and file version (a stat first, so repeated
+        // reports of an unreadable deck do not query the index each time).
+        var checkedKey: String?
+        if !slideCacheMiss {
+            let current = await Task.detached(priority: .utility) { FileStamp.of(url) }.value
+            let key = Self.relayoutKey("checked", path, current)
+            guard !requestedRelayouts.contains(key) else { return }
+            checkedKey = key
+        }
+        let (stamp, outdated, slides) = await Task.detached(priority: .utility) { () -> (FileStamp?, Bool, Int?) in
+            let outdated = (try? index.isOutdated(relativePath: relative)) ?? false
+            return (FileStamp.of(url), outdated, outdated || !slideCacheMiss ? nil : foreign?.pageCount(of: url))
+        }.value
+        guard indexes[folder.path] === index else { return }          // removed or replaced meanwhile
+        if outdated {
+            reindexOutdated(folder.path, index: index, path: path, stamp: stamp)
+            return
+        }
+        if let checkedKey { requestedRelayouts.insert(checkedKey); return }    // SlideKit: unchanged, nothing to lay out
+        let key = Self.relayoutKey("slides", path, stamp)
+        guard slideCacheMiss, slides == nil, !requestedRelayouts.contains(key) else { return }   // checks run one at a time
+        let requested = await Task.detached(priority: .utility) { Result { try index.requestLayout(relativePath: relative) } }.value
+        guard indexes[folder.path] === index else { return }
+        if case .failure(let error) = requested {
+            // Not remembered: the next report of this version tries again.
+            Self.log.error("Cannot queue \(path, privacy: .private) for layout: \(String(describing: error), privacy: .public)")
+            return
+        }
+        requestedRelayouts.insert(key)
+        guard officePreferences.includeOffice else { return }
+        if currentFolder == folder.path, currentPhase == .layout {
+            layoutAgain.insert(folder.path)          // the running layout fetched its work already
+        } else if !layoutPending.contains(folder.path) {
+            layoutPending.append(folder.path)
+        }
+        startQueueIfNeeded()
+    }
+
+    /// A file in `folder` differs from its stored version (folders are not watched): phase 1 again, which reads it
+    /// anew and lays it out (Word: new word boxes, PowerPoint: new slides). Once per file version and session.
+    private func reindexOutdated(_ folder: String, index: any FolderIndexing, path: String, stamp: FileStamp?) {
+        guard indexes[folder] === index,
+              requestedRelayouts.insert(Self.relayoutKey("index", path, stamp)).inserted else { return }
+        enqueueIndexing(folder)
+        startQueueIfNeeded()
+    }
+
+    // MARK: Slide cache (1.3 Teil B Task 9)
+
+    // MARK: Office's fonts (1.3.2 fonts-start)
+
+    /// Starts the registration once (`officeFonts`, GCD utility queue); a success comes back as `fontsRegistered()`.
+    /// Callable from any thread.
+    private func fontStarter() -> @Sendable () -> Void {
+        let fonts = officeFonts, prewarm = prewarmFonts, later = fontsCompleteLater
+        return { [weak self] in
+            let succeeded: @Sendable () -> Void = { Task { @MainActor in self?.fontsRegistered() } }
+            fonts.start(prewarm, then: succeeded, otherwise: { later(succeeded) })
+        }
+    }
+
+    /// A Word document or a deck under the own viewer (SlideKit) is shown in the grid or the preview (views call it
+    /// on the main actor, never render threads): starts Office's font registration in the background, once, with
+    /// „Word/PowerPoint“ on – after a restart with nothing to lay out nobody else would, and Word would be drawn with
+    /// substitute fonts. While the user types, the start waits until the search field has been idle for
+    /// `typingIdleDelay`, so the macOS prompt never comes mid-typing. PDFs, images and decks under Quick Look (it
+    /// draws them itself) start nothing.
+    public func officeDocumentShown(_ url: URL) {
+        guard officePreferences.includeOffice, let kind = DocumentKind(fileExtension: url.pathExtension) else { return }
+        switch kind {
+        case .word:
+            if !fontsAreRegistered { wordShownBeforeFonts = true }
+        case .powerpoint:
+            guard !OfficeDisplay.usesSlideCache(officeRendering.value) else { return }
+        case .pdf, .image:
+            return
+        }
+        guard !officeFonts.hasStarted, fontStartWaiter == nil else { return }
+        guard typingIdleRemaining() != nil else { fontStarter()(); return }
+        fontStartWaiter = Task { [weak self] in
+            while let wait = self?.typingIdleRemaining() {
+                try? await Task.sleep(for: wait)
+                if Task.isCancelled { return }
+            }
+            guard let self else { return }
+            self.fontStartWaiter = nil
+            if self.officePreferences.includeOffice { self.fontStarter()() }
+        }
+    }
+
+    /// How much longer the search field must stay idle; nil when it has been idle long enough (or never typed in).
+    private func typingIdleRemaining() -> Duration? {
+        guard let lastTyping else { return nil }
+        let left = typingIdleDelay - (ContinuousClock.now - lastTyping)
+        return left > .zero ? left : nil
+    }
+
+    /// At launch (the app, not its UI-test mode): when a registration once succeeded, start it now in the background
+    /// – the prompt was answered before, and Word tiles need the fonts from the first one on.
+    public func startOfficeFontsIfRegisteredBefore() {
+        guard officePreferences.includeOffice, defaults.bool(forKey: Self.fontsRegisteredOnceKey) else { return }
+        fontStarter()()
+    }
+
+    /// The registration succeeded (done in time, cloud fonts read): remembered for the next launches; Word tiles and
+    /// the preview shown before are drawn again once (`foreignPagesRevision`: their tile keys carry the font state,
+    /// `OfficePages.contentVersion`); Word documents laid out with substitute fonts are laid out again – single
+    /// files at once, folders by a layout run (the Indexer requeues `TextKitWordSource.substituteRenderer`).
+    func fontsRegistered() {
+        guard !fontsAreRegistered else { return }
+        fontsAreRegistered = true
+        defaults.set(true, forKey: Self.fontsRegisteredOnceKey)
+        if wordShownBeforeFonts, foreignPages != nil { foreignPagesRevision += 1 }
+        guard officePreferences.includeOffice else { return }
+        for source in sourceList.items where !source.isFolder && SingleFileLayout.officeKind(source.url) == .word {
+            if case .laidOut(let result, _)? = fileLayouts[source.url.path], result.renderer == TextKitWordSource.substituteRenderer {
+                requeueFileLayout(source.url.path)
+            }
+        }
+        startQueueIfNeeded()
+        let folders = folderSources.compactMap { url in indexes[url.path].map { (url.path, $0) } }
+        guard !folders.isEmpty else { return }
+        Task { [weak self] in
+            let stale = await Task.detached(priority: .utility) {
+                folders.filter { (try? $0.1.hasLayouts(byRenderer: TextKitWordSource.substituteRenderer)) ?? false }.map(\.0)
+            }.value
+            guard let self, self.officePreferences.includeOffice else { return }
+            for path in stale where self.indexes[path] != nil {
+                if self.currentFolder == path, self.currentPhase == .layout {
+                    self.layoutAgain.insert(path)    // the running layout fetched its work already
+                } else if !self.layoutPending.contains(path) {
+                    self.layoutPending.append(path)
+                }
+            }
+            self.startQueueIfNeeded()
+        }
+    }
+
+    /// Unused slides are kept this long (use = a tile, preview or output read the entry).
+    nonisolated static let slideCacheMaxAge: TimeInterval = 180 * 86_400
+    /// A writer's `.tmp` folder unchanged this long belongs to a crashed run.
+    nonisolated static let abandonedWriteAge: TimeInterval = 86_400
+
+    /// Once at app start (before `restoreSources`): removes Quick Look leftovers of crashed runs
+    /// (`QuickLookHTML.sweepLeftovers()`), slide-cache entries unused for 180 days and `.tmp` folders of crashed
+    /// writers, off the main actor. The queue starts no layout step before it is done. Errors are only logged.
+    /// No Office font prewarm here (1.3.2): it starts with the first Word/PowerPoint layout or shown document
+    /// (`prewarmFonts`), or at launch after an earlier success (`startOfficeFontsIfRegisteredBefore`, the app only).
+    public func startMaintenance() {
+        guard !maintenanceStarted else { return }
+        maintenanceStarted = true
+        let cache = slideCache, leftovers = quickLookLeftoverRoot, gate = maintenanceGate
+        runCacheJob {
+            await gate?()
+            let now = Date()
+            let swept = QuickLookHTML.sweepLeftovers(in: leftovers)
+            do {
+                let pruned = try cache.prune(notUsedSince: now.addingTimeInterval(-Self.slideCacheMaxAge))
+                let abandoned = try cache.pruneAbandonedWrites(notChangedSince: now.addingTimeInterval(-Self.abandonedWriteAge))
+                Self.log.info("Maintenance: \(swept) Quick Look leftovers, \(pruned) old slide entries, \(abandoned) abandoned writes removed")
+            } catch {
+                Self.log.error("Slide cache maintenance failed: \(String(describing: error), privacy: .public)")
+            }
+            return nil
+        }
+    }
+
+    /// „Folien-Cache leeren“: stops a running layout (folder or single file) and waits for it, empties the slide
+    /// cache off the main actor, then lays out every PowerPoint again (each folder `requestLayout(kind: .powerpoint)`,
+    /// PowerPoint single files wait again, first) and starts the queue. A failure shows an alert.
+    /// Under the own viewer (SlideKit) it only empties the cache.
+    public func clearSlideCache() async {
+        // Own viewer (SlideKit): the cache only holds old Quick Look pictures; clearing frees disk space and no layout
+        // depends on it (no stop, no relayout).
+        guard OfficeDisplay.usesSlideCache(officeRendering.value) else {
+            let cache = slideCache
+            if let failure = await runCacheJob({ do { try cache.clear(); return nil } catch { return error } }).value {
+                Self.log.error("Clearing the slide cache failed: \(String(describing: failure), privacy: .public)")
+                alertMessage = "Folien-Cache kann nicht geleert werden: \(failure.localizedDescription)"
+            }
+            return
+        }
+        // Reserved first: a queue started while the running layout stops must not begin a new layout (open writer).
+        cacheJobs += 1
+        if currentFolder != nil, currentPhase == .layout { await stopQueue() }   // no writer may be open
+        let cache = slideCache
+        let cleared = runCacheJob(reserved: true) {
+            do { try cache.clear(); return nil } catch { return error }
+        }
+        var failure = await cleared.value
+        let folders = folderSources.compactMap { url in indexes[url.path].map { (url.path, $0) } }
+        let requested = await Task.detached(priority: .userInitiated) { () -> Error? in
+            var first: Error?
+            for (_, index) in folders {
+                do { try index.requestLayout(kind: .powerpoint) } catch { first = first ?? error }
+            }
+            return first
+        }.value
+        failure = failure ?? requested
+        if let failure {
+            Self.log.error("Clearing the slide cache failed: \(String(describing: failure), privacy: .public)")
+            alertMessage = "Folien-Cache kann nicht geleert werden: \(failure.localizedDescription)"
+        }
+        relayOutPowerPoint(folders)
+    }
+
+    /// „PowerPoint-Darstellung“ or „Fehlende Schriften“ changed (1.3 Teil B Task 12): hands the choice to the layout
+    /// sources and, when the pages differ, replaces `foreignPages` (same `FontSubstitution` as the layout; the tile cache
+    /// is rebuilt by the view) and drops SlideKit's open decks – only after the old PowerPoint words are gone (below).
+    /// Only when that changes the PowerPoint renderer identity (`officeLayout.renderer(for: .powerpoint)`, name and version: SlideKit 101/102 by font, Quick Look's
+    /// own): stops a running layout (its result belongs to the old renderer) and waits for it, removes the old pages of every
+    /// PowerPoint in each folder (`adoptPowerPointRenderer()`: records the new renderer and drops the old pages in one
+    /// transaction, so the next run does not reset again; no old word stays searchable, decks wait like new
+    /// files), lets PowerPoint single files wait again (first) and starts the queue. Word is not affected (yet).
+    private func renderingChanged(to rendering: OfficeRendering) async {
+        let before = officeLayout.renderer(for: .powerpoint)
+        let previous = officeRendering.value
+        officeRendering.value = rendering
+        let after = officeLayout.renderer(for: .powerpoint)
+        guard before != after else { replacePages(from: previous, to: rendering); return }
+        if currentFolder != nil, currentPhase == .layout { await stopQueue() }
+        let folders = folderSources.compactMap { url in indexes[url.path].map { (url.path, $0) } }
+        let failure = await Task.detached(priority: .userInitiated) { () -> Error? in
+            var first: Error?
+            for (_, index) in folders {
+                do { try index.adoptPowerPointRenderer() } catch { first = first ?? error }
+            }
+            return first
+        }.value
+        if let failure {
+            Self.log.error("Resetting PowerPoint layouts failed: \(String(describing: failure), privacy: .public)")
+            alertMessage = "PowerPoint-Dateien können nicht neu eingelesen werden: \(failure.localizedDescription)"
+        }
+        // Only now, with the old words gone: new drawing never pairs with old word boxes (same main-actor turn as the
+        // single files' requeue in `relayOutPowerPoint`).
+        replacePages(from: previous, to: rendering)
+        relayOutPowerPoint(folders)
+    }
+
+    /// New `foreignPages` when `rendering` draws differently from `previous` (unless they were given to `init`); the
+    /// views rebuild the tile cache and reload, SlideKit's open decks are dropped.
+    private func replacePages(from previous: OfficeRendering, to rendering: OfficeRendering) {
+        guard let pageRenderers, !OfficeDisplay.samePages(previous, rendering) else { return }
+        foreignPages = OfficeDisplay.pages(for: rendering, cache: slideCache, renderers: pageRenderers)
+        foreignPagesRevision += 1
+        OfficeDisplay.releaseOpenDecks()
+    }
+
+    /// After the PowerPoint pages were dropped or reset: every folder (when Office is on) and every PowerPoint single
+    /// file waits for its layout again; the tiles and the shown documents follow.
+    private func relayOutPowerPoint(_ folders: [(String, any FolderIndexing)]) {
+        if officePreferences.includeOffice {
+            for (path, index) in folders where indexes[path] === index && !layoutPending.contains(path) {
+                layoutPending.append(path)
+            }
+        }
+        for source in sourceList.items where !source.isFolder && SingleFileLayout.officeKind(source.url) == .powerpoint {
+            requeueFileLayout(source.url.path)
+        }
+        startQueueIfNeeded()
+        bumpLayoutRevision()
+        scheduleRefreshAfterRecognition()            // reset decks have no pages until laid out again
+    }
+
+    /// Runs `body` off the main actor after the previous slide-cache job; the queue's layout steps wait for it.
+    /// - Returns: its error (nil = fine).
+    @discardableResult
+    /// - Parameter reserved: the caller already counted it in `cacheJobs`.
+    private func runCacheJob(reserved: Bool = false, _ body: @escaping @Sendable () async -> Error?) -> Task<Error?, Never> {
+        let previous = cacheWork
+        let job = Task.detached(priority: .utility) { () -> Error? in
+            await previous?.value
+            return await body()
+        }
+        if !reserved { cacheJobs += 1 }
+        cacheWork = Task { [weak self] in
+            _ = await job.value
+            self?.cacheJobs -= 1
+            self?.wakeQueue()
+        }
+        return job
     }
 
     static func message(forSaveError error: Error, url: URL) -> String {
@@ -1504,14 +2607,21 @@ import ViewerUI
     /// Waits until no search, settings change, indexing run or save is pending.
     func waitUntilIdle() async {
         while true {
-            let s = settingsTask, q = searchTask, i = indexTask, w = saveTask, r = rerunTask, a = addTask
+            let s = settingsTask, q = searchTask, i = indexTask, w = saveTask, r = rerunTask, a = addTask, t = treeTask
+            let c = cacheWork, o = officeCheckTask, g = renderingTask, d = diskChangeTask
+            await d?.value
             await a?.value
+            await t?.value
+            await g?.value
             await s?.value
             await r?.value
+            await c?.value
+            await o?.value
             await q?.value
             await i?.value
             await w?.value
-            if s == settingsTask, q == searchTask, i == indexTask, w == saveTask, r == rerunTask, a == addTask { return }
+            if s == settingsTask, q == searchTask, i == indexTask, w == saveTask, r == rerunTask, a == addTask, t == treeTask,
+               c == cacheWork, o == officeCheckTask, g == renderingTask, d == diskChangeTask { return }
         }
     }
 
@@ -1535,4 +2645,32 @@ final class EarlyResults: @unchecked Sendable {
     var isDone: Bool { lock.withLock { done } }
     /// What has arrived so far (nil = nothing yet).
     func take() -> [(target: String, hits: [DocumentHit])]? { lock.withLock { found.isEmpty ? nil : found } }
+}
+
+extension OfficeRendering {
+    /// The settings UI's choices (ViewerUI's own enums, same raw values) as main's types (SlideKit wiring, 1.3.0).
+    @MainActor init(_ preferences: OfficePreferences) {
+        self.init(powerPointRawValue: preferences.powerPointRenderer.rawValue,
+                  fontsRawValue: preferences.fontSubstitution.rawValue)
+    }
+}
+
+/// Starts the Office font prewarm at most once, from any thread, on a GCD utility queue: not the main thread (a
+/// macOS access prompt may hold it), not Swift's cooperative pool (`FontResolver.prewarm()` blocks). `succeeded`
+/// runs (on that queue) when the prewarm answers true.
+final class OfficeFontPrewarm: Sendable {
+    private let started = Mutex(false)
+
+    var hasStarted: Bool { started.withLock { $0 } }
+
+    /// `otherwise` runs (on that queue) when it answers false.
+    func start(_ prewarm: @escaping @Sendable () -> Bool, then succeeded: @escaping @Sendable () -> Void = {},
+               otherwise: @escaping @Sendable () -> Void = {}) {
+        let first = started.withLock { started in
+            defer { started = true }
+            return !started
+        }
+        guard first else { return }
+        DispatchQueue.global(qos: .utility).async { if prewarm() { succeeded() } else { otherwise() } }
+    }
 }

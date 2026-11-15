@@ -14,14 +14,20 @@ final class SampleViewerModel: ViewerModel {
     var hits: [DocumentHit]
     var query = ParsedQuery(terms: [.word("Vertrag")])
     var selection = PageSelection()
-    var focusedPage: PageRef?
+    var focusedPage: PageRef? {
+        didSet { focusIsAutomatic = false }               // like the app: any page set from outside is chosen
+    }
     let settings: GridSettings
     var indexStatus: IndexStatus = .problems(failed: ["Archiv/alt_beschaedigt.pdf"], noText: ["Scans/rechnung_2019.pdf"])
     var summary: String { ViewerText.summary(hits: hits) }
+    var layoutRevision = 0
     var isSearching = false
     var isBrowsing = false
+    var hiddenByFilter = 0
     let previewZoom = PreviewZoom()
     let ocrPreferences = OCRPreferences(defaults: UserDefaults(suiteName: "PDFSucher.Sample.OCR") ?? .standard)
+    let officePreferences = OfficePreferences(defaults: UserDefaults(suiteName: "PDFSucher.Sample.Office") ?? .standard)
+    let foreignPages: (any ForeignPageProvider)? = nil
     func stopRecognition() {}
     var isRecognitionStopped = false
     func resumeRecognition() {}
@@ -43,8 +49,21 @@ final class SampleViewerModel: ViewerModel {
     func openSources() {}
     func addSources(_ urls: [URL]) {}
     let searchHistory = SearchHistory(defaults: UserDefaults(suiteName: "Sample-\(UUID())")!)
-    func noteSearchArrived() {}
+    func noteSearchArrived() { arrivals += 1 }
+    /// Calls of `noteSearchArrived` (key routing tests).
+    var arrivals = 0
+    var focusIsAutomatic = false
     func chooseHistoryEntry(_ term: String) { queryText = term }
+    var folderTree: [FolderNode] = []
+    var folderFilter = FolderFilter()
+    var filterHeader: String? { nil }
+    let folderBar = FolderBarSettings(defaults: UserDefaults(suiteName: "SampleFolderBar-\(UUID())")!)
+    func selectFolder(_ folder: URL, adding: Bool) { folderFilter.select(folder, adding: adding) }
+    func selectSingleFiles(adding: Bool) {}
+    func clearFolderFilter() { folderFilter.clear() }
+    func setFolderFilter(_ filter: FolderFilter) { folderFilter = filter }
+    func openPlace(_ folder: URL) async {}
+    func requestDeleteIndex(for source: URL?) {}
     var addPrompt: AddPrompt?
     func answerAddPrompt(_ choice: AddChoice, remember: Bool) { addPrompt = nil }
     func removeSource(_ url: URL) {}
@@ -52,6 +71,7 @@ final class SampleViewerModel: ViewerModel {
     func printSelection() {}
     func saveSelection() {}
     func openInPreview(_ r: PageRef) {}
+    func slidesMissing(for ref: PageRef) {}
 
     /// Case-insensitive whole-word „Vertrag“, standing in for SearchKit's PageMatcher.
     static let highlighter: @MainActor (ParsedQuery) -> HighlightRanges? = { _ in

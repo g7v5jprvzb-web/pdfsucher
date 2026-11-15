@@ -25,6 +25,25 @@ public enum GridLayout {
         return CGSize(width: width, height: width * pageAspect)
     }
 
+    /// Page shapes are clamped to this height ÷ width range (a strip or a banner would make tiles vanish).
+    public static let pageAspectRange: ClosedRange<CGFloat> = 0.2...5
+
+    /// The tile of one document row (1.3.4, Chris: landscape decks waste the space above and below an A4
+    /// tile): the page shape (`pageAspect` = height ÷ width of its first page) fitted into the A4 portrait
+    /// tile `base`. Wider pages keep the width and get lower (a 16:9 slide: 40 % of the height), so more
+    /// rows fit; taller pages keep the height and get narrower. nil or nonsense keeps `base`.
+    /// Pages within 2 % of the base shape keep `base`.
+    public static func tileSize(base: CGSize, pageAspect aspect: CGFloat?) -> CGSize {
+        guard let aspect, aspect.isFinite, aspect > 0, base.width > 0, base.height > 0,
+              base.width.isFinite, base.height.isFinite else { return base }
+        // Pages within 2 % of the base shape (A4 = 1.414) keep the base tile exactly: same size as before 1.3.4,
+        // so the tiles already cached on disk stay valid.
+        if abs(aspect / (base.height / base.width) - 1) < 0.02 { return base }
+        let clamped = min(max(aspect, pageAspectRange.lowerBound), pageAspectRange.upperBound)
+        let width = min(base.width, base.height / clamped)
+        return CGSize(width: width, height: width * clamped)
+    }
+
     /// How many tiles of `tileWidth` fit side by side into `width` (`spacing` between them); at least 1.
     public static func columns(available width: CGFloat, tileWidth: CGFloat, spacing: CGFloat) -> Int {
         let fitting = (width + spacing) / (tileWidth + spacing)

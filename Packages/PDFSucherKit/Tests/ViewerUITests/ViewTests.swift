@@ -24,14 +24,14 @@ struct ViewTests {
 #endif
     @Test func detailLoadReportsMissingUnreadableAndReady() async throws {
         let dir = try PDFFixtures.tempDirectory()
-        let missing = await DetailDocument.load(dir.appendingPathComponent("gone.pdf"))
+        let missing = await DetailDocument.load(PageRef(url: dir.appendingPathComponent("gone.pdf"), pageIndex: 0))
         #expect(missing == .missing)
         let fake = dir.appendingPathComponent("fake.pdf")
         try Data("not a pdf".utf8).write(to: fake)
-        #expect(await DetailDocument.load(fake) == .unavailable)
+        #expect(await DetailDocument.load(PageRef(url: fake, pageIndex: 0)) == .unavailable)
         let real = dir.appendingPathComponent("real.pdf")
         try PDFFixtures.makePDF(at: real, pages: ["Vertrag"])
-        guard case .ready(let document) = await DetailDocument.load(real) else {
+        guard case .ready(let document) = await DetailDocument.load(PageRef(url: real, pageIndex: 0)) else {
             Issue.record("expected a loaded document"); return
         }
         #expect(document.pdf.pageCount == 1)
@@ -41,11 +41,11 @@ struct ViewTests {
     @Test func detailLoadReusesUnchangedDocument() async throws {
         let url = try PDFFixtures.tempDirectory().appendingPathComponent("d.pdf")
         try PDFFixtures.makePDF(at: url, pages: ["Vertrag"])
-        guard case .ready(let first) = await DetailDocument.load(url) else { Issue.record("not loaded"); return }
-        guard case .ready(let again) = await DetailDocument.load(url, reusing: first) else { Issue.record("not loaded"); return }
+        guard case .ready(let first) = await DetailDocument.load(PageRef(url: url, pageIndex: 0)) else { Issue.record("not loaded"); return }
+        guard case .ready(let again) = await DetailDocument.load(PageRef(url: url, pageIndex: 0), reusing: first) else { Issue.record("not loaded"); return }
         #expect(again.pdf === first.pdf)
         try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(120)], ofItemAtPath: url.path)
-        guard case .ready(let changed) = await DetailDocument.load(url, reusing: first) else { Issue.record("not loaded"); return }
+        guard case .ready(let changed) = await DetailDocument.load(PageRef(url: url, pageIndex: 0), reusing: first) else { Issue.record("not loaded"); return }
         #expect(changed.pdf !== first.pdf)
     }
 

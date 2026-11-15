@@ -1,10 +1,11 @@
 // SettingsView.swift — Task 4.3
 import AppKit
+import IndexKit
 import SearchKit
 import SwiftUI
 
-/// Settings window: tabs „Allgemein“, „Vorschau“, „Tastatur“, „Tastenkürzel“ (1.1).
-/// `onDeleteIndex` adds the „Index löschen …“ button.
+/// Settings window: tabs „Allgemein“, „Vorschau“, „Darstellung“, „Texterkennung“, „Speicher“, „Tastatur“,
+/// „Tastenkürzel“. `onDeleteIndex` and `tileCache` fill „Speicher“ (Index, Kachel-Cache).
 public struct SettingsView: View {
     @Bindable private var settings: GridSettings
     @Bindable private var keyboard: KeyboardSettings
@@ -15,22 +16,27 @@ public struct SettingsView: View {
     private let folderSources: [URL]
     /// 1.2.2 §1: „Suchverlauf“ in „Allgemein“ (not shown without it).
     private let history: SearchHistory?
-    private var canDeleteIndex: Bool { !folderSources.isEmpty }
-    /// Folder whose index „Index löschen …“ deletes; nil = all folders.
-    @State private var deleteTarget: URL?
     private let tileCache: TileDiskCache?
-    /// Size of the tiles on disk; nil while it is being counted.
-    @State private var tileCacheBytes: Int?
+    /// 1.3 Teil B Task 12: the „Word/PowerPoint“ tab (not shown without `office`).
+    private let office: OfficePreferences?
+    private let layoutCounts: ((URL) async -> LayoutCounts?)?
+    private let onClearSlideCache: (() async -> Void)?
 
     /// - Parameters:
     ///   - folderSources: loaded folders; empty disables „Index löschen …“.
     ///   - onDeleteIndex: deletes the index of one folder or (nil) of all folders.
     /// - Parameters:
     ///   - ocr, ocrCounts, onRerunOCR: the „Texterkennung“ tab (spec 1.2 §7); without `ocr` it is not shown.
+    ///   - office, layoutCounts, onClearSlideCache: the „Word/PowerPoint“ tab (1.3); without `office` it is not shown,
+    ///     without `onClearSlideCache` it has no „Folien-Cache leeren“.
     public init(settings: GridSettings, keyboard: KeyboardSettings, ocr: OCRPreferences? = nil,
                 ocrCounts: ((URL) async -> (pages: Int, images: Int)?)? = nil, onRerunOCR: ((URL) -> Void)? = nil,
                 folderSources: [URL] = [], onDeleteIndex: ((URL?) -> Void)? = nil, history: SearchHistory? = nil,
-                tileCache: TileDiskCache? = nil) {
+                office: OfficePreferences? = nil, layoutCounts: ((URL) async -> LayoutCounts?)? = nil,
+                onClearSlideCache: (() async -> Void)? = nil, tileCache: TileDiskCache? = nil) {
+        self.office = office
+        self.layoutCounts = layoutCounts
+        self.onClearSlideCache = onClearSlideCache
         self.history = history
         self.tileCache = tileCache
         self.settings = settings
@@ -52,14 +58,40 @@ public struct SettingsView: View {
                 OCRTab(ocr: ocr, folders: folderSources, counts: ocrCounts, onRerun: onRerunOCR)
                     .tabItem { Label("Texterkennung", systemImage: "text.viewfinder") }.tag(SettingsTab.ocr)
             }
+            if let office {
+                OfficeTab(office: office, folders: folderSources, counts: layoutCounts, onClearSlideCache: onClearSlideCache)
+                    .tabItem { Label("Word/PowerPoint", systemImage: "doc.richtext") }.tag(SettingsTab.office)
+            }
+            if onDeleteIndex != nil || tileCache != nil {
+                StorageTab(folderSources: folderSources, onDeleteIndex: onDeleteIndex, tileCache: tileCache)
+                    .tabItem { Label("Speicher", systemImage: "internaldrive") }.tag(SettingsTab.storage)
+            }
             keys.tabItem { Label("Tastatur", systemImage: "keyboard") }.tag(SettingsTab.keyboard)
             ShortcutsTab(keyboard: keyboard).tabItem { Label("Tastenkürzel", systemImage: "command") }.tag(SettingsTab.shortcuts)
         }
-        .frame(width: 520)
+        // Every tab fits without scrolling; the window can be resized and keeps its size (1.2.4).
+        // One ideal size for every tab, so switching tabs does not resize the window (review I3).
+        .frame(minWidth: SettingsLayout.minContentSize.width, idealWidth: SettingsLayout.defaultContentSize.width, maxWidth: .infinity,
+               minHeight: SettingsLayout.minContentSize.height, idealHeight: SettingsLayout.defaultContentSize.height,
+               maxHeight: .infinity)
         .background(WindowFrameKeeper(
-            load: { [settings] in settings.settingsWindowOrigin.map { CGRect(origin: $0, size: .zero) } },
-            save: { [settings] in settings.settingsWindowOrigin = CGPoint(x: $0.minX, y: $0.maxY) },
-            size: false))
+            load: { [settings] in settings.settingsWindowFrame },
+            save: { [settings] in settings.settingsWindowFrame = $0 },
+            defaultContentSize: { screen in SettingsLayout.contentSize(forVisibleScreen: screen) },
+            savesProgrammaticResizes: false,
+            makesResizable: true))
+    }
+
+    /// The tabs in their order; „Texterkennung“, „Word/PowerPoint“ and „Speicher“ only with their settings.
+    var shownTabs: [SettingsTab] {
+        SettingsTab.allCases.filter { tab in
+            switch tab {
+            case .ocr: ocr != nil
+            case .office: office != nil
+            case .storage: onDeleteIndex != nil || tileCache != nil
+            default: true
+            }
+        }
     }
 
     /// §13: share of the page width per zoom level.
@@ -69,6 +101,17 @@ public struct SettingsView: View {
                 Picker("Vorschau", selection: $settings.previewPosition) {
                     ForEach(PreviewPosition.allCases, id: \.self) { Text(PreviewPositionPicker.label($0)).tag($0) }
                 }
+            }
+            Section {
+                Toggle("Vorschaubreite an Zoom anpassen", isOn: $settings.previewFollowsZoom)
+                    .accessibilityIdentifier("previewFollowsZoomToggle")
+                Toggle("Zoom über die Fensterbreite hinaus erlauben", isOn: $settings.previewZoomBeyondWidth)
+                    .accessibilityIdentifier("previewZoomBeyondWidthToggle")
+            } header: {
+                Text("Breite")
+            } footer: {
+                Text("Neben dem Raster wird die Vorschau so schmal wie die gezoomte Seite, höchstens so breit wie eingestellt; das Raster bekommt den Platz. Über die Breite hinaus: weiter zoomen und waagerecht scrollen.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             Section {
                 ForEach(1...4, id: \.self) { level in
@@ -143,11 +186,13 @@ public struct SettingsView: View {
     private var keys: some View {
         Form {
             Section("Tastatur") {
-                Toggle("Tab überspringt das Suchfeld", isOn: $keyboard.tabSkipsSearch)
-                Text(keyboard.tabSkipsSearch
-                     ? "Tab wechselt nur zwischen Vorschau und Trefferraster; ins Suchfeld mit ⌘F oder Klick."
-                     : "Tab: Suchfeld → Vorschau → Trefferraster.")
+                Toggle("Tab erreicht auch das Suchfeld", isOn: $keyboard.tabIncludesSearch)
+                    .accessibilityIdentifier("tabIncludesSearchToggle")
+                Toggle("Tab erreicht auch die Vorschau", isOn: $keyboard.tabIncludesPreview)
+                    .accessibilityIdentifier("tabIncludesPreviewToggle")
+                Text(keyboard.tabOrderText() + (keyboard.tabIncludesSearch ? "" : " · ins Suchfeld mit ⌘F oder Klick"))
                     .font(.caption).foregroundStyle(.secondary)
+                    .accessibilityIdentifier("tabOrderText")
             }
         }
         .formStyle(.grouped)
@@ -189,49 +234,19 @@ public struct SettingsView: View {
                     Text(notice).font(.caption).foregroundStyle(.orange)
                 }
                 Toggle("Wortteile finden", isOn: $settings.partialWords)
+                Toggle("Auch Dateinamen durchsuchen", isOn: $settings.searchFileNames)
+                    .help("Findet Dateien auch über ihren Namen (ohne Endung), mit denselben Regeln wie den Text")
+                    .accessibilityIdentifier("searchFileNamesToggle")
                 Picker("Wartezeit nach dem Tippen", selection: $settings.debounceMs) {
                     ForEach(GridSettings.debounceChoices, id: \.self) { ms in
                         Text(ms == GridSettings.debounceChoices[0] ? "\(ms) ms (Standard)" : "\(ms) ms").tag(ms)
                     }
                 }
                 .help("So lange wartet die Suche nach dem letzten Tastendruck")
-            }
-            if let onDeleteIndex {
-                Section("Index") {
-                    if folderSources.count > 1 {
-                        Picker("Ordner", selection: $deleteTarget) {
-                            Text("Alle Ordner").tag(URL?.none)
-                            ForEach(folderSources, id: \.self) { Text($0.lastPathComponent).tag(URL?.some($0)) }
-                        }
-                    }
-                    Button("Index löschen …", role: .destructive) { onDeleteIndex(deleteTarget) }
-                    .disabled(!canDeleteIndex)
-                    .help(Self.deleteIndexHelp(canDelete: canDeleteIndex))
-                }
-            }
-            if let tileCache {
-                // Spec 1.2.3: rendered tiles on disk; clearing only costs time to render them again.
-                Section("Kachel-Cache") {
-                    LabeledContent("Belegt", value: tileCacheBytes.map(Self.tileCacheSize) ?? "…")
-                    Button("Kachel-Cache leeren") {
-                        tileCacheBytes = nil
-                        Task {
-                            tileCacheBytes = await Task.detached(priority: .userInitiated) {
-                                tileCache.removeAll()
-                                return tileCache.byteCount
-                            }.value
-                        }
-                    }
-                    .help("Löscht die gespeicherten Seitenbilder. Sie entstehen beim nächsten Anzeigen neu.")
-                }
-                .task { tileCacheBytes = await Task.detached(priority: .utility) { tileCache.byteCount }.value }
+                .accessibilityIdentifier("debouncePicker")
             }
         }
         .formStyle(.grouped)
-        .onChange(of: folderSources) { _, folders in
-            // A removed folder must not stay picked (the model ignores it; the picker shows „Alle“ again).
-            if let target = deleteTarget, !folders.contains(target) { deleteTarget = nil }
-        }
     }
 
     nonisolated static func tileCacheSize(_ bytes: Int) -> String {
@@ -303,6 +318,108 @@ private struct OCRSourceRow: View {
     }
 }
 
+
+/// Settings tab „Word/PowerPoint“ (1.3 Teil B Task 12): the Office switch, the PowerPoint display, the counts per
+/// folder and „Folien-Cache leeren“.
+struct OfficeTab: View {
+    @Bindable var office: OfficePreferences
+    let folders: [URL]
+    let counts: ((URL) async -> LayoutCounts?)?
+    @State private var clearAction: SlideCacheClearAction?
+
+    init(office: OfficePreferences, folders: [URL], counts: ((URL) async -> LayoutCounts?)?,
+         onClearSlideCache: (() async -> Void)?) {
+        self.office = office
+        self.folders = folders
+        self.counts = counts
+        _clearAction = State(initialValue: onClearSlideCache.map(SlideCacheClearAction.init))
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle("Word- und PowerPoint-Dateien durchsuchen", isOn: $office.includeOffice)
+                    .help("Aus: Word- und PowerPoint-Dateien werden nicht mehr aufgelistet; ihr Text wird aus dem Index entfernt")
+            } footer: {
+                Text(ViewerText.officeFormatsFooter)
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section {
+                Picker("PowerPoint-Darstellung", selection: $office.powerPointRenderer) {
+                    Text("Eigener Viewer").tag(OfficeRendererChoice.slideKit)
+                    Text("Quick Look (macOS)").tag(OfficeRendererChoice.quickLook)
+                }
+                .help("Wie Folien gezeichnet und gelesen werden. Wechselt dadurch die Darstellung, werden alle PowerPoint-Dateien neu eingelesen; bis dahin werden sie nicht gefunden.")
+                Picker("Fehlende Schriften", selection: $office.fontSubstitution) {
+                    Text("wie PowerPoint").tag(OfficeFontChoice.powerPoint)
+                    Text("ähnliche Schrift").tag(OfficeFontChoice.similar)
+                }
+                .disabled(office.powerPointRenderer == .quickLook)
+                .help("Nur für den eigenen Viewer (später auch für Word). „wie PowerPoint“ ersetzt fehlende Schriften wie PowerPoint (meist durch Calibri); Office-Schriften wie Garamond oder Century Gothic bekommen auch dann einen ähnlichen Ersatz.")
+            } header: {
+                Text("PowerPoint")
+            } footer: {
+                Text("„Fehlende Schriften“ gilt nur für den eigenen Viewer. Nach einem Wechsel werden PowerPoint-Dateien erst wieder gefunden, wenn sie neu eingelesen sind.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if !folders.isEmpty {
+                Section("Quellen") {
+                    ForEach(folders, id: \.self) { folder in LayoutSourceRow(folder: folder, counts: counts) }
+                }
+            }
+            if let clearAction {
+                Section {
+                    Button("Folien-Cache leeren") { Task { await clearAction.run() } }
+                        .disabled(clearAction.isRunning)
+                        .help("Löscht die gespeicherten Folienbilder (Quick Look) aller Quellen")
+                } header: {
+                    Text("Folien-Cache")
+                } footer: {
+                    Text(ViewerText.slideCacheFooter(office.powerPointRenderer))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+}
+
+/// „Folien-Cache leeren“: runs the model's action once at a time; the button is disabled meanwhile.
+@MainActor @Observable final class SlideCacheClearAction {
+    private(set) var isRunning = false
+    @ObservationIgnored private let action: () async -> Void
+
+    init(_ action: @escaping () async -> Void) { self.action = action }
+
+    func run() async {
+        guard !isRunning else { return }
+        isRunning = true
+        defer { isRunning = false }
+        await action()
+    }
+}
+
+/// One folder's Word/PowerPoint counts, refreshed every 2 s while the tab is open (like `OCRSourceRow`).
+private struct LayoutSourceRow: View {
+    let folder: URL
+    let counts: ((URL) async -> LayoutCounts?)?
+    @State private var text = ""
+
+    var body: some View {
+        VStack(alignment: .leading) {
+            Text(folder.lastPathComponent)
+            Text(text).font(.caption).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .task(id: folder.path) {
+            while !Task.isCancelled {
+                if let counts, let c = await counts(folder) { text = ViewerText.layoutCounts(c) }
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
+    }
+}
 
 /// 1.2.2 §1: „Suchverlauf speichern“, number of entries, „Verlauf löschen“.
 private struct HistorySettings: View {

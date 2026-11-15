@@ -104,7 +104,7 @@ struct ThumbnailCacheTests {
         let p0 = await cache.thumbnail(for: PageRef(url: url, pageIndex: 0), size: size)
         _ = await cache.thumbnail(for: PageRef(url: url, pageIndex: 1), size: size)
         _ = await cache.thumbnail(for: PageRef(url: url, pageIndex: 0), size: CGSize(width: 300, height: 424))
-        #expect(await cache.cachedImageCount == 2)
+        #expect(cache.cachedImageCount == 2)
         let p0again = await cache.thumbnail(for: PageRef(url: url, pageIndex: 0), size: size)
         #expect(p0again !== p0)
     }
@@ -146,7 +146,7 @@ struct ThumbnailCacheTests {
         let size = CGSize(width: 100, height: 141)
         _ = await cache.thumbnail(for: PageRef(url: url, pageIndex: 0), size: size)
         _ = await cache.thumbnail(for: PageRef(url: url, pageIndex: 1), size: size)
-        #expect(await cache.cachedImageCount == 1)
+        #expect(cache.cachedImageCount == 1)
     }
 
     @Test func cancelledRequestRendersNothing() async throws {
@@ -155,7 +155,7 @@ struct ThumbnailCacheTests {
         let task = Task { await cache.thumbnail(for: PageRef(url: url, pageIndex: 0), size: CGSize(width: 100, height: 141)) }
         task.cancel()
         #expect(await task.value == nil)
-        #expect(await cache.cachedImageCount == 0)
+        #expect(cache.cachedImageCount == 0)
     }
 
     @Test func highlightedImageNeverSharesKeyWithPlainImage() async throws {
@@ -174,7 +174,7 @@ struct ThumbnailCacheTests {
         try Data("not a pdf".utf8).write(to: url)
         let cache = ThumbnailCache()
         for _ in 0..<3 { _ = await cache.thumbnail(for: PageRef(url: url, pageIndex: 0), size: CGSize(width: 100, height: 141)) }
-        #expect(await cache.documentOpenCount == 1)
+        #expect(cache.documentOpenCount == 1)
     }
 
     @Test func documentIsOpenedOnceWhileCached() async throws {
@@ -188,11 +188,11 @@ struct ThumbnailCacheTests {
         let size = CGSize(width: 100, height: 141)
         _ = await cache.thumbnail(for: PageRef(url: urls[0], pageIndex: 0), size: size)
         _ = await cache.thumbnail(for: PageRef(url: urls[0], pageIndex: 1), size: size)
-        #expect(await cache.documentOpenCount == 1)
+        #expect(cache.documentOpenCount == 1)
         _ = await cache.thumbnail(for: PageRef(url: urls[1], pageIndex: 0), size: size)
         _ = await cache.thumbnail(for: PageRef(url: urls[2], pageIndex: 0), size: size)   // evicts d0
         _ = await cache.thumbnail(for: PageRef(url: urls[0], pageIndex: 0), size: CGSize(width: 300, height: 424))
-        #expect(await cache.documentOpenCount == 4)
+        #expect(cache.documentOpenCount == 4)
     }
 
     /// Fixed mode with 1 page per row on a wide screen gives tiles taller than 4096 pt: they must still

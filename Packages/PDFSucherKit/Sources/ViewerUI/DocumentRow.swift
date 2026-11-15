@@ -13,24 +13,57 @@ struct DocumentRow: View {
     static func overhead(fontSize: Int) -> CGFloat { headerHeight(fontSize: fontSize) + 4 + scrollerAllowance }
 
     let hit: DocumentHit
-    let tileSize: CGSize
+    /// The A4 portrait tile of the grid; this row fits its document's page shape into it (1.3.4).
+    let baseTileSize: CGSize
+    let shapes: PageShapes
     let model: any ViewerModel
     let cache: ThumbnailCache
     let folderUnreachable: Bool
     let highlightKey: String
     let highlightRanges: HighlightRanges?
-    /// Tiles rendered ahead to the right of each tile that appears (spec 1.2.3): about one screen width.
-    var prefetchAhead = 0
+    /// A tile at this position came into view (spec 1.2.4 §2: the grid prefetches the area once).
+    var onTileAppear: ((Int) -> Void)?
     let onFocusTile: (PageRef) -> Void
+    /// Bumped when the page shape lookup finished, so the row redraws in its shape (`PageShapes` is not observed).
+    @State private var shapeLookups = 0
 
     var body: some View {
+        // Read for Word/PowerPoint rows only (as for the tiles): PDF and image rows must not redraw on layout progress.
+        let shapeRevision = hit.kind.isOffice ? model.layoutRevision : 0
+        let shapeReady = shapeLookups >= 0 && shapes.isResolved(hit.url, revision: shapeRevision)
+        let tileSize = shapes.tileSize(for: hit, base: baseTileSize)
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 if let symbol = ViewerText.rowSymbol(hit) {
-                    Image(systemName: symbol).foregroundStyle(.secondary).accessibilityLabel(ViewerText.imageLabel)
+                    Image(systemName: symbol).foregroundStyle(.secondary).accessibilityLabel(ViewerText.kindLabel(hit.kind))
                 }
-                Text(ViewerText.rowHeader(hit)).font(.system(size: CGFloat(model.settings.headerFontSize), weight: .bold))
+                Text(Self.headerText(hit, ranges: highlightRanges, color: model.settings.highlightColor))
+                    .font(.system(size: CGFloat(model.settings.headerFontSize), weight: .bold))
                     .layoutPriority(1)       // the folder label gives way first
+                if Self.showsNameHint(hit) {
+                    Text(ViewerText.nameHit)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .overlay(Capsule().strokeBorder(Color.secondary.opacity(0.5), lineWidth: 1))
+                        .help(ViewerText.nameHitHelp)
+                        .layoutPriority(1)
+                        .accessibilityHint(ViewerText.nameHitHelp)
+                        .accessibilityIdentifier("nameHitHint")
+                }
+                if Self.showsSimplifiedHint(hit) {
+                    Text(ViewerText.simplified)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .overlay(Capsule().strokeBorder(Color.secondary.opacity(0.5), lineWidth: 1))
+                        .help(ViewerText.simplifiedHelp)
+                        .layoutPriority(1)
+                        .accessibilityHint(ViewerText.simplifiedHelp)
+                        .accessibilityIdentifier("simplifiedHint")
+                }
                 let folder = ViewerText.rowFolder(hit, showSource: model.sources.count > 1)
                 if !folder.isEmpty {
                     Text(folder).font(.callout).foregroundStyle(.secondary).truncationMode(.head)
@@ -42,11 +75,15 @@ struct DocumentRow: View {
 
             let showAll = model.settings.showAllPages
             if hit.isUnreadable || RowPages.count(for: hit, showAll: showAll) == 0 {
-                Label(hit.isUnreadable ? ViewerText.unreadableRow : ViewerText.pagesPending,
-                      systemImage: hit.isUnreadable ? "exclamationmark.triangle" : "hourglass")
+                Label(ViewerText.rowHint(hit), systemImage: hit.isUnreadable ? "exclamationmark.triangle" : "hourglass")
                     .foregroundStyle(.secondary)
                     .frame(height: tileSize.height + 4 + Self.scrollerAllowance, alignment: .topLeading)
                     .accessibilityIdentifier("rowHint")
+            } else if !shapeReady {
+                // The page shape is looked up first (one page header read): tiles are rendered once, in their shape.
+                Color.clear
+                    .frame(width: tileSize.width, height: tileSize.height + 4 + Self.scrollerAllowance)
+                    .accessibilityHidden(true)
             } else {
             ScrollViewReader { proxy in
             ScrollView(.horizontal) {
@@ -57,6 +94,7 @@ struct DocumentRow: View {
                         let style = TileStyle.make(matchCount: page.matchCount, showAll: showAll, isSearchHit: !hit.pageHits.isEmpty)
                         ThumbnailTile(
                             ref: ref,
+                            kind: hit.kind,
                             size: tileSize,
                             isSelected: model.selection.contains(ref),
                             isFocused: model.focusedPage == ref,
@@ -67,16 +105,17 @@ struct DocumentRow: View {
                             style: style,
                             highlightColor: model.settings.highlightColor,
                             ocrText: { await model.ocrText(for: $0) },
+                            // Read for Word/PowerPoint rows only: PDF and image rows must not redraw on layout progress.
+                            layoutRevision: hit.kind.isOffice ? model.layoutRevision : 0,
+                            pagesRevision: hit.kind.isOffice ? model.foreignPagesRevision : 0,
+                            documentPageCount: hit.pageCount,
+                            onSlidesMissing: { model.slidesMissing(for: ref) },
                             onToggle: { model.selection.toggle(ref) },
                             onFocus: { onFocusTile(ref) },
                             onOpen: { model.openInPreview(ref) }
                         )
                         .id(FocusNavigator.tileID(ref))
-                        .onAppear {
-                            guard prefetchAhead > 0 else { return }
-                            Self.prefetch(hit, positions: (position + 1)..<(position + 1 + prefetchAhead), tileSize: tileSize,
-                                          model: model, cache: cache, highlightKey: highlightKey, highlightRanges: highlightRanges)
-                        }
+                        .onAppear { onTileAppear?(position) }
                     }
                 }
             }
@@ -102,6 +141,13 @@ struct DocumentRow: View {
             }
             }
         }
+        .task(id: ShapeLookup(url: hit.url, revision: shapeRevision)) {
+            guard !shapes.isResolved(hit.url, revision: shapeRevision) else { return }
+            await shapes.resolve(hit, revision: shapeRevision, cache: cache)
+            shapeLookups += 1
+        }
+        // A Word document or deck in view: the app may start Office's font registration (1.3.2).
+        .onAppear { if hit.kind.isOffice { model.officeDocumentShown(hit.url) } }
         // The whole row (header and tiles), so UI tests find a row's checkboxes inside it.
         .accessibilityElement(children: .contain)
         .accessibilityLabel(ViewerText.rowHeader(hit))
@@ -115,23 +161,33 @@ struct DocumentRow: View {
 }
 
 extension DocumentRow {
-    /// Renders the tiles at `positions` of a row ahead of time, with the marks they will show (spec 1.2.3).
-    static func prefetch(_ hit: DocumentHit, positions: Range<Int>, tileSize: CGSize, model: any ViewerModel,
-                         cache: ThumbnailCache, highlightKey: String, highlightRanges: HighlightRanges?) {
-        let showAll = model.settings.showAllPages
-        let pages = RowPages.pages(for: hit, showAll: showAll)
-        let range = positions.clamped(to: pages.indices)
-        guard !range.isEmpty else { return }
-        var plain: [PageRef] = [], marked: [PageRef] = []
-        for page in pages[range] {
-            let ref = PageRef(url: hit.url, pageIndex: page.pageIndex)
-            let style = TileStyle.make(matchCount: page.matchCount, showAll: showAll, isSearchHit: !hit.pageHits.isEmpty)
-            if style.highlights, highlightRanges != nil { marked.append(ref) } else { plain.append(ref) }
+    struct ShapeLookup: Equatable { let url: URL; let revision: Int }
+
+    /// „vereinfacht“ next to the header: documents drawn by TextKit (renderer `textkit`, today every Word file).
+    static func showsSimplifiedHint(_ hit: DocumentHit) -> Bool { hit.isSimplified }
+
+    /// „Treffer im Dateinamen“ for a document found by its name only (spec 1.3.2 §2).
+    static func showsNameHint(_ hit: DocumentHit) -> Bool { hit.nameMatch && hit.pageHits.isEmpty }
+
+    /// The row header with the query highlighted in the file name (without extension; never in the counts) when the
+    /// name matched (spec 1.3.2 §2), in the highlight colour of the settings.
+    static func headerText(_ hit: DocumentHit, ranges: HighlightRanges?, color: RGBA) -> AttributedString {
+        let header = ViewerText.rowHeader(hit)
+        let base = DocumentHit.searchableName(of: hit.url.lastPathComponent)
+        guard hit.nameMatch, let ranges, !base.isEmpty, header.hasPrefix(base) else { return AttributedString(header) }
+        let background = Color(.sRGB, red: color.r, green: color.g, blue: color.b, opacity: max(color.a, 0.6))
+        var text = AttributedString()
+        var cursor = base.startIndex
+        for range in ranges(base).sorted(by: { $0.lowerBound < $1.lowerBound }) where range.lowerBound >= cursor {
+            text += AttributedString(String(base[cursor..<range.lowerBound]))
+            var marked = AttributedString(String(base[range]))
+            marked.backgroundColor = background
+            text += marked
+            cursor = range.upperBound
         }
-        let color = model.settings.highlightColor
-        cache.prefetch(plain, size: tileSize)
-        cache.prefetch(marked, size: tileSize, highlightKey: highlightKey, highlightRanges: highlightRanges,
-                       highlightColor: color, ocr: { @MainActor ref in await model.ocrText(for: ref) })
+        text += AttributedString(String(base[cursor...]))
+        text += AttributedString(String(header.dropFirst(base.count)))
+        return text
     }
 
     /// First tile of a row when it comes into view: its first hit with „Alle Seiten“, else the start.

@@ -12,7 +12,7 @@ struct ViewStateTests {
         let d = defaults()
         let s = GridSettings(defaults: d)
         s.mainWindowFrame = CGRect(x: 100, y: 80, width: 1300, height: 900)
-        s.settingsWindowOrigin = CGPoint(x: 400, y: 300)
+        s.settingsWindowFrame = CGRect(x: 400, y: 300, width: 700, height: 900)
         s.settingsTab = .ocr
         s.setPreviewFraction(0.3, for: .top)
         s.setPreviewFraction(0.6, for: .leading)
@@ -21,7 +21,7 @@ struct ViewStateTests {
         s.showAllPages = true; s.partialWords = true; s.previewPosition = .trailing
         let r = GridSettings(defaults: d)
         #expect(r.mainWindowFrame == CGRect(x: 100, y: 80, width: 1300, height: 900))
-        #expect(r.settingsWindowOrigin == CGPoint(x: 400, y: 300))
+        #expect(r.settingsWindowFrame == CGRect(x: 400, y: 300, width: 700, height: 900))
         #expect(r.settingsTab == .ocr)
         #expect(r.previewFraction(for: .top) == 0.3)
         #expect(r.previewFraction(for: .leading) == 0.6)
@@ -33,14 +33,14 @@ struct ViewStateTests {
     @Test func invalidValuesFallBack() {
         let d = defaults()
         d.set("kaputt", forKey: "window.main.frame")
-        d.set("1 zwei", forKey: "window.settings.origin")
+        d.set("1 zwei 3 4", forKey: "window.settings.frame")
         d.set("nichtda", forKey: "settings.tab")
         d.set(7.5, forKey: "layout.split.top")
         d.set("x", forKey: "layout.split.leading")
         d.set("zoom:99", forKey: "preview.zoom")
         let s = GridSettings(defaults: d)
         #expect(s.mainWindowFrame == nil)
-        #expect(s.settingsWindowOrigin == nil)
+        #expect(s.settingsWindowFrame == nil)
         #expect(s.settingsTab == .general)
         #expect(s.previewFraction(for: .top) == SplitMath.maxFraction, "out of range is clamped")
         #expect(s.previewFraction(for: .leading) == SplitMath.defaultFraction(.leading))
@@ -95,6 +95,14 @@ struct ViewStateTests {
         let fitted = WindowPlacement.fitted(small, visibleFrames: [screen], minSize: CGSize(width: 960, height: 560))
         #expect(fitted.size == CGSize(width: 960, height: 560))
         #expect(fitted.maxY == small.maxY, "grows downwards from the title bar")
+    }
+
+    /// Review I4: a remembered frame taller than the current screen (moved from a larger one) is shrunk.
+    @Test func tooTallFrameIsShrunkToTheScreen() {
+        let screen = CGRect(x: 0, y: 0, width: 1440, height: 800)
+        let tall = CGRect(x: 100, y: -300, width: 680, height: 1100)       // title bar on screen
+        let fitted = WindowPlacement.fitted(tall, visibleFrames: [screen])
+        #expect(fitted.height <= 800 && screen.contains(fitted))
     }
 
     @Test func splitFractionClamps() {

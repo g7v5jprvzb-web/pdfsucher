@@ -1,3 +1,4 @@
+import OfficeKit
 import AppKit
 import Foundation
 import Testing
@@ -39,8 +40,8 @@ struct OCRPerformanceTests {
         let indexURL = base.appendingPathComponent("index.sqlite")
         let model = AppModel(settings: GridSettings(defaults: UserDefaults(suiteName: "OCRPerf-\(UUID().uuidString)")!),
                              defaults: UserDefaults(suiteName: "OCRPerf-\(UUID().uuidString)")!,
-                             environment: PerfEnvironment(), debounce: .zero,
-                             openIndex: { try FolderIndex.shared(root: $0, indexURL: indexURL) })
+                             environment: PerfEnvironment(), slideCache: testSlideCache, debounce: .zero,
+                             openIndex: { try FolderIndex.shared(root: $0, indexURL: indexURL, slideCache: testSlideCache) }, officeRendering: PowerPointDisplaySetting())
         let clock = ContinuousClock()
 
         // Main-thread latency while phase 1 and phase 2 run: a 10 ms ticker on the main actor.
@@ -132,5 +133,6 @@ private final class FirstHits: @unchecked Sendable {
     func chooseSaveLocation(defaultName: String) -> URL? { nil }
     func runPrint(_ operation: NSPrintOperation) {}
     func openInPreview(_ url: URL) {}
+    func openWithDefaultApp(_ url: URL) {}
     func confirmDeleteIndex(question: String) -> Bool { false }
 }

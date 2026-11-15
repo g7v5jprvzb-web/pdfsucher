@@ -19,6 +19,29 @@ struct ResultGridView: View {
     @State private var scrollerStyle = NSScroller.preferredScrollerStyle
     /// The tile the user just clicked (visible): focusing it needs no vertical scrolling.
     @State private var clickedTile: PageRef?
+    /// One prefetch for the visible area (spec 1.2.4 §2).
+    @State private var tilePrefetcher = TilePrefetcher()
+    /// Page shape per document: landscape rows are lower (1.3.4).
+    @State private var pageShapes = PageShapes()
+
+    private func prefetchContext(columns: Int, tileSize: CGSize) -> TilePrefetcher.Context {
+        let shapes = pageShapes, cache = cache
+        // Word/PowerPoint revision only for Office rows, as in `DocumentRow`.
+        let revision = model.layoutRevision
+        return TilePrefetcher.Context(cache: cache, hits: model.hits, columns: columns,
+                               tileSize: { hit in
+                                   // Rows not looked up yet are only asked for their shape; their tiles follow next time.
+                                   let rowRevision = hit.kind.isOffice ? revision : 0
+                                   guard shapes.isResolved(hit.url, revision: rowRevision) else {
+                                       shapes.request(hit, revision: rowRevision, cache: cache)
+                                       return nil
+                                   }
+                                   return shapes.tileSize(for: hit, base: tileSize)
+                               },
+                               showAll: model.settings.showAllPages,
+                               highlightKey: highlightKey, highlightRanges: highlightRanges, color: model.settings.highlightColor,
+                               ocr: { @MainActor ref in await model.ocrText(for: ref) })
+    }
 
     /// Space for the tiles: the view minus padding and, with always-visible (legacy) scrollers, minus
     /// the vertical scroller, because fixed-mode tiles fill the width exactly.
@@ -42,16 +65,20 @@ struct ResultGridView: View {
                 ScrollView(.vertical) {
                     LazyVStack(alignment: .leading, spacing: 8) {
                         ForEach(model.hits) { hit in
-                            DocumentRow(hit: hit, tileSize: tileSize, model: model, cache: cache, folderUnreachable: folderUnreachable,
+                            DocumentRow(hit: hit, baseTileSize: tileSize, shapes: pageShapes, model: model, cache: cache, folderUnreachable: folderUnreachable,
                                         highlightKey: highlightKey, highlightRanges: highlightRanges,
-                                        prefetchAhead: metrics.columns,
+                                        onTileAppear: { position in
+                                            tilePrefetcher.tileAppeared(hit.id, position: position,
+                                                                        prefetchContext(columns: metrics.columns, tileSize: tileSize))
+                                        },
                                         onFocusTile: { ref in
                                             clickedTile = ref
                                             model.focusedPage = ref
                                             focus.wrappedValue = .grid
                                         })
                             .id(hit.id)
-                            .onAppear { prefetchRows(after: hit, columns: metrics.columns, tileSize: tileSize) }
+                            .onAppear { tilePrefetcher.rowAppeared(hit.id, prefetchContext(columns: metrics.columns, tileSize: tileSize)) }
+                            .onDisappear { tilePrefetcher.rowDisappeared(hit.id, prefetchContext(columns: metrics.columns, tileSize: tileSize)) }
                         }
                     }
                     .padding(Self.padding)
@@ -82,6 +109,7 @@ struct ResultGridView: View {
                     }
                     log.debug("autoscroll stop")
                 }
+                .task { await PreviewTiming.runAutoNext(model) }   // measurement only (1.3.4): `-uiTestAutoNextDocMS <ms>`
                 .onChange(of: metrics.columns, initial: true) { _, columns in
                     if model.settings.automaticColumns != columns { model.settings.automaticColumns = columns }
                 }
@@ -113,31 +141,21 @@ struct ResultGridView: View {
     }
 
     @ViewBuilder private var emptyState: some View {
-        if model.hits.isEmpty {
-            if model.sources.isEmpty {
-                ContentUnavailableView("Ordner oder PDFs hinzufügen", systemImage: "plus.rectangle.on.folder",
-                                       description: Text("Mit ⌘O öffnen oder ins Fenster ziehen. Ohne Suchbegriff erscheinen hier alle PDFs, mit Suchbegriff alle Trefferseiten."))
-            } else if model.queryText.trimmingCharacters(in: .whitespaces).isEmpty {
-                ContentUnavailableView("Keine PDFs", systemImage: "doc",
-                                       description: Text("In den geladenen Quellen wurden (noch) keine PDFs gefunden."))
-            } else {
-                ContentUnavailableView("Keine Treffer", systemImage: "magnifyingglass",
-                                       description: Text(ViewerText.noResults(query: model.queryText)))
-            }
-        }
-    }
-
-    /// Rows rendered ahead below a row that comes into view (spec 1.2.3).
-    static let prefetchRows = 2
-
-    /// Renders the first screen width of the next rows ahead, so scrolling down finds them ready.
-    private func prefetchRows(after hit: DocumentHit, columns: Int, tileSize: CGSize) {
-        guard let index = model.hits.firstIndex(where: { $0.id == hit.id }) else { return }
-        let showAll = model.settings.showAllPages
-        for next in model.hits.dropFirst(index + 1).prefix(Self.prefetchRows) {
-            let first = DocumentRow.firstShownPosition(next, showAll: showAll)
-            DocumentRow.prefetch(next, positions: first..<(first + max(columns, 1)), tileSize: tileSize, model: model, cache: cache,
-                                 highlightKey: highlightKey, highlightRanges: highlightRanges)
+        switch EmptyGridState.make(hasHits: !model.hits.isEmpty, hasSources: !model.sources.isEmpty,
+                                   browsing: model.queryText.trimmingCharacters(in: .whitespaces).isEmpty,
+                                   hiddenByFilter: model.hiddenByFilter) {
+        case nil: EmptyView()
+        case .noSources:
+            ContentUnavailableView("Ordner oder PDFs hinzufügen", systemImage: "plus.rectangle.on.folder",
+                                   description: Text("Mit ⌘O öffnen oder ins Fenster ziehen. Ohne Suchbegriff erscheinen hier alle PDFs, mit Suchbegriff alle Trefferseiten."))
+        case .noFiles:
+            ContentUnavailableView("Keine PDFs", systemImage: "doc",
+                                   description: Text("In den geladenen Quellen wurden (noch) keine PDFs gefunden."))
+        case .noResults:
+            ContentUnavailableView("Keine Treffer", systemImage: "magnifyingglass",
+                                   description: Text(ViewerText.noResults(query: model.queryText)))
+        case .hiddenByFilter(let count, let browsing):
+            HiddenByFilterView(count: count, browsing: browsing, settings: model.settings)
         }
     }
 
@@ -154,5 +172,20 @@ struct ResultGridView: View {
                                              showAllPages: model.settings.showAllPages) else { return .ignored }
         model.focusedPage = next
         return .handled
+    }
+}
+
+/// What the empty grid says (pure, tested).
+enum EmptyGridState: Equatable {
+    case noSources, noFiles, noResults
+    /// The „Dateitypen“ filter hides `count` documents of the result (spec 1.3 §8a).
+    case hiddenByFilter(Int, browsing: Bool)
+
+    /// nil: there are rows to show.
+    static func make(hasHits: Bool, hasSources: Bool, browsing: Bool, hiddenByFilter: Int) -> EmptyGridState? {
+        guard !hasHits else { return nil }
+        guard hasSources else { return .noSources }
+        if hiddenByFilter > 0 { return .hiddenByFilter(hiddenByFilter, browsing: browsing) }
+        return browsing ? .noFiles : .noResults
     }
 }

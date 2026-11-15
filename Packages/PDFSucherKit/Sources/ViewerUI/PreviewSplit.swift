@@ -7,10 +7,20 @@ import SwiftUI
 struct PreviewSplit<Preview: View, Grid: View>: View {
     let position: PreviewPosition
     let settings: GridSettings
+    /// The large preview's zoom: beside the grid its width follows it (spec 1.3.2 Teil B); nil = fixed width.
+    var zoom: PreviewZoom?
     @ViewBuilder let preview: Preview
     @ViewBuilder let grid: Grid
     @State private var dragStart: CGFloat?
     @State private var hovering = false
+    /// The width shown while it follows the zoom (bundled and animated); nil = the target at once.
+    @State private var shownWidth: CGFloat?
+    @State private var bundler: WidthBundler?
+
+    /// Room around the page in the preview: PDFView's margins and the scroller (spec 1.3.2 §9).
+    static var pageMargin: CGFloat {
+        24 + (NSScroller.preferredScrollerStyle == .legacy ? NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy) : 0)
+    }
 
     static var handleThickness: CGFloat { 7 }
     private var vertical: Bool { position == .top }
@@ -20,8 +30,12 @@ struct PreviewSplit<Preview: View, Grid: View>: View {
     var body: some View {
         GeometryReader { geo in
             let total = max((vertical ? geo.size.height : geo.size.width) - Self.handleThickness, 1)
-            let length = SplitMath.previewLength(fraction: settings.previewFraction(for: position), total: total,
-                                                 minPreview: minPreview, minGrid: minGrid)
+            // B: the length the user set (spec 1.3.2 §9); beside the grid the shown width follows the zoom up to B.
+            let reference = SplitMath.previewLength(fraction: settings.previewFraction(for: position), total: total,
+                                                    minPreview: minPreview, minGrid: minGrid)
+            let target = followsZoom ? targetWidth(reference: reference) : reference
+            let length = dragStart != nil ? reference : min(shownWidth ?? target, reference)
+            Group {
             if vertical {
                 VStack(spacing: 0) {
                     preview.frame(height: length)
@@ -37,7 +51,40 @@ struct PreviewSplit<Preview: View, Grid: View>: View {
                     if position == .leading { grid.frame(maxWidth: .infinity) }
                 }
             }
+            }
+            .onAppear { publishReference(followsZoom ? reference : nil) }
+            .onChange(of: followsZoom ? reference : -1) { _, _ in publishReference(followsZoom ? reference : nil) }
+            // Only a width that follows the zoom is bundled; otherwise the length is B at once (a wider window).
+            .onChange(of: target) { _, wanted in if followsZoom { follow(wanted) } else { shownWidth = nil } }
         }
+    }
+
+    /// Beside the grid with „Vorschaubreite an Zoom anpassen“ on.
+    private var followsZoom: Bool { zoom != nil && !vertical && settings.previewFollowsZoom }
+
+    /// The page's width at the shown zoom plus margin, at least the preview's minimum, at most B.
+    private func targetWidth(reference: CGFloat) -> CGFloat {
+        guard let zoom else { return reference }
+        return PreviewWidthMath.paneWidth(page: zoom.pageSize, scale: CGFloat(zoom.currentPercent) / 100, margin: Self.pageMargin,
+                                          minimum: minPreview, reference: reference)
+    }
+
+    /// B for the preview (levels and „Ganze Seite“ are measured against it, not against the width shown).
+    private func publishReference(_ reference: CGFloat?) {
+        guard let zoom else { return }
+        // B is the view's width at the user's length; `PDFPageView.fillWidth` takes the scroller off.
+        if zoom.referenceWidth != reference { zoom.referenceWidth = reference }
+        if reference == nil { shownWidth = nil }
+    }
+
+    /// A new width: after a quick series of zoom steps only the last, animated (spec 1.3.2 §10).
+    private func follow(_ wanted: CGFloat) {
+        if shownWidth == nil { shownWidth = wanted; return }
+        let bundler = self.bundler ?? WidthBundler { width in
+            withAnimation(.easeOut(duration: 0.15)) { shownWidth = width }
+        }
+        if self.bundler == nil { self.bundler = bundler }
+        bundler.request(wanted)
     }
 
     private func handle(length: CGFloat, total: CGFloat) -> some View {
@@ -66,7 +113,7 @@ struct PreviewSplit<Preview: View, Grid: View>: View {
                                                       total: total, minPreview: minPreview, minGrid: minGrid)
                 settings.setPreviewFraction(SplitMath.fraction(previewLength: clamped, total: total), for: position)
             }
-            .onEnded { _ in dragStart = nil })
+            .onEnded { _ in dragStart = nil; shownWidth = nil })      // the dragged length is the new B
         .accessibilityElement()
         .accessibilityLabel("Trenner Vorschau / Raster")
         .accessibilityIdentifier("previewSplitter")
@@ -80,6 +127,14 @@ struct WindowFrameKeeper: NSViewRepresentable {
     let load: @MainActor () -> CGRect?
     let save: @MainActor (CGRect) -> Void
     var size = true
+    /// Without a stored frame: this content size for the visible screen size, and the window is centred (1.2.4).
+    var defaultContentSize: (@MainActor (CGSize) -> CGSize)?
+    /// false: only the user's own resizes (live resize) and moves are kept, not a size SwiftUI sets, e.g.
+    /// when the settings tab changes (review I3).
+    var savesProgrammaticResizes = true
+    /// SwiftUI's settings window comes without `.resizable` although its content can grow (1.2.4 promised a
+    /// window that can be enlarged; the UI test measured the main window instead).
+    var makesResizable = false
 
     final class HostView: NSView {
         var onWindow: ((NSWindow) -> Void)?
@@ -105,12 +160,20 @@ struct WindowFrameKeeper: NSViewRepresentable {
         let view = HostView()
         let coordinator = context.coordinator
         let load = self.load, save = self.save, keepSize = self.size
+        let defaultContentSize = self.defaultContentSize, savesProgrammaticResizes = self.savesProgrammaticResizes
+        let makesResizable = self.makesResizable
         view.onWindow = { window in
             guard coordinator.window !== window else { return }
             coordinator.window = window
             coordinator.removeObservers()
             // After SwiftUI has placed the window (it restores its own frame first).
             DispatchQueue.main.async {
+                if makesResizable { window.styleMask.insert(.resizable) }
+                if load() == nil, let defaultContentSize {
+                    let screen = (window.screen ?? NSScreen.main)?.visibleFrame.size ?? CGSize(width: 1440, height: 900)
+                    window.setContentSize(defaultContentSize(screen))
+                    window.center()
+                }
                 if let stored = load() {
                     let wanted = keepSize ? stored
                         : CGRect(x: stored.minX, y: stored.minY - window.frame.height, width: window.frame.width, height: window.frame.height)
@@ -127,7 +190,7 @@ struct WindowFrameKeeper: NSViewRepresentable {
             }
             // Not every live-resize step (review M3): the end of a resize, a move, programmatic resizes, closing.
             for name in [NSWindow.didMoveNotification, NSWindow.didEndLiveResizeNotification, NSWindow.didResizeNotification,
-                         NSWindow.willCloseNotification] {
+                         NSWindow.willCloseNotification] where savesProgrammaticResizes || name != NSWindow.didResizeNotification {
                 coordinator.observers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { _ in
                     MainActor.assumeIsolated { store() }
                 })

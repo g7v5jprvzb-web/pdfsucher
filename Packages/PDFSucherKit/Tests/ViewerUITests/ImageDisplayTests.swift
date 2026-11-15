@@ -25,16 +25,16 @@ struct ImageDisplayTests {
     @MainActor @Test func detailLoadsImageAsOnePagePDF() async throws {
         let url = try PDFFixtures.tempDirectory().appendingPathComponent("bild.png")
         try ImageFixtures.makeImage(at: url, text: "Vertrag", size: CGSize(width: 600, height: 300), format: .png)
-        guard case .ready(let detail) = await DetailDocument.load(url) else { Issue.record("not loaded"); return }
+        guard case .ready(let detail) = await DetailDocument.load(PageRef(url: url, pageIndex: 0)) else { Issue.record("not loaded"); return }
         #expect(detail.pdf.pageCount == 1)
         let broken = url.deletingLastPathComponent().appendingPathComponent("kaputt.png")
         try Data("x".utf8).write(to: broken)
-        #expect(await DetailDocument.load(broken) == .unavailable)
+        #expect(await DetailDocument.load(PageRef(url: broken, pageIndex: 0)) == .unavailable)
     }
 
     @Test func rowHeaderShowsImageSymbol() {
         let image = DocumentHit(url: URL(fileURLWithPath: "/d/a.png"), relativePath: "a.png", modifiedAt: .distantPast, pageHits: [],
-                                totalMatches: 0, relevance: 0, sourceRoot: URL(fileURLWithPath: "/d"), pageCount: 1, isImage: true)
+                                totalMatches: 0, relevance: 0, sourceRoot: URL(fileURLWithPath: "/d"), pageCount: 1, kind: .image)
         let pdf = DocumentHit(url: URL(fileURLWithPath: "/d/a.pdf"), relativePath: "a.pdf", modifiedAt: .distantPast, pageHits: [],
                               totalMatches: 0, relevance: 0, sourceRoot: URL(fileURLWithPath: "/d"), pageCount: 1)
         #expect(ViewerText.rowSymbol(image) == "photo")
@@ -43,9 +43,9 @@ struct ImageDisplayTests {
 
     @Test func ocrBadgeOnlyOnOCRPagesOfPDFs() {
         let ocr = OCRPageText(text: "x", words: [])
-        #expect(ThumbnailTile.showsOCRBadge(isImage: false, ocr: ocr))
-        #expect(!ThumbnailTile.showsOCRBadge(isImage: true, ocr: ocr))
-        #expect(!ThumbnailTile.showsOCRBadge(isImage: false, ocr: nil))
+        #expect(ThumbnailTile.showsOCRBadge(kind: .pdf, ocr: ocr))
+        #expect(!ThumbnailTile.showsOCRBadge(kind: .image, ocr: ocr))
+        #expect(!ThumbnailTile.showsOCRBadge(kind: .pdf, ocr: nil))
         #expect(ViewerText.ocrBadge == "Texterkennung")
     }
 
@@ -57,6 +57,6 @@ struct ImageDisplayTests {
         let cache = ThumbnailCache(scale: 1)
         let thumb = await cache.thumbnail(for: PageRef(url: url, pageIndex: 0), size: CGSize(width: 200, height: 133))
         #expect(thumb != nil)
-        #expect(await cache.cachedDocumentCount == 0)
+        #expect(cache.cachedDocumentCount == 0)
     }
 }

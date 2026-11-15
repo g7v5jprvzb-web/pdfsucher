@@ -27,11 +27,19 @@ public struct DocumentHit: Sendable, Equatable, Identifiable {
     public let pageCount: Int
     /// The file could not be read (index status `error`): shown with „nicht lesbar“, without tiles.
     public let isUnreadable: Bool
+    /// PDF, image (spec 1.2), Word or PowerPoint (spec 1.3).
+    public let kind: DocumentKind
     /// An image file (spec 1.2): one page, shown from the image, printed and saved as an A4 page.
-    public let isImage: Bool
+    public var isImage: Bool { kind == .image }
+    /// Laid out by the simplified renderer (`textkit`, spec 1.3): the row header shows „vereinfacht“.
+    public let isSimplified: Bool
+    /// The file name (without extension) matched the query (spec 1.3.2 §1). With empty `pageHits` the name
+    /// alone matched: the row shows the first pages and „Treffer im Dateinamen“.
+    public let nameMatch: Bool
 
     public init(url: URL, relativePath: String, modifiedAt: Date, pageHits: [PageHit], totalMatches: Int, relevance: Double,
-                sourceRoot: URL, pageCount: Int, isUnreadable: Bool = false, isImage: Bool = false) {
+                sourceRoot: URL, pageCount: Int, isUnreadable: Bool = false, kind: DocumentKind = .pdf,
+                isSimplified: Bool = false, nameMatch: Bool = false) {
         self.url = url
         self.relativePath = relativePath
         self.modifiedAt = modifiedAt
@@ -41,7 +49,21 @@ public struct DocumentHit: Sendable, Equatable, Identifiable {
         self.sourceRoot = sourceRoot
         self.pageCount = pageCount
         self.isUnreadable = isUnreadable
-        self.isImage = isImage
+        self.kind = kind
+        self.isSimplified = isSimplified
+        self.nameMatch = nameMatch
+    }
+
+    /// This hit with `nameMatch` set.
+    public func withNameMatch(_ match: Bool = true) -> DocumentHit {
+        DocumentHit(url: url, relativePath: relativePath, modifiedAt: modifiedAt, pageHits: pageHits, totalMatches: totalMatches,
+                    relevance: relevance, sourceRoot: sourceRoot, pageCount: pageCount, isUnreadable: isUnreadable, kind: kind,
+                    isSimplified: isSimplified, nameMatch: match)
+    }
+
+    /// The name the file name search looks at: the file name without its extension (no folders).
+    public static func searchableName(of relativePath: String) -> String {
+        ((relativePath as NSString).lastPathComponent as NSString).deletingPathExtension
     }
 }
 

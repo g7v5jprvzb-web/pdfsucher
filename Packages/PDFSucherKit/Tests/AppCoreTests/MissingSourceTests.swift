@@ -1,6 +1,7 @@
 import Foundation
 import PDFKit
 import IndexKit
+import OfficeKit
 import OutputKit
 import Testing
 import TestSupport
@@ -29,8 +30,8 @@ struct MissingSourceTests {
     func model(_ env: FakeEnvironment) async -> AppModel {
         let indexURL = self.indexURL
         let model = AppModel(settings: makeSettings(), defaults: UserDefaults(suiteName: "AppCoreTests-\(UUID().uuidString)")!,
-                             environment: env, debounce: .zero,
-                             openIndex: { try FolderIndex.shared(root: $0, indexURL: indexURL) })
+                             environment: env, slideCache: testSlideCache, debounce: .zero,
+                             openIndex: { try FolderIndex.shared(root: $0, indexURL: indexURL, slideCache: testSlideCache) }, officeRendering: PowerPointDisplaySetting())
         await model.open(folder: folder)
         model.queryText = "Vertrag"
         await model.waitUntilIdle()

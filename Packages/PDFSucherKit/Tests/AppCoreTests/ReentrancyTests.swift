@@ -1,5 +1,6 @@
 import Foundation
 import IndexKit
+import OfficeKit
 import OutputKit
 import SearchKit
 import Testing
@@ -17,11 +18,11 @@ struct ReentrancyTests {
 
     func model(_ indexes: [String: FakeIndex], debounce: Duration = .zero, defaults: UserDefaults? = nil) -> AppModel {
         AppModel(settings: makeSettings(), defaults: defaults ?? UserDefaults(suiteName: "AppCoreTests-\(UUID().uuidString)")!,
-                 environment: FakeEnvironment(), debounce: debounce,
+                 environment: FakeEnvironment(), slideCache: testSlideCache, debounce: debounce,
                  openIndex: { root in
                      guard let index = indexes[root.lastPathComponent] else { throw OpenFailed() }
                      return index
-                 })
+                 }, officeRendering: PowerPointDisplaySetting())
     }
 
     private func starts(_ index: FakeIndex) -> Int { index.events.filter { $0 == "update-start" }.count }

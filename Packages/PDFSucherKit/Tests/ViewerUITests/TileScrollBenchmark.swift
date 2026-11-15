@@ -57,7 +57,8 @@ struct TileScrollBenchmark {
         try await scroll(stepMS: stepMS, cache: ThumbnailCache(disk: disk), prefetch: true, label: "disk 1st")
         disk.flush()
         try await scroll(stepMS: stepMS, cache: ThumbnailCache(disk: disk), prefetch: true, label: "disk 2nd")
-        disk.removeAll()
+        await disk.removeAll()
+        try? FileManager.default.removeItem(at: disk.directory)        // no tiles-UUID folders left behind
     }
 
     func scroll(stepMS: Int, cache: ThumbnailCache, prefetch: Bool, label: String) async throws {
