@@ -2447,6 +2447,8 @@ import ViewerUI
     nonisolated static let slideCacheMaxAge: TimeInterval = 180 * 86_400
     /// A writer's `.tmp` folder unchanged this long belongs to a crashed run.
     nonisolated static let abandonedWriteAge: TimeInterval = 86_400
+    /// Beyond this the least recently used slides go at app start, whatever their age (audit 2026-11-15).
+    nonisolated static let slideCacheMaxBytes = 2 * 1024 * 1024 * 1024
 
     /// Once at app start (before `restoreSources`): removes Quick Look leftovers of crashed runs
     /// (`QuickLookHTML.sweepLeftovers()`), slide-cache entries unused for 180 days and `.tmp` folders of crashed
@@ -2463,8 +2465,9 @@ import ViewerUI
             let swept = QuickLookHTML.sweepLeftovers(in: leftovers)
             do {
                 let pruned = try cache.prune(notUsedSince: now.addingTimeInterval(-Self.slideCacheMaxAge))
+                let oversize = try cache.prune(keepingAtMostBytes: Self.slideCacheMaxBytes)
                 let abandoned = try cache.pruneAbandonedWrites(notChangedSince: now.addingTimeInterval(-Self.abandonedWriteAge))
-                Self.log.info("Maintenance: \(swept) Quick Look leftovers, \(pruned) old slide entries, \(abandoned) abandoned writes removed")
+                Self.log.info("Maintenance: \(swept) Quick Look leftovers, \(pruned) old and \(oversize) least recently used slide entries, \(abandoned) abandoned writes removed")
             } catch {
                 Self.log.error("Slide cache maintenance failed: \(String(describing: error), privacy: .public)")
             }

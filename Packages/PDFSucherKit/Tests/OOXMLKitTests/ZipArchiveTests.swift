@@ -177,6 +177,22 @@ private struct SplitMix64: RandomNumberGenerator {
         #expect(throws: ZipError.self) { try zip.data("a.xml") }
     }
 
+    /// Audit 2026-11-15: a deflated entry whose directory claims fewer bytes than the stream holds is rejected,
+    /// not cut off at the claimed size; `maxSize` lowers the limit per call.
+    @Test func understatedSizeIsRejectedAndMaxSizeApplies() throws {
+        var bytes = sampleBuilder().build()
+        let full = String(repeating: "<b>world</b>", count: 200).utf8.count
+        patch32(&bytes, centralHeaderOf: 1, at: 24, UInt32(full - 10))
+        let url = try write(bytes)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let zip = try ZipArchive(url: url)
+        #expect(throws: ZipError.self) { try zip.data("dir/b.xml") }
+
+        let ok = try ZipArchive(data: sampleBuilder().build())
+        #expect(try ok.data("dir/b.xml", maxSize: UInt64(full)).count == full)
+        #expect(throws: ZipError.self) { try ok.data("dir/b.xml", maxSize: UInt64(full - 1)) }
+    }
+
     @Test func randomGarbageNeverCrashes() throws {
         let seed = ProcessInfo.processInfo.environment["OOXML_FUZZ_SEED"].flatMap { UInt64($0) } ?? 0x5EED_0001
         var rng = SplitMix64(seed: seed)

@@ -342,7 +342,8 @@ public final class ImageDecoder: Sendable {
             w = (props[kCGImagePropertyPixelWidth] as? Int) ?? 0
             h = (props[kCGImagePropertyPixelHeight] as? Int) ?? 0
         }
-        if max(w, h) > maxPixelSize { return thumbnail(src, maxPixel: maxPixelSize) }
+        // No readable size (audit 2026-11-15): never a full decode of unknown size, always the capped thumbnail.
+        if w <= 0 || h <= 0 || max(w, h) > maxPixelSize { return thumbnail(src, maxPixel: maxPixelSize) }
         let opts: [CFString: Any] = [kCGImageSourceShouldCacheImmediately: true]
         return CGImageSourceCreateImageAtIndex(src, 0, opts as CFDictionary)
     }

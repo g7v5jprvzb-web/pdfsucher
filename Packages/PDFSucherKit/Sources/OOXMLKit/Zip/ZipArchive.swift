@@ -156,12 +156,14 @@ public struct ZipArchive: Sendable {
         if outSize == 0 { return Data() }
         if payloadCount == 0 { throw ZipError.corrupt("empty deflate stream for \(name)") }
         var written = 0
-        let out = [UInt8](unsafeUninitializedCapacity: outSize) { buf, count in
+        // One byte of room beyond the declared size: a stream that is longer than its directory entry claims fills it
+        // and is rejected, instead of being cut off silently at `outSize` (audit 2026-11-15).
+        let out = [UInt8](unsafeUninitializedCapacity: outSize + 1) { buf, count in
             // decode straight from the mapped bytes, no intermediate copy
             written = bytes.withUnsafeBytes { src -> Int in
                 guard let sp = src.bindMemory(to: UInt8.self).baseAddress, let dp = buf.baseAddress,
                       payloadStart + payloadCount <= src.count else { return 0 }
-                return compression_decode_buffer(dp, outSize, sp + payloadStart, payloadCount, nil, COMPRESSION_ZLIB)
+                return compression_decode_buffer(dp, outSize + 1, sp + payloadStart, payloadCount, nil, COMPRESSION_ZLIB)
             }
             count = written
         }
