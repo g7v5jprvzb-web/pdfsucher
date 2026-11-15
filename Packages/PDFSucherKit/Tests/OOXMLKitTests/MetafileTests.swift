@@ -412,6 +412,15 @@ private func redBrush() -> EMFBuilder {
         #expect(Metafile.decode(bomb) == nil)
     }
 
+    /// Audit 2026-11-15: decoded bitmaps count towards the image-cache cost, not just the file size.
+    @Test func bitmapsCountTowardsCacheCost() throws {
+        var b = EMFBuilder()
+        let dib = packedDIB(bpp: 24, rows: Array(repeating: Array(repeating: (255, 0, 0), count: 64), count: 64))
+        for _ in 0..<2 { b.stretchDIBits(dest: (0, 0, 100, 100), dib: dib, width: 64, height: 64) }
+        let doc = try EMFDocument(data: b.build())
+        #expect(doc.program.cost >= 2 * 64 * 64 * 4)
+    }
+
     @Test func recordCountIsCapped() throws {
         var b = EMFBuilder()
         for _ in 0..<50 { b.saveDC() }
@@ -440,6 +449,20 @@ private func redBrush() -> EMFBuilder {
 }
 
 @Suite struct WMFTests {
+    /// Audit 2026-11-15: decoded bitmaps count towards the image-cache cost (STRETCHDIB, 0xF43).
+    @Test func bitmapsCountTowardsCacheCost() throws {
+        var w = WMFBuilder()
+        let dib = packedDIB(bpp: 24, rows: Array(repeating: Array(repeating: (255, 0, 0), count: 64), count: 64))
+        w.rec(0xF43) {
+            // rop SRCCOPY, usage, srcH, srcW, ySrc, xSrc, destH, destW, yDest, xDest, packed DIB
+            $0.u32(0x00CC_0020).u16(0).i16(64).i16(64).i16(0).i16(0).i16(100).i16(100).i16(0).i16(0)
+                .bytes(dib.header).bytes(dib.bits)
+        }
+        let doc = try WMFDocument(data: w.build())
+        #expect(doc.program.records.contains { if case .bitmap = $0 { return true } else { return false } })
+        #expect(doc.program.cost >= 64 * 64 * 4)
+    }
+
     @Test func placeableBoundsInHundredthsOfMillimetre() throws {
         let w = WMFBuilder()   // 1000 units at 1000 units/inch = 1 inch = 2540
         let doc = try WMFDocument(data: w.build())

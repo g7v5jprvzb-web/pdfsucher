@@ -56,17 +56,25 @@ public struct SearchService: Sendable {
         var reported = false
         // Each full batch until the first early result: check the complete documents so far (the last one
         // may continue) and report them once there is at least one hit (retried batch by batch).
+        // After it, or without `onPartial`, every batch is checked as it comes: a page's hit count does not
+        // depend on the rest of its document, so no candidate text outlives its batch (audit 2026-11-15:
+        // `pending` used to collect every later batch, i.e. nearly the whole index for `*ab*` or `ver*`).
         let consume = { (batch: [RawPageMatch]) -> Bool in
             pending += batch.filter { documents[$0.docId] != nil }
-            if !reported, let onPartial, batch.count == batchSize, let lastDoc = batch.last?.docId {
-                let complete = pending.filter { $0.docId != lastDoc }
-                pending.removeAll { $0.docId != lastDoc }
-                verified += Self.check(complete, with: matcher)
-                let early = hits(verified)
-                if !early.isEmpty {
-                    reported = true
-                    onPartial(sortHits(early, by: sort))
+            if !reported, let onPartial {
+                if batch.count == batchSize, let lastDoc = batch.last?.docId {
+                    let complete = pending.filter { $0.docId != lastDoc }
+                    pending.removeAll { $0.docId != lastDoc }
+                    verified += Self.check(complete, with: matcher)
+                    let early = hits(verified)
+                    if !early.isEmpty {
+                        reported = true
+                        onPartial(sortHits(early, by: sort))
+                    }
                 }
+            } else {
+                verified += Self.check(pending, with: matcher)
+                pending.removeAll(keepingCapacity: true)
             }
             return !Task.isCancelled
         }
@@ -153,7 +161,12 @@ public struct SearchService: Sendable {
         let results = ChunkResults(count: chunks)
         DispatchQueue.concurrentPerform(iterations: chunks) { c in
             let slice = candidates[(c * chunkSize)..<min(candidates.count, (c + 1) * chunkSize)]
-            results.set(c, slice.compactMap { page in matcher.matchCount(in: page.text).map { (page, $0) } })
+            // Only id, page and bm25 are needed from here on; dropping the text keeps verified pages small.
+            results.set(c, slice.compactMap { page in
+                matcher.matchCount(in: page.text).map {
+                    (RawPageMatch(docId: page.docId, pageIndex: page.pageIndex, bm25: page.bm25, text: ""), $0)
+                }
+            })
         }
         return results.joined()
     }

@@ -130,7 +130,9 @@ private struct EMFParser {
             add(.embeddedPDF(pdf.0, pdf.1))
             program.cost += pdf.1.count
         }
-        program.cost = program.records.count * 64 + r.b.count
+        // `+=`: the bitmaps and the embedded PDF were counted while parsing (audit 2026-11-15: `=` dropped them,
+        // so a small file with large bitmaps counted only its own size in the image cache).
+        program.cost += program.records.count * 64 + r.b.count
     }
 
     private mutating func add(_ rec: GDIRecord) { program.records.append(rec) }

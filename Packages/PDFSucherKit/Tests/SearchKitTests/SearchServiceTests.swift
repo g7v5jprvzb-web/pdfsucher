@@ -381,6 +381,23 @@ struct SearchBatchTests {
         #expect(final.count == 100)
     }
 
+    /// Audit 2026-11-15: after the early result (and without `onPartial`) each batch is checked as it comes
+    /// instead of being kept until the end. Tiny batches, documents spanning batches and both modes must
+    /// still give exactly the result of one big batch.
+    @Test(arguments: ["vertrag*", "*er*", "vertrag"])
+    func batchByBatchCheckingGivesTheSameResult(_ query: String) throws {
+        let service = SearchService(index: Corpus(docs: 40, pagesPerDoc: 7), root: URL(fileURLWithPath: "/r"))
+        let q = QueryParser.parse(query, partialWords: false)
+        let reference = try service.search(q, sort: .matchCount, batchSize: 100_000)
+        #expect(!reference.isEmpty)
+        let partials = Locked(0)
+        let withEarly = try service.search(q, sort: .matchCount, batchSize: 5) { _ in partials.mutate { $0 += 1 } }
+        let withoutEarly = try service.search(q, sort: .matchCount, batchSize: 5)
+        #expect(partials.value == 1)
+        #expect(withEarly == reference)
+        #expect(withoutEarly == reference)
+    }
+
     @Test func smallResultsReportNoPartial() throws {
         let service = SearchService(index: Corpus(docs: 3, pagesPerDoc: 10), root: URL(fileURLWithPath: "/r"))
         let partials = Locked(0)
