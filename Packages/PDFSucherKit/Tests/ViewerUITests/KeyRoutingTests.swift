@@ -111,6 +111,10 @@ struct KeyRoutingTests {
         #expect(KeyRouting.decide(key("tab"), in: tree) == .moveFocus(.grid))
         #expect(KeyRouting.decide(key("tab", .shift), in: tree) == .moveFocus(.grid))
         #expect(KeyRouting.decide(key("tab"), in: context(focus: nil, folderBar: true)) == .moveFocus(.grid), "nothing focused: the grid")
+        // 1.3.5: SwiftUI still reports the grid while the folder list is first responder → the list counts.
+        let stale = context(focus: .grid, responderTakesArrows: true, folderTree: true, folderBar: true)
+        #expect(KeyRouting.decide(key("tab"), in: stale) == .moveFocus(.grid))
+        #expect(KeyRouting.decide(key("tab", .shift), in: stale) == .moveFocus(.grid))
         // Also with „Tippen sucht sofort“ off: the setting no longer decides the Tab order.
         #expect(KeyRouting.decide(key("tab"), in: context(typeToSearch: false, focus: .grid, folderBar: true)) == .focusFolderTree)
     }

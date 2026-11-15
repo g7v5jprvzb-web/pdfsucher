@@ -170,7 +170,8 @@ struct KeyRouterInstaller: NSViewRepresentable {
                 window.makeFirstResponder(nil)
             }
             if decision == .focusFolderTree, let tree = Self.folderTree(in: window) {
-                setFocus(nil)
+                // Only the AppKit side: SwiftUI drops its own focus when its view resigns. Clearing it here
+                // as well made SwiftUI resign the tree a moment later (1.3.5, Tab from the grid did nothing).
                 window.makeFirstResponder(tree)
                 return nil
             }

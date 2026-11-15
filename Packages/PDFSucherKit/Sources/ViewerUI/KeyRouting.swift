@@ -84,11 +84,15 @@ enum KeyRouting {
         if s.key == "tab", s.modifiers.isSubset(of: .shift), !context.fullKeyboardAccess {
             let stops = tabStops(includesSearch: context.tabIncludesSearch, includesPreview: context.tabIncludesPreview,
                                  folderBarVisible: context.folderBarVisible)
-            let current: TabStop? = switch context.focus {
-            case .search: .search
-            case .grid: .grid
-            case .preview: .preview
-            case nil: context.folderTreeFocused ? .folders : nil
+            // The AppKit list wins: SwiftUI can still report the grid while the folder bar has the keyboard
+            // (1.3.5, Tab from the bar then stayed in the bar).
+            let current: TabStop? = if context.folderTreeFocused { .folders } else {
+                switch context.focus {
+                case .search: .search
+                case .grid: .grid
+                case .preview: .preview
+                case nil: nil
+                }
             }
             guard let current else { return .moveFocus(.grid) }
             switch nextStop(from: current, in: stops, backwards: s.modifiers.contains(.shift)) {

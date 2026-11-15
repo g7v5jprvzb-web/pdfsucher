@@ -215,6 +215,46 @@ final class SmokeTests: XCTestCase {
         XCTAssertFalse(header.exists, "no header without a filter")
     }
 
+    /// 1.3.5 (Chris): Tab went from the folder bar into the grid but not back. Tab and ⇧Tab cycle both ways.
+    func testTabCyclesFolderBarAndGrid() throws {
+        let tree = try PDFFixtures.tempDirectory()
+        defer { try? FileManager.default.removeItem(at: tree) }
+        let sub = tree.appendingPathComponent("Verträge", isDirectory: true)
+        try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+        try PDFFixtures.makePDF(at: sub.appendingPathComponent("mietvertrag.pdf"), pages: ["Der Vertrag"])
+        try PDFFixtures.makePDF(at: tree.appendingPathComponent("angebot.pdf"), pages: ["Ein Angebot"])
+        let app = XCUIApplication()
+        app.launchArguments = ["-uiTestFolder", tree.path]
+        app.launch()
+        XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 15), "window")
+        XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "documentRow").firstMatch
+            .waitForExistence(timeout: 20), "browse rows")
+        app.descendants(matching: .any)["folderBarToggle"].click()
+        let folderTree = app.descendants(matching: .any).matching(identifier: "folderTree").firstMatch
+        XCTAssertTrue(folderTree.waitForExistence(timeout: 10), "folder bar")
+        let folder = app.descendants(matching: .any).matching(NSPredicate(
+            format: "identifier == 'folderRow' AND (label BEGINSWITH 'Verträge' OR value BEGINSWITH 'Verträge')")).firstMatch
+        XCTAssertTrue(folder.waitForExistence(timeout: 10), "folder „Verträge“ in the bar")
+        folder.click()
+        func treeHasFocus() -> Bool { folderTree.value(forKey: "hasKeyboardFocus") as? Bool ?? false }
+        func expectTree(_ focused: Bool, _ step: String) {
+            let deadline = Date().addingTimeInterval(3)
+            while treeHasFocus() != focused, Date() < deadline { Thread.sleep(forTimeInterval: 0.1) }
+            XCTAssertEqual(treeHasFocus(), focused, step)
+        }
+        expectTree(true, "click puts the focus into the folder bar")
+        app.typeKey(.tab, modifierFlags: [])
+        expectTree(false, "Tab: folder bar → grid")
+        app.typeKey(.tab, modifierFlags: [])
+        expectTree(true, "Tab: grid → folder bar")
+        app.typeKey(.tab, modifierFlags: [])
+        expectTree(false, "Tab: folder bar → grid again")
+        app.typeKey(.tab, modifierFlags: .shift)
+        expectTree(true, "⇧Tab: grid → folder bar")
+        app.typeKey(.tab, modifierFlags: .shift)
+        expectTree(false, "⇧Tab: folder bar → grid")
+    }
+
     /// The tree opens down to a chosen folder: choose a deep folder below 40 others, close its parent, scroll
     /// up, hide and show the bar (⌃⌘S) → the parent is open again and the folder scrolled into view.
     func testFolderBarRevealsChosenFolder() throws {
