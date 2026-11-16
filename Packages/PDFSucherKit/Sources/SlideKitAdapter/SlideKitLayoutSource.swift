@@ -13,7 +13,9 @@ import SlideKit
 /// this source has no default of its own.
 ///
 /// Decks are opened for the layout and dropped afterwards (`decks` nil, the default): an index run over hundreds
-/// of decks must not push the viewer's decks out of `SlideDeckCache.shared` nor keep their text and images.
+/// of decks must not push the viewer's decks out of `SlideDeckCache.shared` nor keep their text and images. A deck
+/// the viewer has open already (`borrowing`, default the shared cache) is used as it is (office-speed: no second
+/// parse), without opening anything into that cache.
 ///
 /// Only `.powerpoint`: other kinds report `("none", 0)` and throw `LayoutSourceError.unreadable`. A file that is no
 /// readable presentation (no zip, encrypted, damaged, legacy .ppt) → `unreadable`; file system errors (file gone,
@@ -31,11 +33,14 @@ public struct SlideKitLayoutSource: PageLayoutSource {
 
     public let fontSubstitution: FontSubstitution
     private let decks: SlideDeckCache?
+    private let borrowing: SlideDeckCache
 
-    /// `decks`: a cache to open decks through (tests); nil opens each deck for its layout only.
-    public init(fontSubstitution: FontSubstitution, decks: SlideDeckCache? = nil) {
+    /// `decks`: a cache to open decks through (tests); nil opens each deck for its layout only. `borrowing`: whose
+    /// open decks the layout may use (tests pass their own).
+    public init(fontSubstitution: FontSubstitution, decks: SlideDeckCache? = nil, borrowing: SlideDeckCache = .shared) {
         self.fontSubstitution = fontSubstitution
         self.decks = decks
+        self.borrowing = borrowing
     }
 
     /// `baseVersion * 100` plus a fixed code per substitution (powerPoint 1, similar 2): another setting is another
@@ -55,9 +60,13 @@ public struct SlideKitLayoutSource: PageLayoutSource {
     public func layout(of url: URL, kind: DocumentKind) async throws -> LayoutResult {
         guard kind == .powerpoint else { throw LayoutSourceError.unreadable(url, reason: Self.notPowerPointReason) }
         try Task.checkCancellation()
+        // Word boxes need Office's fonts: wait for (or start) the registration, as the first font lookup did before
+        // office-speed; then only decks opened with them are borrowed.
+        if !SlideDeck.officeFontsReady { SlideDeck.prewarmFonts() }
         let deck: SlideDeck
         do {
             deck = try decks?.deck(for: url, fontSubstitution: fontSubstitution)
+                ?? borrowing.openDeck(for: url, fontSubstitution: fontSubstitution)
                 ?? SlideDeckCache.open(url, fontSubstitution: fontSubstitution)
         } catch let error as SlideKitError {
             throw LayoutSourceError.unreadable(url, reason: error == .encrypted ? Self.encryptedReason : Self.unreadableReason)

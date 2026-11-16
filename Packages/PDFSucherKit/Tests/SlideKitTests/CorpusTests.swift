@@ -84,6 +84,28 @@ struct CorpusDeck {
     }
 }
 
+/// office-speed: the visible slides and their numbers from the root-tag reader equal those from parsing every slide
+/// whole (the reader before), for every deck of the corpus.
+@Suite struct CorpusSlideListTests {
+    @Test(.enabled(if: env["PDFSUCHER_PPTX_CORPUS"] != nil))
+    func visibleSlidesAsWithAFullParse() throws {
+        let decks = try CorpusDeck.all()
+        #expect(!decks.isEmpty)
+        for deck in decks {
+            let package = OPCPackage(zip: try ZipArchive(url: deck.url))
+            let info = try PresentationInfo(package: package)
+            let reference = info.slides.map { slide -> Bool in
+                guard let data = try? package.data(slide.partPath), let root = try? OOXMLNode.parse(data) else { return false }
+                let show = root.attr("show")?.lowercased()
+                return show == "0" || show == "false"
+            }
+            #expect(info.slides.map(\.hidden) == reference, "\(deck.label)")
+            #expect(info.slides.map(\.powerPointNumber) == Array(info.slides.indices).map { $0 + (info.slides.first?.powerPointNumber ?? 1) })
+            print("CORPUS-SLIDES \(deck.label): \(info.visibleSlides.count) visible of \(info.slides.count), numbers \(info.visibleSlides.map(\.powerPointNumber))")
+        }
+    }
+}
+
 @Suite struct CorpusTests {
     static let enabled = env["PDFSUCHER_PPTX_CORPUS"] != nil
     static let pairsPerSheet = 6

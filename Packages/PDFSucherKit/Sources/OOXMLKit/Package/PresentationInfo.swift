@@ -60,7 +60,9 @@ public struct PresentationInfo: Sendable {
             let path = package.resolve(rel.target, from: presentationPart)
             guard let data = try? package.data(path) else { continue }
             var hidden = false
-            if let sld = try? OOXMLNode.parse(data) {
+            // office-speed: the root tag alone decides (parsing every slide whole took two thirds of opening a deck);
+            // only a slide whose root says hidden is parsed whole, so one that does not parse stays visible as before.
+            if Self.rootShowsHidden(data), let sld = try? OOXMLNode.parse(data) {
                 let show = sld.attr("show")?.lowercased()
                 hidden = show == "0" || show == "false"
             }
@@ -75,5 +77,40 @@ public struct PresentationInfo: Sendable {
             size = CGSize(width: cx / 12700, height: cy / 12700)
         }
         self.slideSize = size
+    }
+
+    /// Whether the first element of `data` has `show="0"`/`"false"` (any case): the parser stops after that tag. A
+    /// DOCTYPE or entity declaration stops it before any element (false; such a part does not parse anyway).
+    static func rootShowsHidden(_ data: Data) -> Bool {
+        let parser = XMLParser(data: data)
+        let reader = RootShowReader()
+        parser.delegate = reader
+        parser.shouldResolveExternalEntities = false
+        parser.parse()
+        let show = reader.show?.lowercased()
+        return show == "0" || show == "false"
+    }
+}
+
+/// Reads the `show` attribute of the first element, then stops the parser.
+private final class RootShowReader: NSObject, XMLParserDelegate {
+    var show: String?
+
+    func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?,
+                qualifiedName qName: String?, attributes attributeDict: [String: String] = [:]) {
+        show = attributeDict["show"]
+        parser.abortParsing()
+    }
+
+    func parser(_ parser: XMLParser, foundElementDeclarationWithName elementName: String, model: String) {
+        parser.abortParsing()
+    }
+
+    func parser(_ parser: XMLParser, foundInternalEntityDeclarationWithName name: String, value: String?) {
+        parser.abortParsing()
+    }
+
+    func parser(_ parser: XMLParser, foundExternalEntityDeclarationWithName name: String, publicID: String?, systemID: String?) {
+        parser.abortParsing()
     }
 }

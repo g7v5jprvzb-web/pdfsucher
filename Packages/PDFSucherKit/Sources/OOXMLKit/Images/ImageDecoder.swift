@@ -242,7 +242,7 @@ public final class ImageDecoder: Sendable {
     }
 
     /// Decoded bytes currently cached.
-    var cachedBytes: Int { cache.withLock { $0.bytes } }
+    public var cachedBytes: Int { cache.withLock { $0.bytes } }
 
     /// Long sides of the bitmaps cached for `part` (all sizes), ascending; for tests.
     func cachedLongSides(part: String) -> [Int] {

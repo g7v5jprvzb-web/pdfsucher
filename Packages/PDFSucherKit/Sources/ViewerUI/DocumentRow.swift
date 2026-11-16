@@ -40,6 +40,15 @@ struct DocumentRow: View {
                 Text(Self.headerText(hit, ranges: highlightRanges, color: model.settings.highlightColor))
                     .font(.system(size: CGFloat(model.settings.headerFontSize), weight: .bold))
                     .layoutPriority(1)       // the folder label gives way first
+                if let details = ViewerText.rowDetails(hit, showSize: model.settings.showFileSize,
+                                                       showDate: model.settings.showModifiedDate) {
+                    Text(details)
+                        .font(.system(size: CGFloat(model.settings.headerFontSize) * 0.8))
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                        .layoutPriority(1)
+                        .accessibilityIdentifier("rowDetails")
+                }
                 if Self.showsNameHint(hit) {
                     Text(ViewerText.nameHit)
                         .font(.caption)

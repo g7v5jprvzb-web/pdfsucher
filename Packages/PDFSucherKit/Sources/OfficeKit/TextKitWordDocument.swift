@@ -26,7 +26,9 @@ public final class TextKitWordDocument: @unchecked Sendable {
     static let unreadableReason = "Word-Dokument nicht lesbar"
     /// Upper bound against runaway pagination; the Indexer's 120 s timeout bounds it as well.
     static let maxPages = 10_000
-    static let cacheCapacity = 4
+    /// office-speed: 16 (was 4; a raster of 8 Word files imported them again and again). `cacheMaxPages` is the bound
+    /// that matters for memory.
+    static let cacheCapacity = 16
     /// Spec §8 „Obergrenze nach Speicher“: at most this many pages across the cached documents (≈ 0.3 MB per page
     /// measured, so ≈ 600 MB); the most recently used document always stays.
     static let cacheMaxPages = 2_000
@@ -37,6 +39,41 @@ public final class TextKitWordDocument: @unchecked Sendable {
     /// is editing“ in the test suite remained with the font gate alone (1 in 20 OfficeKit runs); TextKit 1 off the main
     /// thread is not documented as safe for parallel use, so Word layouts no longer run beside each other.
     static let textKit = NSLock()
+    /// Display paths (tiles, preview, output) waiting for or about to take `textKit` (office-speed).
+    private static let displaysWaiting = Atomic<Int>(0)
+
+    /// Who takes `textKit`: display paths go first; layout work steps aside while one waits.
+    enum Turn {
+        /// Tiles, preview, output, page counts.
+        case display
+        /// The index layout: waits while a display path waits, and paginates in chunks (`yieldsToDisplay`).
+        case layout
+    }
+
+    /// `body` under `textKit` (and nothing else). `.layout` first waits until no display path is waiting; a display
+    /// path that comes during `body` waits for it (one import, one chunk of pages or one page), not for the whole
+    /// layout. Same lock order as before: gate → `textKit` → `withStableFonts`.
+    static func withTextKit<T>(_ turn: Turn, _ body: () throws -> T) rethrows -> T {
+        switch turn {
+        case .display:
+            displaysWaiting.add(1, ordering: .sequentiallyConsistent)
+            textKit.lock()
+            displaysWaiting.subtract(1, ordering: .sequentiallyConsistent)
+        case .layout:
+            while true {
+                while yieldsToDisplay { usleep(200) }
+                textKit.lock()
+                // A display path that came meanwhile goes first (it may already sit at `lock()`).
+                guard yieldsToDisplay else { break }
+                textKit.unlock()
+            }
+        }
+        defer { textKit.unlock() }
+        return try body()
+    }
+
+    /// Whether a display path waits for `textKit` (layout work holding it should let go soon).
+    static var yieldsToDisplay: Bool { displaysWaiting.load(ordering: .sequentiallyConsistent) > 0 }
     private let storage: NSTextStorage
     private let layoutManager: NSLayoutManager
     private let containers: [NSTextContainer]
@@ -69,8 +106,11 @@ public final class TextKitWordDocument: @unchecked Sendable {
         // started after a display path joined none, tests) can run meanwhile. No FontResolver call inside it (it
         // would wait for a registration waiting for this gate).
         // One Word TextKit job at a time in the process (`textKit`), font gate inside it.
-        let (storage, layoutManager, containers, setup, overflowLocation) = try Self.textKit.withLock { try FontResolver.withStableFonts {
-            () throws -> (NSTextStorage, NSLayoutManager, [NSTextContainer], WordPageSetup, Int?) in
+        // Office-speed: the layout (`fonts: .start`) yields `textKit` to display paths between chunks of pages; the
+        // import itself is one step.
+        let turn: Turn = fonts == .start ? .layout : .display
+        let (storage, layoutManager, setup) = try Self.withTextKit(turn) { try FontResolver.withStableFonts {
+            () throws -> (NSTextStorage, NSLayoutManager, WordPageSetup) in
             // A layout cancelled or timed out while it waited for `textKit` runs no import.
             if Task.isCancelled { throw CancellationError() }
             let type: NSAttributedString.DocumentType = url.pathExtension.lowercased() == "doc" ? .docFormat : .officeOpenXML
@@ -93,25 +133,36 @@ public final class TextKitWordDocument: @unchecked Sendable {
             layoutManager.backgroundLayoutEnabled = false
             layoutManager.allowsNonContiguousLayout = false
             storage.addLayoutManager(layoutManager)
-            var containers: [NSTextContainer] = []
-            while true {
-                if Task.isCancelled { throw CancellationError() }
-                let container = NSTextContainer(size: setup.contentSize)
-                container.lineFragmentPadding = 0
-                layoutManager.addTextContainer(container)
-                containers.append(container)
-                let glyphs = layoutManager.glyphRange(for: container)
-                if NSMaxRange(glyphs) >= layoutManager.numberOfGlyphs { break }
-                if glyphs.length == 0 || containers.count >= maxPages {
-                    // Nothing fits on an empty page (or far too many pages): stop instead of looping; the rest is lost.
-                    Self.log.error("TextKit-Umbruch abgebrochen nach \(containers.count) Seiten")
-                    if glyphs.length == 0, containers.count > 1 {
-                        layoutManager.removeTextContainer(at: containers.count - 1)
-                        containers.removeLast()
+            return (storage, layoutManager, setup)
+        } }
+        var containers: [NSTextContainer] = []
+        var paginated = false
+        while !paginated {
+            // One chunk of pages; a layout lets go when a display path waits (its objects are its own, so another
+            // document's TextKit work in between is as safe as before: still one at a time).
+            try Self.withTextKit(turn) { try FontResolver.withStableFonts {
+                repeat {
+                    if Task.isCancelled { throw CancellationError() }
+                    let container = NSTextContainer(size: setup.contentSize)
+                    container.lineFragmentPadding = 0
+                    layoutManager.addTextContainer(container)
+                    containers.append(container)
+                    let glyphs = layoutManager.glyphRange(for: container)
+                    if NSMaxRange(glyphs) >= layoutManager.numberOfGlyphs { paginated = true; break }
+                    if glyphs.length == 0 || containers.count >= maxPages {
+                        // Nothing fits on an empty page (or far too many pages): stop instead of looping; the rest is lost.
+                        Self.log.error("TextKit-Umbruch abgebrochen nach \(containers.count) Seiten")
+                        if glyphs.length == 0, containers.count > 1 {
+                            layoutManager.removeTextContainer(at: containers.count - 1)
+                            containers.removeLast()
+                        }
+                        paginated = true
+                        break
                     }
-                    break
-                }
-            }
+                } while !(turn == .layout && Self.yieldsToDisplay)
+            } }
+        }
+        let overflowLocation = Self.withTextKit(turn) { FontResolver.withStableFonts { () -> Int? in
             let laidOut = layoutManager.characterRange(forGlyphRange: layoutManager.glyphRange(for: containers[containers.count - 1]),
                                                        actualGlyphRange: nil)
             let overflowLocation = NSMaxRange(laidOut) < storage.length ? NSMaxRange(laidOut) : nil
@@ -123,7 +174,7 @@ public final class TextKitWordDocument: @unchecked Sendable {
                     containers.removeLast()
                 }
             }
-            return (storage, layoutManager, containers, setup, overflowLocation)
+            return overflowLocation
         } }
         self.storage = storage
         self.layoutManager = layoutManager
@@ -146,9 +197,12 @@ public final class TextKitWordDocument: @unchecked Sendable {
 
     /// Normalized page text and its word boxes (0…1, origin top left), split like `SlideSnapshotter`/OCR; words that
     /// vanish through normalization are dropped.
-    public func page(_ i: Int) -> LaidOutPage {
+    /// `turn`: `.layout` for the index (steps aside for tiles and the preview), `.display` otherwise.
+    public func page(_ i: Int) -> LaidOutPage { page(i, turn: .display) }
+
+    func page(_ i: Int, turn: Turn) -> LaidOutPage {
         checkIndex(i)
-        return Self.textKit.withLock { FontResolver.withStableFonts {
+        return Self.withTextKit(turn) { FontResolver.withStableFonts {
             let container = containers[i]
             let characters = layoutManager.characterRange(forGlyphRange: layoutManager.glyphRange(for: container),
                                                           actualGlyphRange: nil)
@@ -182,7 +236,7 @@ public final class TextKitWordDocument: @unchecked Sendable {
     /// Draws no background.
     public func draw(page i: Int, in ctx: CGContext) {
         checkIndex(i)
-        Self.textKit.withLock { FontResolver.withStableFonts {
+        Self.withTextKit(.display) { FontResolver.withStableFonts {
             let glyphs = layoutManager.glyphRange(for: containers[i])
             ctx.saveGState()
             defer { ctx.restoreGState() }
@@ -230,7 +284,7 @@ public final class TextKitWordDocument: @unchecked Sendable {
     private static let shared = DocumentLRU<CacheKey, TextKitWordDocument>(capacity: cacheCapacity,
                                                                             maxWeight: cacheMaxPages) { $0.pageCount }
 
-    /// The document for `url`, from a thread-safe LRU of at most 4 documents and `cacheMaxPages` pages in all keyed by the standardized path and the
+    /// The document for `url`, from a thread-safe LRU of at most `cacheCapacity` documents and `cacheMaxPages` pages in all keyed by the standardized path and the
     /// size and modification date of the resolved file (a changed file is imported anew). Errors as `init`.
     /// `fonts`: `.join` (default) for display paths – tiles, preview, output, page counts never start Office's font
     /// registration; `.start` for layout (`TextKitWordSource`).
@@ -265,7 +319,20 @@ final class DocumentLRU<Key: Equatable & Sendable, Value: Sendable>: Sendable {
     let capacity: Int
     let maxWeight: Int
     private let weight: @Sendable (Value) -> Int
-    private let entries = Mutex<[(key: Key, value: Value, weight: Int)]>([])
+
+    /// A value being made: its result, set once, then `done` is left.
+    private final class Making: Sendable {
+        let key: Key
+        let done = DispatchGroup()
+        let result = Mutex<Result<Value, any Error>?>(nil)
+        init(_ key: Key) { self.key = key; done.enter() }
+    }
+
+    private struct State {
+        var entries: [(key: Key, value: Value, weight: Int)] = []
+        var making: [Making] = []
+    }
+    private let state = Mutex(State())
 
     init(capacity: Int, maxWeight: Int = .max, weight: @escaping @Sendable (Value) -> Int = { _ in 0 }) {
         precondition(capacity > 0, "DocumentLRU: Kapazität muss positiv sein")
@@ -274,33 +341,63 @@ final class DocumentLRU<Key: Equatable & Sendable, Value: Sendable>: Sendable {
         self.weight = weight
     }
 
+    private enum Lookup {
+        case hit(Value)
+        case wait(Making)
+        case make(Making)
+    }
+
     /// The value for `key` (now the most recently used), or `make()`'s result, stored after removing the entries
     /// `replacing` matches (an older version of the same file) and then the least recently used ones while more
     /// than `capacity` entries or more than `maxWeight` remain (never the new one).
-    /// `make` runs outside the lock: two simultaneous misses both make a value, the later one keeps the entry.
-    func value(for key: Key, replacing: (Key) -> Bool = { _ in false }, make: () throws -> Value) rethrows -> Value {
-        let hit = entries.withLock { entries -> Value? in
-            guard let index = entries.firstIndex(where: { $0.key == key }) else { return nil }
-            let entry = entries.remove(at: index)
-            entries.append(entry)
-            return entry.value
+    /// `make` runs outside the lock, once per key at a time (office-speed): simultaneous misses wait for the first
+    /// one's value or error; an error is not kept.
+    func value(for key: Key, replacing: (Key) -> Bool = { _ in false }, make: () throws -> Value) throws -> Value {
+        let lookup = state.withLock { state -> Lookup in
+            if let index = state.entries.firstIndex(where: { $0.key == key }) {
+                let entry = state.entries.remove(at: index)
+                state.entries.append(entry)
+                return .hit(entry.value)
+            }
+            if let making = state.making.first(where: { $0.key == key }) { return .wait(making) }
+            let making = Making(key)
+            state.making.append(making)
+            return .make(making)
         }
-        if let hit { return hit }
-        let value = try make()
-        let valueWeight = weight(value)
-        entries.withLock { entries in
-            entries.removeAll { $0.key == key || replacing($0.key) }
-            entries.append((key, value, valueWeight))
-            var total = entries.reduce(0) { $0 + $1.weight }
-            while entries.count > 1, entries.count > capacity || total > maxWeight {
-                total -= entries.removeFirst().weight
+        let making: Making
+        switch lookup {
+        case .hit(let value): return value
+        case .wait(let other):
+            other.done.wait()
+            return try other.result.withLock { $0! }.get()
+        case .make(let mine): making = mine
+        }
+        let result = Result { try make() }
+        if case .success(let value) = result {
+            let valueWeight = weight(value)
+            state.withLock { state in
+                state.entries.removeAll { $0.key == key || replacing($0.key) }
+                state.entries.append((key, value, valueWeight))
+                var total = state.entries.reduce(0) { $0 + $1.weight }
+                while state.entries.count > 1, state.entries.count > capacity || total > maxWeight {
+                    total -= state.entries.removeFirst().weight
+                }
             }
         }
-        return value
+        state.withLock { $0.making.removeAll { $0 === making } }
+        making.result.withLock { $0 = result }
+        making.done.leave()
+        return try result.get()
     }
 
-    var keys: [Key] { entries.withLock { $0.map(\.key) } }
-    var totalWeight: Int { entries.withLock { $0.reduce(0) { $0 + $1.weight } } }
+    /// `value(for:replacing:make:)` for a `make` that cannot fail.
+    func value(for key: Key, replacing: (Key) -> Bool = { _ in false }, make: () -> Value) -> Value {
+        // Never throws: the only error source is `make`.
+        try! value(for: key, replacing: replacing, make: { () throws -> Value in make() })
+    }
+
+    var keys: [Key] { state.withLock { $0.entries.map(\.key) } }
+    var totalWeight: Int { state.withLock { $0.entries.reduce(0) { $0 + $1.weight } } }
 }
 
 /// Page size and margins in points.

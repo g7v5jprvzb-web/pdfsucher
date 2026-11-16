@@ -38,6 +38,8 @@ struct KeyContext {
     var folderTreeFocused = false
     /// The folder bar is shown: its list is a Tab stop (computed for Tab only).
     var folderBarVisible = false
+    /// The large preview is shown (⇧Tab can hide it, 1.3.6): only then is it a Tab stop.
+    var previewVisible = true
     let shortcuts: [ShortcutAction: KeyShortcut]
 }
 
@@ -54,6 +56,8 @@ enum KeyDecision: Equatable {
     case showHistory
     /// Tab into the folder bar's list (an AppKit view: the monitor makes it first responder).
     case focusFolderTree
+    /// ⇧Tab (1.3.6, Chris): hide the folder bar, then also the preview, then show both again.
+    case cycleLayout
 }
 
 /// What a key press does (pure; the monitor applies it). Rules: spec 1.1 §7, §9, §10.
@@ -81,9 +85,10 @@ enum KeyRouting {
 
         // After the chosen shortcuts, so one put on ⌥↓ still works (review M7).
         if s.key == "down", s.modifiers == .option, inSearch { return .showHistory }
-        if s.key == "tab", s.modifiers.isSubset(of: .shift), !context.fullKeyboardAccess {
+        if s.key == "tab", s.modifiers == .shift, !context.fullKeyboardAccess { return .cycleLayout }
+        if s.key == "tab", s.modifiers.isEmpty, !context.fullKeyboardAccess {
             let stops = tabStops(includesSearch: context.tabIncludesSearch, includesPreview: context.tabIncludesPreview,
-                                 folderBarVisible: context.folderBarVisible)
+                                 folderBarVisible: context.folderBarVisible, previewVisible: context.previewVisible)
             // The AppKit list wins: SwiftUI can still report the grid while the folder bar has the keyboard
             // (1.3.5, Tab from the bar then stayed in the bar).
             let current: TabStop? = if context.folderTreeFocused { .folders } else {
@@ -95,7 +100,7 @@ enum KeyRouting {
                 }
             }
             guard let current else { return .moveFocus(.grid) }
-            switch nextStop(from: current, in: stops, backwards: s.modifiers.contains(.shift)) {
+            switch nextStop(from: current, in: stops, backwards: false) {
             case .folders: return .focusFolderTree
             case .search: return .moveFocus(.search)
             case .grid: return .moveFocus(.grid)
@@ -153,17 +158,23 @@ enum KeyRouting {
 
     /// The Tab cycle: the grid always; the folder bar while shown; search field and preview when switched on.
     /// Fewer than two stops (folder bar hidden, nothing switched on): the preview joins, so Tab never does nothing.
-    static func tabStops(includesSearch: Bool, includesPreview: Bool, folderBarVisible: Bool) -> [TabStop] {
+    static func tabStops(includesSearch: Bool, includesPreview: Bool, folderBarVisible: Bool, previewVisible: Bool = true) -> [TabStop] {
         var stops = TabStop.allCases.filter { stop in
             switch stop {
             case .search: includesSearch
             case .folders: folderBarVisible
             case .grid: true
-            case .preview: includesPreview
+            case .preview: includesPreview && previewVisible
             }
         }
-        if stops.count < 2 { stops.append(.preview) }
+        if stops.count < 2, previewVisible { stops.append(.preview) }
         return stops
+    }
+
+    /// ⇧Tab's layout cycle: both shown → folder bar hidden → preview hidden as well → both shown.
+    static func nextLayout(folderBar: Bool, preview: Bool) -> (folderBar: Bool, preview: Bool) {
+        if !preview { return (true, true) }
+        return folderBar ? (false, true) : (false, false)
     }
 
     /// The next stop after `current`; a place outside the cycle (e.g. a click into the preview) goes on to the

@@ -120,6 +120,81 @@ struct ThumbnailCacheForeignTests {
         #expect(yellow.intersects(word))
     }
 
+    /// office-speed: a provider that draws its tile directly (Word) is not asked for a PDF page.
+    final class DirectProvider: ForeignPageProvider {
+        struct State {
+            var documentCalls = 0
+            var draws = 0
+            var textCalls = 0
+        }
+        let state = Mutex(State())
+        static let box = CGRect(x: 0.5, y: 0.6, width: 0.3, height: 0.05)
+
+        func handles(_ url: URL) -> Bool { url.pathExtension == "docx" }
+        func pageCount(of url: URL) -> Int? { 1 }
+        func makePage(_ ref: PageRef) throws -> PDFPage { throw OutputError.cannotOpen(ref.url) }
+        func pageDocument(_ ref: PageRef, maxPixel: Int?) -> PDFDocument? {
+            state.withLock { $0.documentCalls += 1 }
+            return FakeProvider.blankDocument()
+        }
+        func tile(_ ref: PageRef) -> ForeignTile? {
+            guard ref.pageIndex == 0 else { return nil }
+            return ForeignTile(size: CGSize(width: 200, height: 283), draw: { [self] ctx in
+                state.withLock { $0.draws += 1 }
+                ctx.setFillColor(CGColor(gray: 0, alpha: 1))
+                ctx.fill(CGRect(x: 10, y: 10, width: 20, height: 20))   // bottom left, in page points
+            }, text: { [self] in
+                state.withLock { $0.textCalls += 1 }
+                return (text: "Vertrag", words: [OCRWord(range: NSRange(location: 0, length: 7), box: Self.box)])
+            })
+        }
+    }
+
+    @Test func directTileIsDrawnWithoutAPDFPage() async throws {
+        let provider = DirectProvider()
+        let cache = ThumbnailCache(foreign: provider)
+        let ref = PageRef(url: try officeFile(), pageIndex: 0)
+        let size = CGSize(width: 400, height: 566)
+        let image = try #require(await cache.thumbnail(for: ref, size: size))
+        let probe = PixelProbe(image)
+        let ink = try #require(probe.boundingBox(where: PixelProbe.isDark))
+        // 10…30 pt of 200 × 283 pt, origin bottom left → in the image (origin top left) near the bottom left.
+        #expect(ink.minX < CGFloat(probe.width) * 0.2 && ink.maxY > CGFloat(probe.height) * 0.85, "\(ink)")
+        #expect(PixelProbe(image).boundingBox(where: PixelProbe.isYellow) == nil)
+        let state = provider.state.withLock { $0 }
+        #expect(state.documentCalls == 0 && state.draws == 1 && state.textCalls == 0)
+        // No direct tile for a page: the PDF page as before.
+        #expect(await cache.thumbnail(for: PageRef(url: ref.url, pageIndex: 1), size: size) != nil)
+        #expect(provider.state.withLock { $0.documentCalls } == 1)
+    }
+
+    @Test func directTileMarksFromItsOwnWordsOrTheStoredOnes() async throws {
+        let provider = DirectProvider()
+        let cache = ThumbnailCache(foreign: provider)
+        let ref = PageRef(url: try officeFile(), pageIndex: 0)
+        let size = CGSize(width: 400, height: 566)
+        let ranges: HighlightRanges = { text in [text.startIndex..<text.endIndex] }
+        func yellowCentre(_ image: NSImage) throws -> CGPoint {
+            let probe = PixelProbe(image)
+            let yellow = try #require(probe.boundingBox(where: PixelProbe.isYellow))
+            return CGPoint(x: yellow.midX / CGFloat(probe.width), y: yellow.midY / CGFloat(probe.height))
+        }
+        let own = try yellowCentre(try #require(await cache.thumbnail(for: ref, size: size, highlightKey: "v",
+                                                                       highlightRanges: ranges)))
+        #expect(abs(own.x - DirectProvider.box.midX) < 0.03 && abs(own.y - DirectProvider.box.midY) < 0.03, "\(own)")
+        #expect(provider.state.withLock { $0.textCalls } == 1)
+        // Stored word boxes (the index) win, as for PDF tiles.
+        let stored = CGRect(x: 0.1, y: 0.1, width: 0.3, height: 0.05)
+        let ocr = OCRPageText(text: "Vertrag", words: [OCRWord(range: NSRange(location: 0, length: 7), box: stored)])
+        let fromIndex = try yellowCentre(try #require(await cache.thumbnail(for: ref, size: size, highlightKey: "w",
+                                                                             highlightRanges: ranges, ocr: ocr)))
+        #expect(abs(fromIndex.x - stored.midX) < 0.03 && abs(fromIndex.y - stored.midY) < 0.03, "\(fromIndex)")
+        #expect(provider.state.withLock { $0.textCalls } == 1 && provider.state.withLock { $0.documentCalls } == 0)
+        // The tile's shape comes from the tile, too.
+        #expect(abs((cache.pageAspect(of: ref.url) ?? 0) - 283.0 / 200) < 0.001)
+        #expect(provider.state.withLock { $0.documentCalls } == 0)
+    }
+
     @Test func officeTileKeyChangesWithContentVersion() async throws {
         let provider = FakeProvider()
         let disk = TileDiskCache(directory: try PDFFixtures.tempDirectory().appendingPathComponent("Tiles"))

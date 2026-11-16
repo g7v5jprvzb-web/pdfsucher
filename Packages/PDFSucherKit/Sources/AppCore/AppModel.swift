@@ -226,7 +226,8 @@ import ViewerUI
     @ObservationIgnored private var lastTyping: ContinuousClock.Instant?
     /// A start waiting for typing to pause.
     @ObservationIgnored private var fontStartWaiter: Task<Void, Never>?
-    /// A Word document was shown before the registration succeeded: its tiles/preview may carry substitute fonts.
+    /// A Word document or a SlideKit deck was shown before the registration succeeded: its tiles/preview may carry
+    /// substitute fonts.
     @ObservationIgnored private var wordShownBeforeFonts = false
     /// The registration succeeded in this process (`fontsRegistered`).
     @ObservationIgnored private var fontsAreRegistered = false
@@ -1751,7 +1752,9 @@ import ViewerUI
     }
 
     private nonisolated static func singleEntry(_ url: URL, layout: FileLayoutState?) -> DocumentHit {
-        let modifiedAt = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let modifiedAt = attributes?[.modificationDate] as? Date
+        let fileSize = (attributes?[.size] as? NSNumber)?.int64Value
         if let layout, let kind = SingleFileLayout.officeKind(url) {
             // Word/PowerPoint: waiting → no pages yet; unreadable; laid out → its pages (spec 1.3).
             let pages: Int, unreadable: Bool
@@ -1762,19 +1765,20 @@ import ViewerUI
             }
             return DocumentHit(url: url, relativePath: url.lastPathComponent, modifiedAt: modifiedAt ?? Date(timeIntervalSince1970: 0),
                                pageHits: [], totalMatches: 0, relevance: 0, sourceRoot: url,
-                               pageCount: pages, isUnreadable: unreadable, kind: kind, isSimplified: SingleFileLayout.isSimplified(layout))
+                               pageCount: pages, isUnreadable: unreadable, kind: kind, isSimplified: SingleFileLayout.isSimplified(layout),
+                               fileSize: fileSize)
         }
         if ImagePages.isImage(url) {
             let readable = ImagePages.isReadable(url)
             return DocumentHit(url: url, relativePath: url.lastPathComponent, modifiedAt: modifiedAt ?? Date(timeIntervalSince1970: 0),
                                pageHits: [], totalMatches: 0, relevance: 0, sourceRoot: url,
-                               pageCount: readable ? 1 : 0, isUnreadable: !readable, kind: .image)
+                               pageCount: readable ? 1 : 0, isUnreadable: !readable, kind: .image, fileSize: fileSize)
         }
         let document = PDFDocument(url: url)
         let readable = document.map { !$0.isLocked } ?? false
         return DocumentHit(url: url, relativePath: url.lastPathComponent, modifiedAt: modifiedAt ?? Date(timeIntervalSince1970: 0),
                            pageHits: [], totalMatches: 0, relevance: 0, sourceRoot: url,
-                           pageCount: readable ? document?.pageCount ?? 0 : 0, isUnreadable: !readable)
+                           pageCount: readable ? document?.pageCount ?? 0 : 0, isUnreadable: !readable, fileSize: fileSize)
     }
 
     private func applyBrowse(_ sorted: [(target: String, hit: DocumentHit)], mode: SortMode, for parsed: ParsedQuery) {
@@ -2379,6 +2383,8 @@ import ViewerUI
             if !fontsAreRegistered { wordShownBeforeFonts = true }
         case .powerpoint:
             guard !OfficeDisplay.usesSlideCache(officeRendering.value) else { return }
+            // office-speed: SlideKit tiles no longer wait for the registration either (substitutes until it is done).
+            if !fontsAreRegistered { wordShownBeforeFonts = true }
         case .pdf, .image:
             return
         }

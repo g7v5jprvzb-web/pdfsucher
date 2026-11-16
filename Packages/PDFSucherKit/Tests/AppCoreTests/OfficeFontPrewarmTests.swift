@@ -347,8 +347,9 @@ struct OfficeFontPrewarmTests {
         #expect(clean.layoutCount == 1, "no substitute layouts stored: no extra run")
     }
 
-    /// Only decks shown (SlideKit resolves its fonts itself): no tile reload.
-    @Test(.timeLimit(.minutes(1))) func successAfterOnlyDecksDoesNotReloadTiles() async throws {
+    /// Decks shown before the fonts (office-speed: SlideKit tiles no longer wait for the registration, they draw
+    /// substitutes): the tiles are loaded again once, like Word's.
+    @Test(.timeLimit(.minutes(1))) func successAfterDecksShownReloadsTilesOnce() async throws {
         calls.succeeds = true
         let defaults = UserDefaults(suiteName: "FontPrewarm-\(UUID().uuidString)")!
         let m = model(defaults: defaults)
@@ -356,7 +357,7 @@ struct OfficeFontPrewarmTests {
         m.officeDocumentShown(base.appendingPathComponent("Folien.pptx"))
         #expect(await eventually { defaults.bool(forKey: AppModel.fontsRegisteredOnceKey) })
         try await settle()
-        #expect(m.foreignPagesRevision == revision)
+        #expect(m.foreignPagesRevision == revision + 1)
     }
 
     /// A Word single file laid out with substitute fonts is laid out again after a successful registration.

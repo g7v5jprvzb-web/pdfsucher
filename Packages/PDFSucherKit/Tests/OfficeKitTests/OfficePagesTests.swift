@@ -208,6 +208,23 @@ struct OfficePagesTests {
         #expect(pages.thumbnail(PageRef(url: dir.appendingPathComponent("weg.docx"), pageIndex: 0), maxPixel: 300) == nil)
     }
 
+    /// office-speed: Word tiles draw directly; the tile's words are the laid-out page's (marks without the index).
+    @Test func wordTileDrawsDirectlyWithLaidOutWords() throws {
+        let tile = try #require(pages.tile(PageRef(url: word, pageIndex: 0)))
+        let document = try TextKitWordDocument.cached(url: word)
+        #expect(tile.size == document.pageSize(0))
+        let text = tile.text()
+        #expect(text.text == document.page(0).text && text.words == document.page(0).words)
+        #expect(text.text.contains("kündigungsfrist") || text.text.contains("Kündigungsfrist"))
+        let ctx = try #require(CGContext(data: nil, width: Int(tile.size.width), height: Int(tile.size.height), bitsPerComponent: 8,
+                                         bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                         bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        tile.draw(ctx)
+        #expect(pages.tile(PageRef(url: word, pageIndex: 5)) == nil)
+        #expect(pages.tile(PageRef(url: deck, pageIndex: 0)) == nil)
+        #expect(pages.tile(PageRef(url: dir.appendingPathComponent("weg.docx"), pageIndex: 0)) == nil)
+    }
+
     @Test func previewPageSizeMatchesSlide() throws {
         #expect(pages.previewPage(PageRef(url: deck, pageIndex: 0)) == nil)
         try cacheSlides(of: deck)

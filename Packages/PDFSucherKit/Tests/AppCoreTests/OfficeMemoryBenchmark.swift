@@ -22,7 +22,8 @@ import UniformTypeIdentifiers
 /// One configuration per process (the process peak is per process): `PDFSUCHER_MEMBENCH_LAYOUT` = PowerPoint layouts
 /// at once in the index run (0 = no index run), `PDFSUCHER_MEMBENCH_DECKS` = `SlideDeckCache` capacity for tiles
 /// drawn at the same time as the index run (0 = no tiles), `PDFSUCHER_MEMBENCH_PIXEL` = tile size (long side, default
-/// 512), `PDFSUCHER_MEMBENCH_RENDERER=quicklook` = Quick Look instead of SlideKit for the layout. Synthetic decks only (no customer files): 8 decks × 30
+/// 512), `PDFSUCHER_MEMBENCH_MAXMB` = the cache's bound in decoded image MB (default none),
+/// `PDFSUCHER_MEMBENCH_RENDERER=quicklook` = Quick Look instead of SlideKit for the layout. Synthetic decks only (no customer files): 8 decks × 30
 /// slides, each slide a distinct 3000 × 2250 PNG over the whole slide plus text; generated once into the temp folder.
 /// Office's own fonts: off in test processes (`FontResolver.officeFontRoots` is `.none`); for numbers with the
 /// fonts an installed Office brings, add `PDFSUCHER_TEST_OFFICE_FONTS=1` (reads Office's real font folders and cache).
@@ -119,7 +120,10 @@ struct OfficeMemoryBenchmark {
         }()
         async let tiles: Int = {
             guard deckCapacity > 0 else { return 0 }
-            let pages = SlideKitPages(fontSubstitution: .powerPoint, decks: SlideDeckCache(capacity: deckCapacity))
+            let maxMB = Self.env("PDFSUCHER_MEMBENCH_MAXMB", 0)
+            let decks = maxMB > 0 ? SlideDeckCache(capacity: deckCapacity, maxBytes: maxMB * 1024 * 1024)
+                                  : SlideDeckCache(capacity: deckCapacity)
+            let pages = SlideKitPages(fontSubstitution: .powerPoint, decks: decks)
             var drawn = 0
             for url in deckURLs {
                 for i in 0..<Self.slidesPerDeck where pages.thumbnail(PageRef(url: url, pageIndex: i), maxPixel: maxPixel) != nil {
@@ -133,7 +137,7 @@ struct OfficeMemoryBenchmark {
         sampling.withLock { $0 = false }
         let after = Self.footprint()
         let sampledPeak = peak.withLock { $0 }
-        let line = "MEMBENCH \(quickLook ? "quicklook" : "slidekit") layout=\(layoutAtOnce) decks=\(deckCapacity) px=\(maxPixel): indexed \(indexed), tiles \(drawn), "
+        let line = "MEMBENCH \(quickLook ? "quicklook" : "slidekit") layout=\(layoutAtOnce) decks=\(deckCapacity) maxMB=\(Self.env("PDFSUCHER_MEMBENCH_MAXMB", 0)) px=\(maxPixel): indexed \(indexed), tiles \(drawn), "
             + "\(elapsed.formatted(.units(allowed: [.seconds], fractionalPart: .show(length: 1)))); "
             + "base \(Self.mb(base.now)), sampled peak +\(Self.mb(sampledPeak - base.now)), "
             + "process peak \(Self.mb(after.peak)), after \(Self.mb(after.now))"

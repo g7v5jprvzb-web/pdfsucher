@@ -627,3 +627,37 @@ Die Grundlast des Rechners schwankte (ein Simulator-Prozess); ruhige Läufe sind
 - Median ≤ 50 ms bis sichtbar: **erfüllt** (32–42 ms; schnelles Blättern 6 ms).
 - Beim normalen Weiterblättern scharfes Bild: **erfüllt** (32 von 33 vorgezeichnet).
 - Kein Main-Thread-Block > 100 ms beim schnellen Blättern durch Scans: **erfüllt** (0 bzw. 1 × 58 ms; vorher bis 328 ms).
+
+## office-speed: Word- und PowerPoint-Kacheln (Paket 1–4)
+
+Gemessen 2026-11-16 auf Chris' Mac (M3 Max, 16 Kerne), **Release**, je Zeile ein frischer Prozess, 3 Durchgänge,
+Median / Max über die Prozesse. Vorher = main 92ffcb6 + Messcode, nachher = Zweig `claude/project-thread-it2vzj` +
+derselbe Messcode, beide direkt nacheinander gemessen (heute las kein Prozess Office' Cloud-Schriftcache rechtzeitig,
+`complete=false`; darum ist „vorher“ neu gemessen statt aus MESSUNG.md übernommen). Volle Tabelle, Methode und Rohdaten:
+interne Messnotiz. Entscheidungen: decisions.md „Office-Vorschau schneller“.
+
+| Szenario | vorher ms | nachher ms | Faktor |
+|---|---|---|---|
+| Deck öffnen (7 Decks) | 24–138 | 1,6–7,2 | 10–24× |
+| A2 ein Deck, alle Folien gleichzeitig kalt (Wand) | 194–612 | 155–436 | 1,1–1,5× |
+| A2 Deck-Öffnungen dabei | 6 je Deck | 1 je Deck | 6× |
+| A3 Raster 7 Decks × 6 Folien, kalt, 6 Worker | 857 / 930 | 346 / 352 | 2,5× |
+| A3 … zweiter Durchlauf | 756 / 762 | 25 / 26 | 31× |
+| B1 erste Word-Kachel kalt (15 Dateien) | 93–2373 | 93–2492 | 1,0× |
+| B2 Word 100 S. gleichzeitig, kalt, 6 Worker | 811 / 813 | 220 / 230 | 3,7× |
+| B2 … Dokument importiert, 6 Worker | 188 / 188 | 33 / 33 | 5,7× |
+| B3 Raster 8 Word-Dateien × 3 S., kalt | 2538 / 4569 | 2593 / 2625 | 1,0× (17 → 8 Importe) |
+| B3 … zweiter Durchlauf | 4468 / 4502 | 14 / 14 | > 300× |
+| B4 erste Word-Kachel, Registrierung läuft | 2146 / 2152 | 53 / 56 | 41× |
+| B4 erste Folien-Kachel vor der Registrierung | 2212 / 2230 | 103 / 110 | 21× |
+| B5 30 Word-Kacheln ohne Layout | 71 / 71 | 24 / 25 | 3,0× |
+| B5 30 Word-Kacheln während 2 Word-Layouts | 955 / 957 | 40 / 41 | 24× |
+
+Speicher: A3 Prozess-Höchststand 152–183 → 202–224 MB. „1.3.2“-Bild-Deck (8 × 30 Folien à 3000 × 2250, 1600 px,
+Layoutlauf, Debug, wie oben): 2 Decks +773 MB, neu 10 Decks / 400 MB **+457 MB**.
+
+Befund: Faktor 5 und mehr überall, wo dasselbe Dokument wieder gebraucht wird (offen halten, einmal öffnen/importieren),
+beim Öffnen eines Decks, bei Kacheln neben Index-Layouts und während der Schriftregistrierung. **Nicht** bei der
+allerersten Kachel einer Datei: bei Folien bleiben Text setzen und Bilder dekodieren (A1 kalt 1,0–1,1×), bei Word
+Import und Umbruch des ganzen Dokuments (B1 1,0×). Das wäre der nächste Hebel (Word seitenweise umbrechen, SlideKit-
+Einmalkosten je Prozess).

@@ -276,7 +276,10 @@ public final class ThumbnailCache: Sendable {
     /// opened through the pool like for a tile, so its first tile reuses the document. Blocks: not on the main actor.
     public func pageAspect(of url: URL) -> CGFloat? {
         if ImagePages.isImage(url) { return Self.imageAspect(url) }
-        if foreign?.handles(url) == true {
+        if let foreign, foreign.handles(url) {
+            if let tile = foreign.tile(PageRef(url: url, pageIndex: 0)) {
+                return tile.size.width > 0 && tile.size.height > 0 ? tile.size.height / tile.size.width : nil
+            }
             return foreignDocument(for: url, page: 0, maxPixel: 64)?.page(at: 0).flatMap(Self.aspect(of:))
         }
         guard let stamp = Self.stamp(of: url), let document = documents.checkout(url, stamp: stamp) else { return nil }
@@ -324,6 +327,9 @@ public final class ThumbnailCache: Sendable {
             let pixels = Int((max(size.width, size.height) * scale).rounded(.up))
             guard let document = ImageDocument.make(ref.url, maxPixel: min(pixels, Int(Self.maxRenderPixelSide))) else { return nil }
             rendered = draw(document, request)
+        } else if let foreign, foreign.handles(ref.url), let tile = foreign.tile(ref) {
+            // Word (office-speed): drawn straight into the bitmap, no PDF page in between (~0.5 ms instead of ~6 ms).
+            rendered = render(tile, request)
         } else if foreign?.handles(ref.url) == true {
             // Word/PowerPoint: a one-page document from the provider, not pooled (like images).
             guard let document = foreignDocument(for: ref.url, page: ref.pageIndex, maxPixel: Self.foreignMaxPixel(size, scale: scale))
@@ -351,14 +357,47 @@ public final class ThumbnailCache: Sendable {
 
     private func render(_ page: PDFPage, size: CGSize, highlightRanges: HighlightRanges?, color: RGBA,
                         ocr: OCRPageText?, maxPixelSide: CGFloat) -> (image: CGImage, bytes: Int)? {
+        let box = page.bounds(for: .cropBox)
+        let quarterTurns = ((page.rotation % 360) + 360) % 360 / 90
+        let shown = quarterTurns % 2 == 1 ? CGSize(width: box.height, height: box.width) : box.size
+        return render(shown: shown, box: box, size: size, highlightRanges: highlightRanges, color: color,
+                      maxPixelSide: maxPixelSide, transform: { page.transform($0, for: .cropBox) },
+                      draw: { ctx in if !ScannedPage.draw(page, in: ctx) { page.draw(with: .cropBox, to: ctx) } },
+                      matches: { highlightRanges in
+            if let ocr = OCRHighlights.usable(ocr) {
+                return OCRHighlights.pageRects(ocr, highlightRanges: highlightRanges, page: page)
+            } else if let text = page.string, !text.isEmpty {
+                return Self.highlightRects(on: page, text: text, ranges: highlightRanges(text))
+            }
+            return []
+        })
+    }
+
+    /// A tile the provider draws directly: page space is the tile's points (no crop box, no rotation); marks from
+    /// the stored word boxes (`ocr`, the index) or else the tile's own words.
+    private func render(_ tile: ForeignTile, _ request: Request) -> (image: CGImage, bytes: Int)? {
+        let box = CGRect(origin: .zero, size: tile.size)
+        let ocr = request.ocr
+        return render(shown: tile.size, box: box, size: request.size, highlightRanges: request.highlightRanges,
+                      color: request.color, maxPixelSide: Self.maxRenderPixelSide, transform: { _ in }, draw: tile.draw,
+                      matches: { highlightRanges in
+            let words = OCRHighlights.usable(ocr) ?? { let own = tile.text(); return OCRPageText(text: own.text, words: own.words) }()
+            return OCRHighlights.normalizedBoxes(words, highlightRanges: highlightRanges)
+                .map { OCRMapping.pageRect($0, cropBox: box, rotation: 0) }
+        })
+    }
+
+    /// Draws a page of `shown` size (points as displayed; `box` its unrotated crop box) fitted into a tile of `size`
+    /// on white, then the marks: `matches` gives match rectangles in page space, `transform` maps page space onto the
+    /// fitted, displayed page.
+    private func render(shown: CGSize, box: CGRect, size: CGSize, highlightRanges: HighlightRanges?, color: RGBA,
+                        maxPixelSide: CGFloat, transform: (CGContext) -> Void, draw: (CGContext) -> Void,
+                        matches: (HighlightRanges) -> [CGRect]) -> (image: CGImage, bytes: Int)? {
         let scale = min(self.scale, maxPixelSide / max(size.width, size.height))
         let (pixelWidth, pixelHeight) = Self.pixelSize(size, scale: self.scale, maxPixelSide: maxPixelSide)
         guard let ctx = CGContext(data: nil, width: pixelWidth, height: pixelHeight, bitsPerComponent: 8, bytesPerRow: 0,
                                   space: CGColorSpace(name: CGColorSpace.sRGB)!,
                                   bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
-        let box = page.bounds(for: .cropBox)
-        let quarterTurns = ((page.rotation % 360) + 360) % 360 / 90
-        let shown = quarterTurns % 2 == 1 ? CGSize(width: box.height, height: box.width) : box.size
         guard shown.width > 0, shown.height > 0 else { return nil }
         let fit = min(size.width / shown.width, size.height / shown.height)
         let drawn = CGSize(width: shown.width * fit, height: shown.height * fit)
@@ -371,22 +410,15 @@ public final class ThumbnailCache: Sendable {
         ctx.interpolationQuality = .high
 
         ctx.saveGState()
-        if !ScannedPage.draw(page, in: ctx) { page.draw(with: .cropBox, to: ctx) }
+        draw(ctx)
         ctx.restoreGState()
 
         if let highlightRanges {
-            let rects: [CGRect]
-            if let ocr = OCRHighlights.usable(ocr) {
-                rects = OCRHighlights.pageRects(ocr, highlightRanges: highlightRanges, page: page)
-            } else if let text = page.string, !text.isEmpty {
-                rects = Self.highlightRects(on: page, text: text, ranges: highlightRanges(text))
-            } else {
-                rects = []
-            }
+            let rects = matches(highlightRanges)
             if !rects.isEmpty {
                 let style = HighlightGeometry.style(forTileWidth: size.width)
                 let layout = HighlightGeometry.layout(matchRects: rects, pageBounds: box, scale: fit, style: style)
-                page.transform(ctx, for: .cropBox)
+                transform(ctx)
                 ctx.setBlendMode(.multiply)
                 let opacity = style == .exact ? HighlightGeometry.exactOpacity : HighlightGeometry.enlargedOpacity
                 ctx.setFillColor(Self.cgColor(color, alpha: opacity))

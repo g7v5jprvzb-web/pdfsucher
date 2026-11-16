@@ -249,10 +249,44 @@ final class SmokeTests: XCTestCase {
         expectTree(true, "Tab: grid → folder bar")
         app.typeKey(.tab, modifierFlags: [])
         expectTree(false, "Tab: folder bar → grid again")
+        app.typeKey(.tab, modifierFlags: [])
+        expectTree(true, "Tab: grid → folder bar again")
+    }
+
+    /// 1.3.6 (Chris): ⇧Tab hides the folder bar, then the large preview as well, then shows both again; Tab still
+    /// cycles folder bar ↔ grid afterwards.
+    func testShiftTabCyclesLayout() throws {
+        let tree = try PDFFixtures.tempDirectory()
+        defer { try? FileManager.default.removeItem(at: tree) }
+        try PDFFixtures.makePDF(at: tree.appendingPathComponent("angebot.pdf"), pages: ["Ein Angebot"])
+        let app = XCUIApplication()
+        app.launchArguments = ["-uiTestFolder", tree.path]
+        app.launch()
+        XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 15), "window")
+        let row = app.descendants(matching: .any).matching(identifier: "documentRow").firstMatch
+        XCTAssertTrue(row.waitForExistence(timeout: 20), "browse rows")
+        let folderTree = app.descendants(matching: .any).matching(identifier: "folderTree").firstMatch
+        if !folderTree.exists { app.descendants(matching: .any)["folderBarToggle"].click() }
+        XCTAssertTrue(folderTree.waitForExistence(timeout: 10), "folder bar shown")
+        let splitter = app.descendants(matching: .any).matching(identifier: "previewSplitter").firstMatch
+        XCTAssertTrue(splitter.waitForExistence(timeout: 10), "preview shown")
+        row.click()
+        func expect(tree shown: Bool, preview: Bool, _ step: String) {
+            let deadline = Date().addingTimeInterval(3)
+            while (folderTree.exists != shown || splitter.exists != preview), Date() < deadline { Thread.sleep(forTimeInterval: 0.1) }
+            XCTAssertEqual(folderTree.exists, shown, step + ": folder bar")
+            XCTAssertEqual(splitter.exists, preview, step + ": preview")
+        }
         app.typeKey(.tab, modifierFlags: .shift)
-        expectTree(true, "⇧Tab: grid → folder bar")
+        expect(tree: false, preview: true, "1st ⇧Tab")
         app.typeKey(.tab, modifierFlags: .shift)
-        expectTree(false, "⇧Tab: folder bar → grid")
+        expect(tree: false, preview: false, "2nd ⇧Tab")
+        app.typeKey(.tab, modifierFlags: .shift)
+        expect(tree: true, preview: true, "3rd ⇧Tab")
+        app.typeKey(.tab, modifierFlags: [])
+        let deadline = Date().addingTimeInterval(3)
+        while !(folderTree.value(forKey: "hasKeyboardFocus") as? Bool ?? false), Date() < deadline { Thread.sleep(forTimeInterval: 0.1) }
+        XCTAssertTrue(folderTree.value(forKey: "hasKeyboardFocus") as? Bool ?? false, "Tab: grid → folder bar after the cycle")
     }
 
     /// The tree opens down to a chosen folder: choose a deep folder below 40 others, close its parent, scroll

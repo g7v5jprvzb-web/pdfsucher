@@ -111,7 +111,7 @@ enum SampleData {
             let pageHits = hitPages.map { PageHit(pageIndex: $0, matchCount: 2) }
             return DocumentHit(url: url, relativePath: path, modifiedAt: Date(timeIntervalSinceNow: -Double(offset) * 86_400),
                                pageHits: pageHits, totalMatches: pageHits.count * 2, relevance: Double(3 - offset),
-                               sourceRoot: dir, pageCount: 15)
+                               sourceRoot: dir, pageCount: 15, fileSize: Int64(180_000 + offset * 1_250_000))
         }
     }
 

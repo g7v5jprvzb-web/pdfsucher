@@ -1,5 +1,6 @@
 // ForeignPages.swift — 1.3 Office Task 8
 import Foundation
+import IndexKit
 import PDFKit
 
 /// Pages of files that are neither PDF nor image (Word, PowerPoint), supplied from outside OutputKit
@@ -20,11 +21,35 @@ public protocol ForeignPageProvider: Sendable {
     /// whether a layout is cached), so cached tiles of an older layout are not shown (1.3 Teil B). "" = unknown.
     /// May touch the disk; called off the main actor.
     func contentVersion(_ url: URL) -> String
+    /// A page drawn straight into a tile's bitmap, without a PDF page in between (office-speed: Word); nil = no such
+    /// fast path, tiles use `pageDocument`. Output, printing and the large preview keep `makePage`/`pageDocument`.
+    func tile(_ ref: PageRef) -> ForeignTile?
+}
+
+/// A page for a tile, drawn directly. Calls may block (the provider's locks); called off the main actor.
+public struct ForeignTile: Sendable {
+    /// Page size in points.
+    public let size: CGSize
+    /// Draws the page into a context whose user space has its origin bottom left and measures the page in points; no
+    /// background.
+    public let draw: @Sendable (CGContext) -> Void
+    /// The page text and its word boxes (0…1, origin top left), for marks; asked only when a tile is marked.
+    public let text: @Sendable () -> (text: String, words: [OCRWord])
+
+    public init(size: CGSize, draw: @escaping @Sendable (CGContext) -> Void,
+                text: @escaping @Sendable () -> (text: String, words: [OCRWord])) {
+        self.size = size
+        self.draw = draw
+        self.text = text
+    }
 }
 
 extension ForeignPageProvider {
     /// Default: "" (the file's date and size alone identify its pages).
     public func contentVersion(_ url: URL) -> String { "" }
+
+    /// Default: no direct tile.
+    public func tile(_ ref: PageRef) -> ForeignTile? { nil }
 
     /// Default: the output page (`makePage`) in a new document; ignores `maxPixel`.
     public func pageDocument(_ ref: PageRef, maxPixel: Int?) -> PDFDocument? {

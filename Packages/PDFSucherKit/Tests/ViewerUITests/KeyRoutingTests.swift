@@ -106,15 +106,15 @@ struct KeyRoutingTests {
     /// Default: Tab and ⇧Tab go between the folder bar and the grid only.
     @Test func tabOrderDefaultTreeAndGrid() {
         #expect(KeyRouting.decide(key("tab"), in: context(focus: .grid, folderBar: true)) == .focusFolderTree)
-        #expect(KeyRouting.decide(key("tab", .shift), in: context(focus: .grid, folderBar: true)) == .focusFolderTree)
+        #expect(KeyRouting.decide(key("tab", .shift), in: context(focus: .grid, folderBar: true)) == .cycleLayout)
         let tree = context(focus: nil, responderTakesArrows: true, folderTree: true, folderBar: true)
         #expect(KeyRouting.decide(key("tab"), in: tree) == .moveFocus(.grid))
-        #expect(KeyRouting.decide(key("tab", .shift), in: tree) == .moveFocus(.grid))
+        #expect(KeyRouting.decide(key("tab", .shift), in: tree) == .cycleLayout)
         #expect(KeyRouting.decide(key("tab"), in: context(focus: nil, folderBar: true)) == .moveFocus(.grid), "nothing focused: the grid")
         // 1.3.5: SwiftUI still reports the grid while the folder list is first responder → the list counts.
         let stale = context(focus: .grid, responderTakesArrows: true, folderTree: true, folderBar: true)
         #expect(KeyRouting.decide(key("tab"), in: stale) == .moveFocus(.grid))
-        #expect(KeyRouting.decide(key("tab", .shift), in: stale) == .moveFocus(.grid))
+        #expect(KeyRouting.decide(key("tab", .shift), in: stale) == .cycleLayout)
         // Also with „Tippen sucht sofort“ off: the setting no longer decides the Tab order.
         #expect(KeyRouting.decide(key("tab"), in: context(typeToSearch: false, focus: .grid, folderBar: true)) == .focusFolderTree)
     }
@@ -128,27 +128,34 @@ struct KeyRoutingTests {
         #expect(KeyRouting.decide(key("tab"), in: c(.preview, false)) == .moveFocus(.search))
     }
 
-    @Test func shiftTabReverses() {
-        let c = { (f: FocusArea?, tree: Bool) in context(tabSearch: true, tabPreview: true, focus: f, folderTree: tree, folderBar: true) }
-        #expect(KeyRouting.decide(key("tab", .shift), in: c(.search, false)) == .moveFocus(.preview))
-        #expect(KeyRouting.decide(key("tab", .shift), in: c(.preview, false)) == .moveFocus(.grid))
-        #expect(KeyRouting.decide(key("tab", .shift), in: c(.grid, false)) == .focusFolderTree)
-        #expect(KeyRouting.decide(key("tab", .shift), in: c(nil, true)) == .moveFocus(.search))
+    /// 1.3.6 (Chris): ⇧Tab hides the folder bar, then the preview as well, then shows both again.
+    @Test func shiftTabCyclesTheLayout() {
+        #expect(KeyRouting.nextLayout(folderBar: true, preview: true) == (false, true))
+        #expect(KeyRouting.nextLayout(folderBar: false, preview: true) == (false, false))
+        #expect(KeyRouting.nextLayout(folderBar: false, preview: false) == (true, true))
+        #expect(KeyRouting.nextLayout(folderBar: true, preview: false) == (true, true))
+        #expect(KeyRouting.decide(key("tab", .shift), in: context(focus: .grid, fka: true)) == .passThrough, "keyboard navigation: system Tab")
+        // A hidden preview is no Tab stop, also not as the fallback with the folder bar hidden.
+        #expect(KeyRouting.tabStops(includesSearch: false, includesPreview: true, folderBarVisible: false, previewVisible: false) == [.grid])
+        var hidden = context(tabPreview: true, focus: .grid)
+        hidden.previewVisible = false
+        #expect(KeyRouting.decide(key("tab"), in: hidden) == .moveFocus(.grid))
     }
+
 
     @Test func tabFromSearchGoesToTheNextStop() {
         // In the cycle: on to the tree.
         #expect(KeyRouting.decide(key("tab"), in: context(tabSearch: true, focus: .search, folderBar: true)) == .focusFolderTree)
         // Not in the cycle (⌘F or a click put the focus there): on in the fixed order, ⇧Tab backwards.
         #expect(KeyRouting.decide(key("tab"), in: context(focus: .search, folderBar: true)) == .focusFolderTree)
-        #expect(KeyRouting.decide(key("tab", .shift), in: context(focus: .search, folderBar: true)) == .moveFocus(.grid))
+        #expect(KeyRouting.decide(key("tab", .shift), in: context(focus: .search, folderBar: true)) == .cycleLayout)
         #expect(KeyRouting.decide(key("tab"), in: context(focus: .search)) == .moveFocus(.grid))
     }
 
     /// A click into the preview, which is not in the cycle: Tab goes on to the next stop after it.
     @Test func focusOutsideTheCycle() {
         #expect(KeyRouting.decide(key("tab"), in: context(focus: .preview, folderBar: true)) == .focusFolderTree)
-        #expect(KeyRouting.decide(key("tab", .shift), in: context(focus: .preview, folderBar: true)) == .moveFocus(.grid))
+        #expect(KeyRouting.decide(key("tab", .shift), in: context(focus: .preview, folderBar: true)) == .cycleLayout)
         #expect(KeyRouting.decide(key("tab"), in: context(tabSearch: true, focus: .preview, folderBar: true)) == .moveFocus(.search))
     }
 
@@ -156,7 +163,7 @@ struct KeyRoutingTests {
     @Test func folderBarHiddenFallsBackToThePreview() {
         #expect(KeyRouting.decide(key("tab"), in: context(focus: .grid)) == .moveFocus(.preview))
         #expect(KeyRouting.decide(key("tab"), in: context(focus: .preview)) == .moveFocus(.grid))
-        #expect(KeyRouting.decide(key("tab", .shift), in: context(focus: .grid)) == .moveFocus(.preview))
+        #expect(KeyRouting.decide(key("tab", .shift), in: context(focus: .grid)) == .cycleLayout)
         #expect(KeyRouting.decide(key("tab"), in: context(focus: nil)) == .moveFocus(.grid))
         // Search switched on: Suchfeld ↔ Kacheln, the preview stays out.
         #expect(KeyRouting.decide(key("tab"), in: context(tabSearch: true, focus: .grid)) == .moveFocus(.search))
@@ -249,10 +256,10 @@ struct KeyRoutingTests {
     /// With the preview switched on, the tree is in the cycle: Ordner → Kacheln → Vorschau → Ordner.
     @Test func tabCycleIncludesTheTree() {
         #expect(KeyRouting.decide(key("tab"), in: context(tabPreview: true, focus: .preview, folderBar: true)) == .focusFolderTree)
-        #expect(KeyRouting.decide(key("tab", .shift), in: context(tabPreview: true, focus: .grid, folderBar: true)) == .focusFolderTree)
+        #expect(KeyRouting.decide(key("tab", .shift), in: context(tabPreview: true, focus: .grid, folderBar: true)) == .cycleLayout)
         let tree = context(tabPreview: true, focus: nil, responderTakesArrows: true, folderTree: true, folderBar: true)
         #expect(KeyRouting.decide(key("tab"), in: tree) == .moveFocus(.grid))
-        #expect(KeyRouting.decide(key("tab", .shift), in: tree) == .moveFocus(.preview))
+        #expect(KeyRouting.decide(key("tab", .shift), in: tree) == .cycleLayout)
     }
 
     /// Arrows with modifiers keep their text meaning in the field (⇧← selects, ⌘→ goes to the end).

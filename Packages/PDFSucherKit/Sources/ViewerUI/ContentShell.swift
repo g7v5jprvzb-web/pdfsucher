@@ -63,7 +63,11 @@ public struct ContentShell: View {
                 VStack(spacing: 0) {
                     FolderFilterHeader(model: model)
                     // The divider position is remembered per preview position (1.2.1 §2).
-                    PreviewSplit(position: model.settings.previewPosition, settings: model.settings, zoom: model.previewZoom) { preview } grid: { grid }
+                    if model.settings.previewHidden {
+                        grid                                // ⇧Tab hid the large preview (1.3.6)
+                    } else {
+                        PreviewSplit(position: model.settings.previewPosition, settings: model.settings, zoom: model.previewZoom) { preview } grid: { grid }
+                    }
                 }
             }
             Divider()
@@ -86,6 +90,11 @@ public struct ContentShell: View {
         .onChange(of: model.settings.previewPosition) { _, _ in
             let area = lastFocus
             Task { @MainActor in focus = area }      // after the rebuilt views are in the window
+        }
+        // ⇧Tab's layout cycle rebuilds the grid without the preview (1.3.6): give it its focus back.
+        .onChange(of: model.settings.previewHidden) { _, _ in
+            let area = lastFocus
+            Task { @MainActor in focus = area }
         }
         .background(KeyRouterInstaller(model: model, search: searchHandle,
                                        focus: { focus }, setFocus: { area in if area != .search { focus = area } }))
