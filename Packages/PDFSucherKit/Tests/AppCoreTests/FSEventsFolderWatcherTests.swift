@@ -14,7 +14,7 @@ struct FSEventsFolderWatcherTests {
     /// Waits up to `seconds` for a report; nil when none came.
     func nextReport(_ watcher: FSEventsFolderWatcher, seconds: Double = 8, after change: () throws -> Void) async rethrows -> [String]? {
         var got: [String]?
-        watcher.onChange = { roots, _ in got = roots }
+        watcher.onChange = { roots, _, _ in got = roots }
         try change()
         let end = ContinuousClock.now + .seconds(seconds)
         while got == nil, ContinuousClock.now < end { try? await Task.sleep(for: .milliseconds(50)) }
@@ -109,7 +109,7 @@ struct FSEventsFolderWatcherTests {
         let watcher = FSEventsFolderWatcher(latency: 0.1, retryDelays: [.milliseconds(50), .milliseconds(100), .milliseconds(200)],
                                             createStream: flaky.create)
         var catchUp: [String]?
-        watcher.onChange = { roots, _ in catchUp = roots }
+        watcher.onChange = { roots, _, _ in catchUp = roots }
         watcher.watch([root.standardizedFileURL.path], includeImages: true)
         #expect(!watcher.isWatching)
         await waitUntil(3) { watcher.isWatching && catchUp != nil }
@@ -170,6 +170,19 @@ struct FSEventsFolderWatcherTests {
         #expect(filter.changedRoots([("/q/Belege/a/b.PDF", file)]) == ["/q/Belege"])
         #expect(filter.changedRoots([("/q/Belege/scan.heic", file)]) == ["/q/Belege"])
         #expect(filter.changedRoots([("/q/Akten/x.pdf", file), ("/q/Belege/y.pdf", file)]) == ["/q/Akten", "/q/Belege"])
+    }
+
+    /// 1.4.0 P3: the folders to scan again per root; a change directly in the root or lost events: the whole root.
+    @Test func filterNamesTheChangedFolders() {
+        let filter = EventFilter(isHidden: { _ in false })
+        filter.setRoots(["/q/Akten", "/q/Belege"], resolve: { $0 })
+        let lost = FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs)
+        #expect(filter.changedScopes([("/q/Akten/2025/Mai/x.pdf", file), ("/q/Akten/2025/y.pdf", file),
+                                      ("/q/Akten/Alt/Verträge", dir)]) == ["/q/Akten": ["2025", "Alt"]])
+        #expect(filter.changedScopes([("/q/Akten/x.pdf", file)]) == [:], "directly in the root: full scan")
+        #expect(filter.changedScopes([("/q/Belege/a/b.pdf", file), ("/q/Akten/a/c.pdf", file)]) == ["/q/Akten": ["a"], "/q/Belege": ["a"]])
+        #expect(filter.changedScopes([("/q/Akten/a/b.pdf", file), ("/q/Akten/a", lost)]) == [:], "lost events: full scan")
+        #expect(filter.changedScopes([("/q/Akten/a/notiz.txt", file)]) == [:], "nothing relevant")
     }
 
     @Test func filterDropsOtherFilesDotFoldersAndPrefixLookalikes() {

@@ -7,12 +7,20 @@ public struct ScannedFile: Sendable, Equatable {
     public let url: URL
     public let fileSize: Int64
     public let modifiedAt: Date
+    /// 1.4.0 P4: „<volume UUID>/<file id>“ of the file on disk (stays with the file when it is moved or renamed on
+    /// its volume); nil when unknown. Not part of equality (a scan compares by path, size and date).
+    public var fileID: String?
 
-    public init(relativePath: String, url: URL, fileSize: Int64, modifiedAt: Date) {
+    public init(relativePath: String, url: URL, fileSize: Int64, modifiedAt: Date, fileID: String? = nil) {
         self.relativePath = relativePath
         self.url = url
         self.fileSize = fileSize
         self.modifiedAt = modifiedAt
+        self.fileID = fileID
+    }
+
+    public static func == (a: ScannedFile, b: ScannedFile) -> Bool {
+        a.relativePath == b.relativePath && a.url == b.url && a.fileSize == b.fileSize && a.modifiedAt == b.modifiedAt
     }
 
     /// `.pdf`, `.image`, `.word` or `.powerpoint` by file extension (anything else counts as PDF, as before 1.2).
@@ -36,6 +44,8 @@ public struct StoredDocument: Sendable, Equatable {
     /// Layout renderer of an Office document (`quicklook`, `textkit`, ...); nil until laid out and for other kinds.
     public let renderer: String?
     public let layoutVersion: Int?
+    /// 1.4.0 P4: the file identity stored with it (`ScannedFile.fileID`), nil for documents stored before.
+    public var fileID: String?
 
     public init(id: Int64, relativePath: String, fileSize: Int64, modifiedAt: Date, pageCount: Int, status: DocumentStatus,
                 kind: DocumentKind = .pdf, renderer: String? = nil, layoutVersion: Int? = nil) {
@@ -221,6 +231,8 @@ public enum IndexPhase: String, Sendable {
     case layout
     /// Phase 2: text recognition of scan pages and images, counted in pages.
     case ocr
+    /// After phase 1 (1.3.12): the trigram index („Wortteil-Index“) of the pages phase 1 stored, counted in pages.
+    case wordParts
 }
 
 public struct IndexProgress: Sendable, Equatable {
@@ -293,6 +305,9 @@ public struct LayoutCounts: Sendable, Equatable {
 
 public struct IndexReport: Sendable, Equatable {
     public var added = 0, updated = 0, removed = 0, unchanged = 0
+    /// 1.4.0 P4: files found under a new path (moved or renamed on their volume) whose stored entry was moved along
+    /// instead of reading them again; they are counted in neither `added` nor `removed`.
+    public var moved = 0
     /// Phase 1: files whose text could not be read.
     public var failed: [String] = []
     /// Phase 1: files without any text and nothing waiting for OCR or layout.

@@ -397,4 +397,13 @@ struct SlideCacheTests {
         #expect(cache.slideCount(for: k) == 1)
         #expect(try folderDate(k) == before)
     }
+
+    /// 1.3.10: settings „Speicher“ shows the cache's size; empty after `clear`.
+    @Test func byteCountFollowsStoreAndClear() throws {
+        #expect(cache.byteCount == 0)
+        try cache.store([makeImage(width: 400, height: 300)], for: key())
+        #expect(cache.byteCount > 0)
+        try cache.clear()
+        #expect(cache.byteCount == 0)
+    }
 }

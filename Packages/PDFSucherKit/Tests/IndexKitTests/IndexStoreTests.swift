@@ -120,6 +120,7 @@ struct IndexStoreTests {
     @Test func trigramFindsInfix() throws {
         try withStore { _, store throws in
             try store.upsert(file("a.pdf"), pages: [PageText(pageIndex: 0, text: "Vertragsende")], status: .ok)
+            try store.fillTrigramIndex(maxPages: 1_000)          // schema 4: phase-1 pages wait for the trigram index
             #expect(try store.match("\"trag\"", in: .trigram).count == 1)
             #expect(try store.match("\"trag\"", in: .words).isEmpty)
             #expect(try store.match("\"ANDERUNG\"", in: .trigram).isEmpty)
@@ -159,6 +160,7 @@ struct IndexStoreTests {
             try store.upsert(file("a.pdf"), pages: [PageText(pageIndex: 0, text: "alter Inhalt")], status: .ok)
             let firstId = try store.documents().first?.id
             try store.upsert(file("a.pdf", size: 200), pages: [PageText(pageIndex: 0, text: "neuer Text")], status: .ok)
+            try store.fillTrigramIndex(maxPages: 1_000)
             #expect(try store.match("alter", in: .words).isEmpty)
             #expect(try store.match("\"alt\"", in: .trigram).isEmpty)
             #expect(try store.match("neuer", in: .words).count == 1)
@@ -171,8 +173,10 @@ struct IndexStoreTests {
     }
 
     /// FTS5 integrity check against the content table: catches stale or missing FTS rows,
-    /// which a JOIN with page_text would hide.
-    private func expectFTSIntact(_ url: URL) throws {
+    /// which a JOIN with page_text would hide. Schema 4: the trigram index holds every page only once the waiting ones
+    /// are moved in, so they are moved first (a page indexed twice or a wrong delete would still show).
+    private func expectFTSIntact(_ url: URL, _ store: IndexStore) throws {
+        while try store.fillTrigramIndex(maxPages: 1_000) > 0 {}
         let raw = try SQLiteConnection(path: url.path)
         for table in ["pages_words", "pages_trigram"] {
             #expect(throws: Never.self) {
@@ -185,13 +189,13 @@ struct IndexStoreTests {
         try withStore { url, store throws in
             try store.upsert(file("a.pdf"), pages: [PageText(pageIndex: 0, text: "eins zwei"), PageText(pageIndex: 1, text: "drei")], status: .ok)
             try store.upsert(file("b.pdf"), pages: [PageText(pageIndex: 0, text: "vier")], status: .ok)
-            try expectFTSIntact(url)
+            try expectFTSIntact(url, store)
             try store.upsert(file("a.pdf", size: 1), pages: [PageText(pageIndex: 0, text: "fünf")], status: .ok)
-            try expectFTSIntact(url)
+            try expectFTSIntact(url, store)
             try store.remove(relativePaths: ["b.pdf"])
-            try expectFTSIntact(url)
+            try expectFTSIntact(url, store)
             try store.deleteIndex()
-            try expectFTSIntact(url)
+            try expectFTSIntact(url, store)
         }
     }
 

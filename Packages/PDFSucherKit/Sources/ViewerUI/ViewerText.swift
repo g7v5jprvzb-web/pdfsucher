@@ -36,6 +36,8 @@ public enum ViewerText {
         case .layingOut(let folder, let folders, let done, let total):
             folders > 1 ? "Word/PowerPoint Ordner \(folder)/\(folders): \(number(done))/\(number(total))"
                         : "Word/PowerPoint \(number(done))/\(number(total))"
+        case .preparingWordParts(let folder, let folders, let done, let total):
+            (folders > 1 ? "Ordner \(folder)/\(folders): " : "") + "Wortteil-Suche wird vorbereitet … (\(percent(done, total)) %)"
         case .upToDate: "Index: aktuell"
         case .problems(let failed, let noText):
             "Index: aktuell" + (failed.isEmpty ? "" : " · " + files(failed.count) + " nicht lesbar")
@@ -43,6 +45,11 @@ public enum ViewerText {
         case .unreachable: "Ordner nicht erreichbar · Suche im gespeicherten Index"
         }
     }
+
+    static func percent(_ done: Int, _ total: Int) -> Int { total > 0 ? min(100, done * 100 / total) : 0 }
+
+    /// Behind the summary of a search for word parts (`*ab*`, `*ab`) while the Wortteil-Index is being built (1.3.12).
+    public static let wordPartsSlow = "Wortteil-Suche kann gerade langsamer sein"
 
     static func files(_ n: Int) -> String { n == 1 ? "1 Datei" : "\(number(n)) Dateien" }
 
@@ -119,7 +126,8 @@ public enum ViewerText {
     static let allSources = "Alle Quellen"
     static let revealInFinder = "Im Finder zeigen"
     static let removeAsSource = "Als Quelle entfernen"
-    static let rebuildIndex = "Index neu aufbauen"
+    /// Ordnerleiste and „Quellen (n)“: deletes the folder's index after asking, then indexes again.
+    static let rebuildIndex = "Index löschen und neu aufbauen …"
     static let clearFolderFilter = "Ordnerfilter aufheben"
     static let showFolderBar = "Ordnerleiste einblenden"
     static let hideFolderBar = "Ordnerleiste ausblenden"

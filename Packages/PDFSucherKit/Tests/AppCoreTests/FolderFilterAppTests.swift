@@ -109,26 +109,28 @@ struct FolderFilterAppTests {
         #expect(m.folderFilter.folders == [akten.appendingPathComponent("Verträge").standardizedFileURL])
     }
 
-    @Test func placeOutsideAsksThenLoadsAndFilters() async {
+    /// 1.4.0 P2: with „Fragen“ a place outside the sources is added at once (no sheet), then filtered to.
+    @Test func placeOutsideLoadsAtOnceAndFilters() async {
         let other = FakeIndex()
         other.browseList = [entry("q.pdf", in: belege)]
         let m = model(["Akten": akteIndex(), "Belege": other])
         await m.add([akten])
         await m.waitUntilIdle()
         await m.openPlace(belege)
-        #expect(m.addPrompt != nil, "the add prompt of 1.2.1")
-        m.answerAddPrompt(.add, remember: false)
+        #expect(m.addPrompt == nil, "no add prompt for a place since 1.4.0")
         await m.waitUntilIdle()
         #expect(m.sources.map(\.url.lastPathComponent) == ["Akten", "Belege"])
         #expect(m.folderFilter.folders == [belege.standardizedFileURL])
         #expect(names(m) == ["q.pdf"])
     }
 
-    @Test func cancelledPlaceChangesNothing() async {
+    /// A drop still asks (1.2.1); cancelling it changes nothing (a place no longer asks since 1.4.0).
+    @Test func cancelledDropChangesNothing() async {
         let m = model(["Akten": akteIndex(), "Belege": FakeIndex()])
         await m.add([akten])
         await m.waitUntilIdle()
-        await m.openPlace(belege)
+        await m.requestAdd([belege])
+        #expect(m.addPrompt != nil)
         m.answerAddPrompt(.cancel, remember: false)
         await m.waitUntilIdle()
         #expect(m.folderFilter.isEmpty && m.sources.count == 1)

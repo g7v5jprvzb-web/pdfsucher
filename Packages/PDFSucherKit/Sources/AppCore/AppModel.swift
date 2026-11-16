@@ -50,7 +50,12 @@ import ViewerUI
     /// Ordnerleiste: folders of the sources (from the document list) and the chosen folders.
     public internal(set) var folderTree: [FolderNode] = []
     public var folderFilter = FolderFilter() {
-        didSet { if folderFilter != oldValue { publishFiltered(keepFocus: false) } }
+        didSet {
+            if folderFilter != oldValue {
+                publishFiltered(keepFocus: false)
+                updateWorkPriority()
+            }
+        }
     }
     public let folderBar: FolderBarSettings
     /// Further filters on the grid, combined with the folder filter and the file types (AND).
@@ -62,7 +67,7 @@ import ViewerUI
     /// Watches the folder sources on disk (FSEvents in the app; nil in tests unless a fake is set).
     @ObservationIgnored public var folderWatcher: (any FolderWatching)? {
         didSet {
-            folderWatcher?.onChange = { [weak self] roots, urgent in self?.foldersChangedOnDisk(roots, urgent: urgent) }
+            folderWatcher?.onChange = { [weak self] roots, urgent, scopes in self?.foldersChangedOnDisk(roots, urgent: urgent, scopes: scopes) }
             updateWatchedFolders()
         }
     }
@@ -119,6 +124,8 @@ import ViewerUI
     /// Tiles on disk of the window's grid (spec 1.2.4 §3: cleaned after indexing and „Index löschen“);
     /// the app sets it, tests leave it nil.
     public var tileDisk: TileDiskCache?
+    /// The folder of the index files (settings „Verwaiste Indexe“); the app sets it, UI tests and tests leave it nil.
+    public var indexDirectory: URL?
     /// The last search terms (1.2.2 §1).
     public let searchHistory: SearchHistory
     /// A finished search with hits is remembered after this pause without typing.
@@ -185,7 +192,7 @@ import ViewerUI
 
     private var sourceList = SourceList()
     /// Index of every folder source, by standardized path.
-    @ObservationIgnored private var indexes: [String: any FolderIndexing] = [:]
+    @ObservationIgnored var indexes: [String: any FolderIndexing] = [:]   // internal: AppModel+Storage
     /// One search per single-PDF source (its page cache is per file), by path.
     @ObservationIgnored private var singleSearches: [String: SingleDocumentSearch] = [:]
     @ObservationIgnored private let defaults: UserDefaults
@@ -196,7 +203,7 @@ import ViewerUI
     /// Lays out Word/PowerPoint single files (in memory, spec 1.3).
     @ObservationIgnored private let officeLayout: any PageLayoutSource
     /// Rendered slides of PowerPoint files (one cache for all sources; tests pass their own).
-    @ObservationIgnored private let slideCache: SlideCache
+    @ObservationIgnored let slideCache: SlideCache   // internal: AppModel+Storage
     /// „PowerPoint-Darstellung“ / „Fehlende Schriften“ as the layout sources read it (1.3 Teil B Task 12).
     @ObservationIgnored private let officeRendering: PowerPointDisplaySetting
     @ObservationIgnored private var lastRendering = OfficeRendering.default
@@ -244,6 +251,13 @@ import ViewerUI
     /// Files whose missing slides or outdated index entry were already acted on, as "slides|…" / "index|…" with path
     /// and file version: at most once per file version and session (tiles report up to once a second).
     @ObservationIgnored private var requestedRelayouts: Set<String> = []
+    /// Measurement log (1.3.9): why each folder waits for phase 1, the trigger of sources being added, and the start of
+    /// the running queue step.
+    @ObservationIgnored private var metricsTriggers: [String: [String]] = [:]
+    @ObservationIgnored private var addTrigger = "added"
+    @ObservationIgnored private var metricsRunStart = ContinuousClock.now
+    /// The measurement log (tests use their own).
+    @ObservationIgnored var metrics: IndexMetrics = .shared
     /// Paths with a check queued or running (`checkOfficeFile`); further reports meanwhile are dropped.
     @ObservationIgnored private var checksQueued: Set<String> = []
     /// The last of those checks; each waits for the one before.
@@ -287,6 +301,13 @@ import ViewerUI
     /// Folders waiting for the phase „layout“ (Word/PowerPoint, spec 1.3), after every phase 1 and
     /// before any phase 2; only while „office.include“ is on.
     @ObservationIgnored private var layoutPending: [String] = []
+    /// Folders whose trigram index („Wortteil-Index“, 1.3.12) is filled after phase 1, before any folder layout and
+    /// recognition (decisions „index-speed-2“).
+    @ObservationIgnored private var wordPartsPending: [String] = []
+    /// 1.4.0 P3: folders changed on disk per source since its last phase 1, and sources that need a full scan anyway.
+    @ObservationIgnored private var diskScopes: [String: Set<String>] = [:]
+    @ObservationIgnored private var needsFullScan: Set<String> = []
+    @ObservationIgnored private var currentWordParts: Task<Result<Int, Error>, Never>?
     @ObservationIgnored private var currentLayout: Task<Result<LayoutReport, Error>, Never>?
     /// Word/PowerPoint single files by path (laid out in memory, kept for the session; 1.3 Teil B Task 5).
     @ObservationIgnored private var fileLayouts: [String: FileLayoutState] = [:]
@@ -296,7 +317,7 @@ import ViewerUI
     /// Throttles `layoutRevision` during a layout run (at most once a second).
     @ObservationIgnored private var layoutBumpTask: Task<Void, Never>?
     @ObservationIgnored private var lastLayoutBump = ContinuousClock.now - .seconds(1)
-    private enum Phase { case text, layout, ocr }
+    private enum Phase { case text, layout, ocr, wordParts }
     @ObservationIgnored private var currentPhase = Phase.text
     /// „Texterkennung anhalten“ until a new source, „neu ausführen“ or the next start.
     public private(set) var isRecognitionStopped = false
@@ -332,7 +353,7 @@ import ViewerUI
     @ObservationIgnored private var restoredSources = false
     /// Saved sources that were missing at launch: still remembered (an unplugged disk comes back next
     /// time) until „Alle entfernen“.
-    @ObservationIgnored private var rememberedMissing: [String] = []
+    @ObservationIgnored var rememberedMissing: [String] = []   // internal: AppModel+Storage
     @ObservationIgnored private var lastSort: SortMode
     @ObservationIgnored private var lastPartialWords: Bool
     @ObservationIgnored private var lastSearchFileNames: Bool
@@ -408,7 +429,8 @@ import ViewerUI
 
     /// Drop or ⌘O: adds at once without loaded sources or when nothing new would come in (the hints show);
     /// otherwise asks, or follows „Beim Hinzufügen von Quellen“.
-    func requestAdd(_ dropped: [URL]) async {
+    /// - Parameter fromPlace: a click on a folder of „Orte“ (1.4.0 P2): with „Fragen“ it is added without the sheet.
+    func requestAdd(_ dropped: [URL], fromPlace: Bool = false) async {
         // A drop while the prompt is open joins it (review I1); the sheet stays the same.
         let openPrompt = addPrompt?.id
         let urls = openPrompt == nil ? dropped : pendingAddURLs + dropped
@@ -425,6 +447,8 @@ import ViewerUI
         switch settings.addSourcesPolicy {
         case .add: await add(urls)
         case .replace: await replaceSources(with: urls)
+        case .ask where fromPlace:
+            await add(urls)                     // 1.4.0 P2: a click on a place means „this one too“ (decisions)
         case .ask:
             pendingAddURLs = urls
             addPrompt = AddPrompt(newItems: newItems.map(\.url.lastPathComponent), existing: loaded, id: openPrompt ?? UUID())
@@ -455,6 +479,8 @@ import ViewerUI
         let previous = sourceList.items.map(\.url)
         let previousMissing = rememberedMissing
         let previousSelection = selection
+        addTrigger = "replace"
+        defer { addTrigger = "added" }
         removeAllSources()
         await add(urls)
         guard !sourceList.items.isEmpty else {
@@ -535,6 +561,7 @@ import ViewerUI
         let path = LoadedSourceRef(url: url, isFolder: true).url.path
         guard sourceList.remove(url) else { return }
         clearTransientNotice()
+        logSourceRemoved(path, isFolder: indexes[path] != nil, reason: "user")
         forget(path)
         persistSources()
         updateIndexStatus()
@@ -547,6 +574,9 @@ import ViewerUI
         generation += 1
         openRequest += 1
         cancelQueue()
+        for item in sourceList.items {
+            logSourceRemoved(item.url.path, isFolder: item.isFolder, reason: addTrigger == "replace" ? "replace" : "remove_all")
+        }
         resetSources()
         rememberedMissing.removeAll()
         persistSources()
@@ -578,7 +608,9 @@ import ViewerUI
         guard token == generation else { return }   // a newer open came in while we waited
         resetSources()
         noticeKind = nil
+        addTrigger = "open"
         insert(LoadedSourceRef(url: root, isFolder: true), index: index)
+        addTrigger = "added"
         startQueueIfNeeded()
         scheduleSearch(debounced: false)
     }
@@ -612,7 +644,9 @@ import ViewerUI
             urls.filter { !FileManager.default.fileExists(atPath: $0.path) }
         }.value
         guard token == generation else { return }
+        addTrigger = "launch_restore"
         let failed = await add(urls.filter { !missing.contains($0) })
+        addTrigger = "added"
         guard token == generation else { return }       // „Alle entfernen“ or another open meanwhile
         // Folders whose index cannot be opened now stay remembered like missing ones.
         rememberedMissing = missing.map(\.path) + failed.map(\.standardizedFileURL.path)
@@ -642,9 +676,18 @@ import ViewerUI
     /// Adds a checked source (and drops the loaded sources it replaces).
     private func insert(_ source: LoadedSourceRef, index: (any FolderIndexing)?) {
         let result = sourceList.add([source])
-        for replaced in result.replaced { forget(replaced.url.path) }
+        for replaced in result.replaced {
+            logSourceReplaced(replaced.url.path, by: source.url.path)
+            forget(replaced.url.path)
+        }
         guard !result.added.isEmpty else { return }
         let path = source.url.path
+        let trigger = result.replaced.isEmpty ? addTrigger : "replaced_by_parent"
+        if metrics.isEnabled {
+            metrics.log("source_added", ["source": IndexMetrics.hash(path: path), "depth": source.url.pathComponents.count - 1,
+                                                     "folder": source.isFolder, "ext": source.isFolder ? "" : source.url.pathExtension.lowercased(),
+                                                     "trigger": trigger, "replaces": result.replaced.count])
+        }
         if let index {
             index.configure(currentOCRSettings, includeOffice: officePreferences.includeOffice)
             indexes[path] = index
@@ -654,14 +697,15 @@ import ViewerUI
             }
             pending.removeAll { $0 == path }
             recognitionStopped = false              // a new source resumes a stopped recognition
-            enqueueIndexing(path)
+            updateWorkPriority()                     // a filter chosen before (a place clicked) applies at once
+            enqueueIndexing(path, trigger: trigger)
         } else if let kind = SingleFileLayout.officeKind(source.url) {
             // Word/PowerPoint: laid out in memory, never recognized. It goes first (behind other single files)
             // and pre-empts a folder's recognition or layout, which resumes afterwards where it stopped.
             fileLayouts[path] = .pending
             singleSearches[path] = SingleFileLayout.search(source.url, kind: kind, state: .pending)
             if let current = currentFolder, indexes[current] != nil {
-                if currentPhase == .ocr { preemptRecognition() } else if currentPhase == .layout { preemptLayout() }
+                if currentPhase == .ocr { preemptRecognition(reason: "single_file") } else if currentPhase == .layout { preemptLayout(reason: "single_file") } else if currentPhase == .wordParts { preemptWordParts(reason: "single_file") }
             }
             enqueueFileLayout(path)
         } else {
@@ -675,7 +719,7 @@ import ViewerUI
             // Also a folder's layout (core review I3): a dropped scan must not wait for all of the Office files.
             // With recognition off it has nothing to do: nothing is stopped for it.
             if canRecognize, let current = currentFolder, indexes[current] != nil {
-                if currentPhase == .ocr { preemptRecognition() } else if currentPhase == .layout { preemptLayout() }
+                if currentPhase == .ocr { preemptRecognition(reason: "single_file") } else if currentPhase == .layout { preemptLayout(reason: "single_file") } else if currentPhase == .wordParts { preemptWordParts(reason: "single_file") }
             }
             recognitionPending.removeAll { $0 == path }
             // After the single files already at the front: files dropped together keep their order.
@@ -688,6 +732,7 @@ import ViewerUI
 
     /// Drops everything kept for a source that is no longer loaded; its indexing stops.
     private func forget(_ path: String) {
+        metricsTriggers[path] = nil
         indexes[path] = nil
         singleSearches[path] = nil
         fileOCR[path] = nil
@@ -702,6 +747,9 @@ import ViewerUI
         recognitionPending.removeAll { $0 == path }
         ocrReports[path] = nil
         layoutPending.removeAll { $0 == path }
+        wordPartsPending.removeAll { $0 == path }
+        diskScopes[path] = nil
+        needsFullScan.remove(path)
         layoutReports[path] = nil
         fileLayouts[path] = nil
         layoutAgain.remove(path)
@@ -716,6 +764,8 @@ import ViewerUI
             currentFileLayout = nil
             currentRecognition?.cancel()
             currentRecognition = nil
+            currentWordParts?.cancel()
+            currentWordParts = nil
             currentFolder = nil
             indexRun += 1
         }
@@ -744,6 +794,9 @@ import ViewerUI
         recognitionPending.removeAll()
         ocrReports.removeAll()
         layoutPending.removeAll()
+        wordPartsPending.removeAll()
+        diskScopes.removeAll()
+        needsFullScan.removeAll()
         layoutReports.removeAll()
         fileLayouts.removeAll()
         fileOCR.removeAll()
@@ -816,7 +869,7 @@ import ViewerUI
         guard token == generation else { return }   // other sources are loaded now: no re-index here
         for (path, _) in targets {
             restartedAfterDamage.remove(path)        // a fresh index may be rebuilt again after damage
-            if indexes[path] != nil { enqueueIndexing(path) }
+            if indexes[path] != nil { enqueueIndexing(path, trigger: "delete_index_rebuild") }
         }
         startQueueIfNeeded()
         scheduleSearch(debounced: false)
@@ -844,6 +897,8 @@ import ViewerUI
                 if !recognitionPending.contains(current) { recognitionPending.insert(current, at: 0) }
             } else if currentPhase == .layout {
                 if !layoutPending.contains(current) { layoutPending.insert(current, at: 0) }
+            } else if currentPhase == .wordParts {
+                if !wordPartsPending.contains(current) { wordPartsPending.insert(current, at: 0) }
             } else if !pending.contains(current) {
                 pending.insert(current, at: 0)
             }
@@ -855,19 +910,35 @@ import ViewerUI
 
     /// Phase 1 for `path` (new folder, re-index): a running text recognition or layout makes way (spec 1.2: new
     /// files must not wait behind a long recognition; finished pages are kept, the folder continues later).
-    private func enqueueIndexing(_ path: String) {
+    private func enqueueIndexing(_ path: String, trigger: String) {
         if !pending.contains(path) { pending.append(path) }
-        preemptRecognition()
-        preemptLayout()
+        if trigger != "disk_change" { needsFullScan.insert(path) }        // P3: only a plain disk change may be scoped
+        if metrics.isEnabled, metricsTriggers[path]?.contains(trigger) != true {
+            metricsTriggers[path, default: []].append(trigger)
+        }
+        preemptRecognition(reason: trigger)
+        preemptLayout(reason: trigger)
+        preemptWordParts(reason: trigger)
+    }
+
+    /// A running „Wortteil-Index“ step stops after its current transaction (nothing moved is lost); the folder goes back
+    /// to the front of `wordPartsPending`.
+    private func preemptWordParts(reason: String) {
+        guard currentPhase == .wordParts, let current = currentFolder, indexes[current] != nil else { return }
+        logPreempt(current, phase: "wordparts", reason: reason)
+        if !wordPartsPending.contains(current) { wordPartsPending.insert(current, at: 0) }
+        currentWordParts?.cancel()
     }
 
     /// A running folder layout stops (documents already stored stay) and the folder goes back to the front of
     /// `layoutPending`.
     /// A single file's layout is not pre-empted (it is short and was asked for).
-    private func preemptLayout() {
-        guard currentPhase == .layout, let current = currentFolder, indexes[current] != nil else { return }
+    private func preemptLayout(reason: String) {
+        guard currentPhase == .layout, let current = currentFolder, let index = indexes[current] else { return }
+        logPreempt(current, phase: "layout", reason: reason)
         if !layoutPending.contains(current) { layoutPending.insert(current, at: 0) }
-        currentLayout?.cancel()
+        // 1.4.0 P3: for a change on disk the files being laid out are finished and kept; phase 1 follows right after.
+        if reason == "disk_change" { index.stopLayoutGently() } else { currentLayout?.cancel() }
     }
 
     /// Each folder's last stored layout report (tests).
@@ -880,17 +951,27 @@ import ViewerUI
     /// change after an add or launch is indexed at once); a report while it cools, waits in
     /// the queue or is being indexed (phase 1) waits for one trailing run (re-review: counted from the end,
     /// so a run longer than the cooldown is not followed at once by the next).
-    func foldersChangedOnDisk(_ roots: [String], urgent: Bool = false) {
+    ///
+    /// `scopes` (1.4.0 P3): the changed folders per root from the watcher; a root without an entry is scanned whole. nil:
+    /// nothing new is known (a held-back report runs now), what was collected stays.
+    func foldersChangedOnDisk(_ roots: [String], urgent: Bool = false, scopes: [String: [String]]? = [:]) {
         let now = ContinuousClock.now
         var any = false
         for root in roots {
             let path = URL(fileURLWithPath: root).standardizedFileURL.path
             guard indexes[path] != nil else { continue }
             changedOnDisk.insert(path)
+            if let scopes {
+                if !urgent, let changed = scopes[root] ?? scopes[path] {
+                    diskScopes[path, default: []].formUnion(changed)
+                } else {
+                    needsFullScan.insert(path)
+                }
+            }
             if pending.contains(path) { continue }                       // its run has not started: it sees this
             if urgent {
                 diskChangeDue.remove(path)
-                enqueueIndexing(path)
+                enqueueIndexing(path, trigger: "urgent_disk_change")
                 any = true
                 continue
             }
@@ -900,7 +981,7 @@ import ViewerUI
                 continue
             }
             diskChangeDue.remove(path)
-            enqueueIndexing(path)
+            enqueueIndexing(path, trigger: "disk_change")
             any = true
         }
         scheduleDiskChanges()
@@ -920,7 +1001,7 @@ import ViewerUI
             self.diskChangeTask = nil
             let waiting = self.diskChangeDue
             self.diskChangeDue = []
-            self.foldersChangedOnDisk(waiting.sorted())                   // still cooling ones wait again
+            self.foldersChangedOnDisk(waiting.sorted(), scopes: nil)      // still cooling ones wait again; scopes stay
         }
     }
 
@@ -931,8 +1012,9 @@ import ViewerUI
     /// Pending recognitions in queue order (tests).
     var recognitionQueueForTesting: [String] { recognitionPending }
 
-    private func preemptRecognition() {
+    private func preemptRecognition(reason: String) {
         guard currentPhase == .ocr, let current = currentFolder else { return }
+        logPreempt(current, phase: "ocr", reason: reason)
         if !recognitionPending.contains(current) { recognitionPending.insert(current, at: 0) }
         currentRecognition?.cancel()
     }
@@ -954,7 +1036,7 @@ import ViewerUI
         lastIncludeOffice = includeOffice
         for (_, index) in indexes { index.configure(now, includeOffice: includeOffice) }
         if rescan {
-            for url in folderSources { enqueueIndexing(url.path) }
+            for url in folderSources { enqueueIndexing(url.path, trigger: "settings_change") }
             updateWatchedFolders()
         }
         if !includeOffice {
@@ -965,7 +1047,7 @@ import ViewerUI
             layoutReports.removeAll()
         }
         if ocrChanged {               // the Office switch alone leaves a stopped recognition stopped
-            if !now.recognizeText { preemptRecognition() } else { recognitionStopped = false }   // on again: resume after ✕
+            if !now.recognizeText { preemptRecognition(reason: "settings_change") } else { recognitionStopped = false }   // on again: resume after ✕
         }
         startQueueIfNeeded()
         updateIndexStatus()
@@ -987,7 +1069,7 @@ import ViewerUI
             recognitionStopped = false
             if currentFolder == path, currentPhase == .ocr {
                 // The running recognition fetched its pages before the reset: start it again.
-                preemptRecognition()
+                preemptRecognition(reason: "rerun_ocr")
             } else {
                 recognitionPending.removeAll { $0 == path }
                 recognitionPending.insert(path, at: 0)
@@ -1060,12 +1142,13 @@ import ViewerUI
     /// Status ✕ „Texterkennung anhalten“: stops phase 2 until a new source, „neu ausführen“ or the next start.
     public func stopRecognition() {
         recognitionStopped = true
-        preemptRecognition()
+        preemptRecognition(reason: "user_stop")
         updateIndexStatus()
     }
 
     private var hasQueuedWork: Bool {
         pending.contains { indexes[$0] != nil }
+            || wordPartsPending.contains { indexes[$0] != nil }
             || (officePreferences.includeOffice && layoutPending.contains { indexes[$0] != nil })
             || layoutPending.contains(where: needsFileLayout)
             || (canRecognize && recognitionPending.contains(where: isLoaded))
@@ -1090,11 +1173,20 @@ import ViewerUI
                 } else if self.cacheJobs > 0, self.layoutWaiting {
                     // Slide-cache job running: only layout steps wait. A dropped scan is recognized meanwhile;
                     // otherwise sleep until the job ends or new work comes (`wakeQueue`), then look again.
-                    if let path = self.nextFileRecognition() { await self.recognizeFile(path) } else { await self.waitForWake() }
+                    if let path = self.nextFileRecognition() {
+                        await self.recognizeFile(path)
+                    } else if let path = self.nextWordParts() {
+                        await self.buildWordParts(path)
+                    } else {
+                        await self.waitForWake()
+                    }
                 } else if let path = self.nextFileLayout() {
                     await self.layoutFile(path)
                 } else if let path = self.nextFileRecognition() {
                     await self.recognizeFile(path)
+                } else if let path = self.nextWordParts() {
+                    // 1.3.12: after phase 1 of every folder and the single files, before folder layout and recognition.
+                    await self.buildWordParts(path)
                 } else if let path = self.nextLayout() {
                     await self.layoutFolder(path)
                 } else if let path = self.nextRecognition() {
@@ -1116,6 +1208,74 @@ import ViewerUI
             if indexes[path] != nil { return path }
         }
         return nil
+    }
+
+    private func nextWordParts() -> String? {
+        while let path = wordPartsPending.first {
+            wordPartsPending.removeFirst()
+            if indexes[path] != nil { return path }
+        }
+        return nil
+    }
+
+    /// Wortteil-Index (1.3.12) of one folder, cancellable after each transaction without losing what moved.
+    private func buildWordParts(_ path: String) async {
+        guard let index = indexes[path] else { return }
+        indexRun += 1
+        let run = indexRun
+        currentFolder = path
+        currentPhase = .wordParts
+        setPreparingWordParts(path, done: 0, total: 0)
+        let metricsRun = beginMetricsRun(path, phase: "wordparts")
+        let (stream, continuation) = AsyncStream.makeStream(of: IndexProgress.self, bufferingPolicy: .bufferingNewest(1))
+        let work = Task.detached(priority: .utility) { () -> Result<Int, Error> in
+            defer { continuation.finish() }
+            do {
+                return .success(try await IndexMetrics.$run.withValue(metricsRun.id) { try await index.buildWordParts { continuation.yield($0) } })
+            } catch { return .failure(error) }
+        }
+        currentWordParts = work
+        await withTaskCancellationHandler {
+            for await progress in stream where !Task.isCancelled {
+                guard self.indexRun == run, self.currentFolder == path else { continue }
+                self.setPreparingWordParts(path, done: progress.done, total: progress.total)
+            }
+        } onCancel: {
+            work.cancel()
+        }
+        let result = await work.value
+        endMetricsRun(metricsRun, path: path, phase: "wordparts", result: result.map { _ in () })
+        guard !Task.isCancelled, indexRun == run else { return }
+        currentFolder = nil
+        currentWordParts = nil
+        currentPhase = .text
+        guard indexes[path] != nil else { return }
+        switch result {
+        case .success:
+            wordPartsPending.removeAll { $0 == path }
+            if summaryStyle == .search { publishFiltered(keepFocus: true) }      // the „langsamer“ hint goes
+        case .failure(let error) where error is CancellationError:
+            break                                    // pre-empted: queued again already
+        case .failure(let error):
+            if case IndexStoreError.corruptIndexRebuilt = error, !restartedAfterDamage.contains(path) {
+                restartedAfterDamage.insert(path)
+                reports[path] = nil
+                ocrReports[path] = nil
+                layoutReports[path] = nil
+                setIndexProblem(path, .corruptIndex)
+                enqueueIndexing(path, trigger: "corrupt_rebuild")
+            } else {
+                // Searches stay complete (pages without trigram entries are scanned); the next phase 1 tries again.
+                Self.log.error("Wortteil-Index in \(path, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+            }
+        }
+    }
+
+    /// A search uses the trigram index (infix/suffix terms) while a folder's trigram index is still being built: it
+    /// scans the pages not in it yet, so it can be slower (1.3.12).
+    private var wordPartsBusy: Bool {
+        (currentPhase == .wordParts && currentFolder.map { indexes[$0] != nil } == true)
+            || wordPartsPending.contains { indexes[$0] != nil }
     }
 
     /// The next folder layout (single files are taken first by `nextFileLayout`).
@@ -1228,10 +1388,19 @@ import ViewerUI
         currentFolder = path
         currentPhase = .text
         setBuilding(path, done: 0, total: 0)
+        // P3: only the changed folders when nothing else asked for this run; otherwise (and when unsure) the whole tree.
+        let collected = diskScopes.removeValue(forKey: path)
+        let scopes: [String]? = needsFullScan.remove(path) == nil && sawChange ? collected.map { $0.sorted() } : nil
+        let metricsRun = beginMetricsRun(path, phase: "text", sawChange: sawChange, scopes: scopes?.count)
         let (stream, continuation) = AsyncStream.makeStream(of: IndexProgress.self, bufferingPolicy: .bufferingNewest(1))
         let work = Task.detached(priority: .utility) { () -> Result<IndexReport, Error> in
             defer { continuation.finish() }
-            do { return .success(try await index.update { continuation.yield($0) }) } catch { return .failure(error) }
+            do {
+                return .success(try await IndexMetrics.$run.withValue(metricsRun.id) {
+                    if let scopes { try await index.update(scopes: scopes) { continuation.yield($0) } }
+                    else { try await index.update { continuation.yield($0) } }
+                })
+            } catch { return .failure(error) }
         }
         currentWork = work
         await withTaskCancellationHandler {
@@ -1244,7 +1413,10 @@ import ViewerUI
             work.cancel()
         }
         let result = await work.value
+        endMetricsRun(metricsRun, path: path, phase: "text", result: result.map { _ in () })
+        if scopes != nil, case .failure = result { needsFullScan.insert(path) }      // what it did not finish: all again
         guard !Task.isCancelled, indexRun == run else {
+            if scopes != nil { needsFullScan.insert(path) }
             if sawChange, indexes[path] != nil { changedOnDisk.insert(path) }   // it runs again later
             return
         }
@@ -1262,10 +1434,13 @@ import ViewerUI
         currentFolder = path
         currentPhase = .ocr
         setRecognizing(path, done: 0, total: 0)
+        let metricsRun = beginMetricsRun(path, phase: "ocr")
         let (stream, continuation) = AsyncStream.makeStream(of: IndexProgress.self, bufferingPolicy: .bufferingNewest(1))
         let work = Task.detached(priority: .utility) { () -> Result<OCRReport, Error> in
             defer { continuation.finish() }
-            do { return .success(try await index.recognize { continuation.yield($0) }) } catch { return .failure(error) }
+            do {
+                return .success(try await IndexMetrics.$run.withValue(metricsRun.id) { try await index.recognize { continuation.yield($0) } })
+            } catch { return .failure(error) }
         }
         currentRecognition = work
         await withTaskCancellationHandler {
@@ -1277,6 +1452,7 @@ import ViewerUI
             work.cancel()
         }
         let result = await work.value
+        endMetricsRun(metricsRun, path: path, phase: "ocr", result: result.map { _ in () })
         guard !Task.isCancelled, indexRun == run else { return }
         currentFolder = nil
         currentRecognition = nil
@@ -1297,7 +1473,7 @@ import ViewerUI
                 ocrReports[path] = nil
                 layoutReports[path] = nil
                 setIndexProblem(path, .corruptIndex)
-                enqueueIndexing(path)
+                enqueueIndexing(path, trigger: "corrupt_rebuild")
             } else {
                 Self.log.error("Recognition in \(path, privacy: .public) failed: \(String(describing: error), privacy: .public)")
                 setIndexProblem(path, .indexFailed(error.localizedDescription))
@@ -1315,18 +1491,19 @@ import ViewerUI
         currentPhase = .layout
         layoutAgain.remove(path)                     // this run takes every document waiting now
         setLayingOut(path, done: 0, total: 0)
+        let metricsRun = beginMetricsRun(path, phase: "layout")
         let (stream, continuation) = AsyncStream.makeStream(of: IndexProgress.self, bufferingPolicy: .bufferingNewest(1))
         let startFonts = fontStarter(), office = officePreferences.includeOffice
         let work = Task.detached(priority: .utility) { () -> Result<LayoutReport, Error> in
             defer { continuation.finish() }
             do {
-                return .success(try await index.layOut { progress in
+                return .success(try await IndexMetrics.$run.withValue(metricsRun.id) { try await index.layOut { progress in
                     // The run's first progress counts its pending Word/PowerPoint documents, just before the layout
                     // source gets the first one: only then Office's fonts are needed (none for PDFs/images). The
                     // count has no kinds, so decks under Quick Look alone prewarm too (decisions „1.3.2“).
                     if office, progress.total > 0 { startFonts() }
                     continuation.yield(progress)
-                })
+                } })
             } catch { return .failure(error) }
         }
         currentLayout = work
@@ -1346,6 +1523,7 @@ import ViewerUI
             work.cancel()
         }
         let result = await work.value
+        endMetricsRun(metricsRun, path: path, phase: "layout", result: result.map { _ in () })
         bumpLayoutRevision()                         // what this run stored, also when it was stopped
         guard !Task.isCancelled, indexRun == run else { return }
         currentFolder = nil
@@ -1373,7 +1551,7 @@ import ViewerUI
                 ocrReports[path] = nil
                 layoutReports[path] = nil
                 setIndexProblem(path, .corruptIndex)
-                enqueueIndexing(path)
+                enqueueIndexing(path, trigger: "corrupt_rebuild")
             } else {
                 Self.log.error("Layout in \(path, privacy: .public) failed: \(String(describing: error), privacy: .public)")
                 setIndexProblem(path, .indexFailed(error.localizedDescription))
@@ -1554,10 +1732,67 @@ import ViewerUI
         indexStatus = .recognizing(folder: position, folders: max(folders.count, 1), done: done, total: total)
     }
 
+    private func setPreparingWordParts(_ path: String, done: Int, total: Int) {
+        let folders = folderSources.map(\.path)
+        let position = (folders.firstIndex(of: path) ?? 0) + 1
+        indexStatus = .preparingWordParts(folder: position, folders: max(folders.count, 1), done: done, total: total)
+    }
+
     private func setLayingOut(_ path: String, done: Int, total: Int) {
         let folders = folderSources.map(\.path)
         let position = (folders.firstIndex(of: path) ?? 0) + 1
         indexStatus = .layingOut(folder: position, folders: max(folders.count, 1), done: done, total: total)
+    }
+
+    // MARK: Measurement log (1.3.9)
+
+    private struct MetricsRun { let id: Int; let start: ContinuousClock.Instant }
+
+    /// `run_start` of one queue step; phase 1 takes the triggers collected since the folder was queued.
+    private func beginMetricsRun(_ path: String, phase: String, sawChange: Bool = false, scopes: Int? = nil) -> MetricsRun {
+        metricsRunStart = .now
+        var triggers = phase == "text" ? (metricsTriggers.removeValue(forKey: path) ?? []) : []
+        guard metrics.isEnabled else { return MetricsRun(id: 0, start: metricsRunStart) }
+        if sawChange, !triggers.contains(where: { $0.hasSuffix("disk_change") }) { triggers.append("disk_change") }
+        let run = metrics.nextRun()
+        metrics.log("run_start", ["run": run, "source": IndexMetrics.hash(path: path), "phase": phase,
+                                  "trigger": triggers.isEmpty ? (phase == "text" ? "unknown" : "queue") : triggers.joined(separator: "+"),
+                                  "pending": pending.count, "recognitionPending": recognitionPending.count, "scopes": scopes ?? 0,
+                                  "layoutPending": layoutPending.count])
+        return MetricsRun(id: run, start: metricsRunStart)
+    }
+
+    private func endMetricsRun(_ run: MetricsRun, path: String, phase: String, result: Result<Void, Error>) {
+        guard run.id > 0 else { return }
+        let outcome = switch result {
+        case .success: "ok"
+        case .failure(let error) where error is CancellationError: "cancelled"
+        case .failure: "failed"
+        }
+        metrics.log("run_end", ["run": run.id, "source": IndexMetrics.hash(path: path), "phase": phase,
+                                            "outcome": outcome, "ms": IndexMetrics.ms(since: run.start)])
+    }
+
+    /// A running layout or recognition makes way; `elapsed_ms` is how long the step had run.
+    private func logPreempt(_ path: String, phase: String, reason: String) {
+        metrics.log("preempt", ["source": IndexMetrics.hash(path: path), "phase": phase, "reason": reason,
+                                            "elapsed_ms": IndexMetrics.ms(since: metricsRunStart)])
+    }
+
+    private func logSourceRemoved(_ path: String, isFolder: Bool, reason: String) {
+        metrics.log("source_removed", ["source": IndexMetrics.hash(path: path), "folder": isFolder, "reason": reason])
+    }
+
+    /// A loaded child replaced by its parent folder: the documents of the child's index are indexed again for the parent
+    /// (counted off the main actor).
+    private func logSourceReplaced(_ old: String, by new: String) {
+        guard metrics.isEnabled else { return }
+        let index = indexes[old], metrics = metrics
+        Task.detached(priority: .utility) {
+            let documents = (try? index?.browse().count) ?? 0
+            metrics.log("source_replaced", ["source": IndexMetrics.hash(path: new), "old_source": IndexMetrics.hash(path: old),
+                                                        "old_documents": documents, "old_folder": index != nil])
+        }
     }
 
     private func finishIndexing(_ result: Result<IndexReport, Error>, path: String, sawChange: Bool = false) {
@@ -1583,6 +1818,7 @@ import ViewerUI
             // Tiles of documents that left the folder or changed (spec 1.2.4 §3).
             tileDisk?.pruneStale(under: URL(fileURLWithPath: path, isDirectory: true))
             if !recognitionPending.contains(path) { recognitionPending.append(path) }
+            if !wordPartsPending.contains(path) { wordPartsPending.append(path) }
             scheduleSearch(debounced: false)
         case .failure(let error) where error is CancellationError:
             break
@@ -1596,6 +1832,8 @@ import ViewerUI
                 setIndexProblem(path, .corruptIndex)
                 if sawChange { changedOnDisk.insert(path) }  // the rebuild run checks the filter then
                 pending.insert(path, at: 0)
+                needsFullScan.insert(path)
+                metricsTriggers[path, default: []].append("corrupt_rebuild")
             } else {
                 Self.log.error("Indexing \(path, privacy: .public) failed: \(String(describing: error), privacy: .public)")
                 reports[path] = nil
@@ -1618,6 +1856,8 @@ import ViewerUI
                 case (.text, .building(_, _, let done, let total)): setBuilding(current, done: done, total: total)
                 case (.ocr, .recognizing(_, _, let done, let total)): setRecognizing(current, done: done, total: total)
                 case (.layout, .layingOut(_, _, let done, let total)): setLayingOut(current, done: done, total: total)
+                case (.wordParts, .preparingWordParts(_, _, let done, let total)): setPreparingWordParts(current, done: done, total: total)
+                case (.wordParts, _): setPreparingWordParts(current, done: 0, total: 0)
                 case (.text, _): setBuilding(current, done: 0, total: 0)
                 case (.ocr, _): setRecognizing(current, done: 0, total: 0)
                 case (.layout, _): setLayingOut(current, done: 0, total: 0)
@@ -1625,6 +1865,9 @@ import ViewerUI
                 return
             } else if let next = pending.first(where: { indexes[$0] != nil }) {
                 setBuilding(next, done: 0, total: 0)
+                return
+            } else if let next = wordPartsPending.first(where: { indexes[$0] != nil }) {
+                setPreparingWordParts(next, done: 0, total: 0)
                 return
             } else if officePreferences.includeOffice, let next = layoutPending.first(where: { indexes[$0] != nil }) {
                 setLayingOut(next, done: 0, total: 0)
@@ -1979,7 +2222,7 @@ import ViewerUI
                 // A running phase 1 of the folder restarts itself after a wipe; a recognition does not, and
                 // a recognition of another folder must not delay the rebuild (review of 1.2 Task 1).
                 if indexes[target] != nil, currentFolder != target || currentPhase == .ocr {
-                    enqueueIndexing(target)
+                    enqueueIndexing(target, trigger: "corrupt_rebuild")
                     startQueueIfNeeded()
                 }
             case SingleDocumentSearchError.noText where fileLayouts[target] != nil:
@@ -2046,7 +2289,11 @@ import ViewerUI
         hiddenByFilter = inFolders.count - shown.count
         switch summaryStyle {
         case .empty: summary = ""
-        case .search: summary = ViewerText.withHidden(ViewerText.summary(hits: shown), hidden: hiddenByFilter)
+        case .search:
+            summary = ViewerText.withHidden(ViewerText.summary(hits: shown), hidden: hiddenByFilter)
+            if wordPartsBusy, case .fts(_, .trigram)? = FTSQueryBuilder.plan(for: query) {
+                summary += " · " + ViewerText.wordPartsSlow
+            }
         case .browse:
             summary = ViewerText.withHidden(ViewerText.browseSummary(files: shown.count, pages: shown.reduce(0) { $0 + $1.pageCount }),
                                             hidden: hiddenByFilter)
@@ -2352,7 +2599,7 @@ import ViewerUI
     private func reindexOutdated(_ folder: String, index: any FolderIndexing, path: String, stamp: FileStamp?) {
         guard indexes[folder] === index,
               requestedRelayouts.insert(Self.relayoutKey("index", path, stamp)).inserted else { return }
-        enqueueIndexing(folder)
+        enqueueIndexing(folder, trigger: "reindex_outdated")
         startQueueIfNeeded()
     }
 

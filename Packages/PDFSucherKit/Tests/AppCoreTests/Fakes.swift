@@ -188,6 +188,46 @@ final class FakeIndex: FolderIndexing, @unchecked Sendable {
         return ocrReport
     }
 
+    /// 1.4.0 P3: scopes of every scoped `update`, and how often the layout was asked to stop gently.
+    private var _scopedUpdates: [[String]] = []
+    private var _gentleStops = 0
+    var scopedUpdates: [[String]] { lock.withLock { _scopedUpdates } }
+    var gentleStops: Int { lock.withLock { _gentleStops } }
+    func update(scopes: [String], progress: @Sendable (IndexProgress) -> Void) async throws -> IndexReport {
+        lock.withLock { _scopedUpdates.append(scopes) }
+        return try await update(progress: progress)
+    }
+    func stopLayoutGently() { lock.withLock { _gentleStops += 1 } }
+
+    /// 1.4.0 P2: every priority set.
+    private var _priorities: [[String]] = []
+    var priorities: [[String]] { lock.withLock { _priorities } }
+    func setPriority(_ prefixes: [String]) { lock.withLock { _priorities.append(prefixes) } }
+
+    /// Wortteil-Index events "<name>:wordparts-start|end|cancelled" (1.3.12; an own log, so older sequences stay).
+    var wordPartsLog: StringLog?
+    private var _holdWordParts = false
+    var holdWordParts: Bool {
+        get { lock.withLock { _holdWordParts } }
+        set { lock.withLock { _holdWordParts = newValue } }
+    }
+
+    func buildWordParts(progress: @Sendable (IndexProgress) -> Void) async throws -> Int {
+        wordPartsLog?.append("\(name):wordparts-start")
+        progress(IndexProgress(done: 0, total: 10, currentFile: nil, phase: .wordParts))
+        let deadline = ContinuousClock.now + fakeHoldDeadline
+        while holdWordParts {
+            if Task.isCancelled {
+                wordPartsLog?.append("\(name):wordparts-cancelled")
+                throw CancellationError()
+            }
+            try checkFakeHold("\(name) word parts", deadline: deadline)
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+        wordPartsLog?.append("\(name):wordparts-end")
+        return 10
+    }
+
     func configure(_ settings: OCRSettings, includeOffice: Bool) {
         lock.withLock { configured.append(settings); configuredOffice.append(includeOffice) }
     }

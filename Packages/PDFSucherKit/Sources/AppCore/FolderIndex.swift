@@ -50,9 +50,31 @@ public protocol FolderIndexing: AnyObject, Sendable {
     func isOutdated(relativePath: String) throws -> Bool
     /// Whether any document is stored as laid out by `renderer` (1.3.2: Word with substitute fonts).
     func hasLayouts(byRenderer renderer: String) throws -> Bool
+    /// The index file on disk (settings „Speicher“: its size); nil for test doubles without a file.
+    var indexFileURL: URL? { get }
+    /// „Wortteil-Index“ (1.3.12): moves the pages phase 1 stored into the trigram index; cancellable without loss.
+    func buildWordParts(progress: @Sendable (IndexProgress) -> Void) async throws -> Int
+    /// 1.4.0 P2: relative path prefixes (ending in "/") whose files go first in layout, recognition and Wortteil-Index.
+    func setPriority(_ prefixes: [String])
+    /// 1.4.0 P3: phase 1 only for these folders (relative paths, changed on disk); the rest of the index stays.
+    func update(scopes: [String], progress: @Sendable (IndexProgress) -> Void) async throws -> IndexReport
+    /// 1.4.0 P3: the running layout starts no further file, finishes the ones in progress, then ends as cancelled.
+    func stopLayoutGently()
 }
 
 extension FolderIndexing {
+    /// Test doubles without a trigram index: nothing to build.
+    public func buildWordParts(progress: @Sendable (IndexProgress) -> Void) async throws -> Int { 0 }
+    /// Test doubles: no order to change.
+    public func setPriority(_ prefixes: [String]) {}
+    /// Test doubles: always the whole folder.
+    public func update(scopes: [String], progress: @Sendable (IndexProgress) -> Void) async throws -> IndexReport {
+        try await update(progress: progress)
+    }
+    /// Test doubles: nothing to stop gently.
+    public func stopLayoutGently() {}
+    /// Test doubles without a file: none.
+    public var indexFileURL: URL? { nil }
     /// Test doubles without layouts: none.
     public func hasLayouts(byRenderer renderer: String) throws -> Bool { false }
     public func search(_ q: ParsedQuery, sort: SortMode) throws -> [DocumentHit] { try search(q, sort: sort, onPartial: nil) }
@@ -87,6 +109,12 @@ public final class FolderIndex: FolderIndexing {
     /// `name:version` adopted last by this instance; equal → `adoptPowerPointRenderer` skips the transaction.
     private let adoptedIdentity = Mutex<String?>(nil)
     private let adoptions = Mutex(0)
+    /// 1.4.0 P1: indexes of subfolders were looked at (once per instance, in the first `update`'s turn).
+    private let childrenImported = Mutex(false)
+    /// 1.4.0 P2: shared with every Indexer of this folder (also after `configure` rebuilt it).
+    private let priority = PriorityBox()
+    /// Where the index files lie (the subfolders' indexes are looked for there).
+    private let indexDirectory: URL
 
     /// The index of `root`, created on first use. `indexURL` defaults to
     /// `IndexStore.location(forFolder:)`; tests pass a file in a temp directory.
@@ -109,12 +137,13 @@ public final class FolderIndex: FolderIndexing {
     init(root: URL, indexURL: URL, slideCache: SlideCache = .shared,
          makeLayout: (@Sendable () -> any PageLayoutSource)? = nil) throws {
         self.root = root
+        indexDirectory = indexURL.deletingLastPathComponent()
         let make = makeLayout ?? { OfficeLayoutSource.standard(cache: slideCache) }
         self.makeLayout = make
         store = try IndexStore(fileURL: indexURL, root: root)
         let layout = make()
         indexerState = Mutex((Self.makeIndexer(root: root, store: store, settings: .default,
-                                               layout: layout), .default, true))
+                                               layout: layout, priority: priority), .default, true))
         service = SearchService(index: store, root: root)
         currentLayout = Mutex(layout)
         // 1.3 Teil B Task 12: another PowerPoint renderer than the index expects (a display switch while this folder was
@@ -124,15 +153,30 @@ public final class FolderIndex: FolderIndexing {
 
     public var wasRebuilt: Bool { store.wasRebuilt }
 
+    public var indexFileURL: URL? { store.fileURL }
+
+    /// The index files of every `FolderIndex` created in this process, open or of a removed source (their store
+    /// stays open): „Verwaiste Indexe löschen“ never touches them.
+    public static func openIndexFiles() -> Set<String> {
+        registry.withLock { Set($0.values.map { $0.store.fileURL.standardizedFileURL.path }) }
+    }
+
     /// Phase 1 lists images when wanted and Word/PowerPoint with a layout source (stored as waiting);
     /// recognition and layout run only through `recognize` / the layout phase (the AppModel queue runs
     /// phase 1 of every folder first). Without a layout source Office files leave the index.
     private static func makeIndexer(root: URL, store: IndexStore, settings: OCRSettings,
-                                    layout: (any PageLayoutSource)?) -> Indexer {
-        Indexer(root: root, store: store, ocr: VisionOCRSource(),
+                                    layout: (any PageLayoutSource)?, priority: PriorityBox) -> Indexer {
+        var wordPreview: (@Sendable (URL) -> String?)?
+        if layout != nil { wordPreview = { @Sendable url in WordPreviewText.text(of: url) } }
+        return Indexer(root: root, store: store, ocr: VisionOCRSource(),
                 ocrSettings: OCRSettings(recognizeText: false, includeImages: settings.includeImages),
-                layout: layout, layoutDuringUpdate: false)
+                layout: layout, layoutDuringUpdate: false, priority: { priority.prefixes }, stopRequests: { priority.stops },
+                wordPreview: wordPreview)
     }
+
+    public func setPriority(_ prefixes: [String]) { priority.prefixes = prefixes }
+
+    public func stopLayoutGently() { priority.requestStop() }
 
     /// Replaces the Indexer for new settings. Callers start no run before the previous one has returned
     /// (the AppModel queue runs one at a time): a run on the old Indexer would not wait for the new one.
@@ -144,7 +188,7 @@ public final class FolderIndex: FolderIndexing {
             guard state.settings != settings || state.includeOffice != includeOffice else { return }
             let layout = includeOffice ? makeLayout() : nil
             currentLayout.withLock { $0 = layout }
-            state = (Self.makeIndexer(root: root, store: store, settings: settings, layout: layout), settings, includeOffice)
+            state = (Self.makeIndexer(root: root, store: store, settings: settings, layout: layout, priority: priority), settings, includeOffice)
         }
     }
 
@@ -153,6 +197,10 @@ public final class FolderIndex: FolderIndexing {
     }
 
     public func ocrCounts() throws -> (pages: Int, images: Int) { try store.ocrCounts() }
+
+    public func buildWordParts(progress: @Sendable (IndexProgress) -> Void) async throws -> Int {
+        try await indexer.buildWordParts(progress: progress)
+    }
 
     public func layOut(progress: @Sendable (IndexProgress) -> Void) async throws -> LayoutReport {
         try await indexer.layOutPending(progress: progress, atTurnStart: { [self] in adoptPowerPointRendererLogged() })
@@ -181,6 +229,27 @@ public final class FolderIndex: FolderIndexing {
     private func adoptPowerPointRendererLogged() {
         do { try adoptPowerPointRenderer() } catch {
             Self.log.error("Cannot adopt the PowerPoint renderer: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    /// 1.4.0 P1: before the first phase 1 of this folder in the session, the indexes of its subfolders on disk (sources
+    /// it replaced, or loaded earlier) hand over what they hold, so phase 1 finds those files unchanged instead of reading
+    /// them again. Each child index once per parent index; a failure only costs the time to read the files.
+    private func importChildIndexesOnce() {
+        guard childrenImported.withLock({ done in defer { done = true }; return !done }) else { return }
+        let metrics = IndexMetrics.shared
+        for child in IndexStore.childIndexes(of: root, in: indexDirectory, excluding: store.fileURL) {
+            let start = ContinuousClock.now
+            do {
+                let result = try store.importChild(child)
+                guard result.documents + result.layoutDropped > 0 else { continue }
+                Self.log.notice("Took over \(result.documents) documents from a subfolder's index")
+                metrics.log("source_import", ["source": IndexMetrics.hash(root), "child": IndexMetrics.hash(path: child.folderPath),
+                                              "documents": result.documents, "pages": result.pages,
+                                              "layout_dropped": result.layoutDropped, "ms": IndexMetrics.ms(since: start)])
+            } catch {
+                Self.log.error("Cannot take over a subfolder's index: \(String(describing: error), privacy: .public)")
+            }
         }
     }
 
@@ -225,6 +294,14 @@ public final class FolderIndex: FolderIndexing {
     var scanCount: Int { scans.withLock { $0 } }
 
     public func update(progress: @Sendable (IndexProgress) -> Void) async throws -> IndexReport {
+        try await update(scopes: nil, progress: progress)
+    }
+
+    public func update(scopes: [String], progress: @Sendable (IndexProgress) -> Void) async throws -> IndexReport {
+        try await update(scopes: Optional(scopes), progress: progress)
+    }
+
+    private func update(scopes: [String]?, progress: @Sendable (IndexProgress) -> Void) async throws -> IndexReport {
         updating.withLock { $0 = true }
         scanCache.withLock { $0 = nil }
         defer {
@@ -233,7 +310,10 @@ public final class FolderIndex: FolderIndexing {
         }
         // Inside the Indexer's turn, before phase 1: no old slide text after a renderer switch, and no layout of the
         // old renderer can store a deck after the clear (it holds the turn until it is done).
-        return try await indexer.update(progress: progress, atTurnStart: { [self] in adoptPowerPointRendererLogged() })
+        return try await indexer.update(scopes: scopes, progress: progress, atTurnStart: { [self] in
+            adoptPowerPointRendererLogged()
+            importChildIndexesOnce()
+        })
     }
 
     /// The scan for browsing: cached while an update runs, fresh otherwise.
@@ -279,4 +359,17 @@ public final class FolderIndex: FolderIndexing {
         }
         return entries
     }
+}
+
+/// The folder filter's path prefixes for one folder's Indexers (1.4.0 P2).
+/// Also the gentle stop of a running layout (P3).
+final class PriorityBox: Sendable {
+    private let value = Mutex<[String]>([])
+    private let stopCount = Mutex(0)
+    var prefixes: [String] {
+        get { value.withLock { $0 } }
+        set { value.withLock { $0 = newValue } }
+    }
+    var stops: Int { stopCount.withLock { $0 } }
+    func requestStop() { stopCount.withLock { $0 += 1 } }
 }

@@ -58,4 +58,23 @@ struct SourcesViewTests {
         let entries = SourcesMenu.entries([LoadedSourceRef(url: URL(fileURLWithPath: "/a/Verträge"), isFolder: true)])
         #expect(entries.map(\.accessibilityLabel) == ["„Verträge“ entfernen"])
     }
+
+    /// 1.3.10: a folder entry offers „Index löschen und neu aufbauen …“, a file entry does not.
+    @Test func folderEntriesOfferTheIndex() {
+        let entries = SourcesMenu.entries([LoadedSourceRef(url: URL(fileURLWithPath: "/a/Verträge"), isFolder: true),
+                                           LoadedSourceRef(url: URL(fileURLWithPath: "/b/rechnung.pdf"), isFolder: false)])
+        #expect(entries.map(\.isFolder) == [true, false])
+        #expect(ViewerText.rebuildIndex == "Index löschen und neu aufbauen …")
+    }
+
+    @Test func storageTexts() {
+        #expect(StorageTab.ocrText((pages: 1, images: 3)) == "1 Seite, 3 Bilder")
+        #expect(StorageTab.ocrText(nil) == "…")
+        #expect(StorageTab.filesText(0, bytes: 0) == "keine")
+        let hex = String(repeating: "b", count: 64)
+        let files = [hex + ".sqlite", hex + ".sqlite-wal"].map { URL(fileURLWithPath: "/x/" + $0) }
+        #expect(StorageTab.indexNames(files) == 1)
+        #expect(StorageTab.orphanText([], bytes: 0) == "keine")
+        #expect(StorageTab.indexCount(2) == "2 verwaiste Indexe")
+    }
 }

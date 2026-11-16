@@ -263,9 +263,10 @@ struct FolderWatchTests {
 
 /// Records the watched roots; `fire` stands for FSEvents reporting a change below those roots.
 @MainActor final class FakeWatcher: FolderWatching {
-    var onChange: (@MainActor ([String], Bool) -> Void)?
+    var onChange: (@MainActor ([String], Bool, [String: [String]]) -> Void)?
     private(set) var roots: [String] = []
     private(set) var includeImages: Bool?
     func watch(_ roots: [String], includeImages: Bool) { self.roots = roots; self.includeImages = includeImages }
-    func fire(_ roots: [String], urgent: Bool = false) { onChange?(roots, urgent) }
+    /// Without `scopes`: a full scan of each root (as before 1.4.0).
+    func fire(_ roots: [String], urgent: Bool = false, scopes: [String: [String]] = [:]) { onChange?(roots, urgent, scopes) }
 }

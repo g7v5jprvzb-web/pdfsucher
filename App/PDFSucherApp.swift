@@ -1,6 +1,8 @@
 // PDFSucherApp.swift — Task 5.1
 import AppCore
+import AppKit
 import Foundation
+import IndexKit
 import OfficeKit
 import SearchKit
 import SwiftUI
@@ -51,9 +53,16 @@ struct PDFSucherApp: App {
             model.folderWatcher = FSEventsFolderWatcher()
             _model = State(initialValue: model)
         } else {
+            // Measurement log of the indexing (1.3.9), off by default; written at most 1 s late, flushed at quit.
+            IndexMetrics.shared.setEnabled(UserDefaults.standard.bool(forKey: IndexMetrics.defaultsKey), atLaunch: true)
+            NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { _ in
+                IndexMetrics.shared.flush()
+            }
             let model = AppModel(settings: GridSettings(), environment: SystemEnvironment())
             tileDisk = .standard
             model.tileDisk = tileDisk           // tiles of changed or gone PDFs are cleaned (1.2.4 §3)
+            // Settings „Verwaiste Indexe“ (1.3.10): only the user's index folder, never in UI tests.
+            model.indexDirectory = IndexStore.location(forFolder: URL(fileURLWithPath: "/", isDirectory: true)).deletingLastPathComponent()
             model.folderWatcher = FSEventsFolderWatcher()   // the tree follows the Finder (decisions „Ordner beobachten“)
             _model = State(initialValue: model)
         }
@@ -100,7 +109,12 @@ struct PDFSucherApp: App {
                          folderSources: model.folderSources,
                          onDeleteIndex: { model.requestDeleteIndex(for: $0) }, history: model.searchHistory,
                          office: model.officePreferences, layoutCounts: { await model.layoutCounts(for: $0) },
-                         onClearSlideCache: { await model.clearSlideCache() }, tileCache: tileDisk)
+                         onClearSlideCache: { await model.clearSlideCache() }, tileCache: tileDisk,
+                         storage: StorageActions(indexBytes: { await model.indexBytes(for: $0) },
+                                                 orphanIndexes: { await model.orphanIndexFiles() },
+                                                 deleteOrphanIndexes: { await model.deleteOrphanIndexes() },
+                                                 slideCacheBytes: { await model.slideCacheBytes() },
+                                                 rerunOCR: { model.rerunRecognition(forSource: $0) }))
         }
         .windowResizability(.contentMinSize)     // the settings window can be enlarged (1.2.4)
     }

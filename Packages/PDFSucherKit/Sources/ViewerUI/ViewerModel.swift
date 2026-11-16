@@ -107,5 +107,7 @@ public enum IndexStatus: Equatable {
     /// `layingOut`: layout of Word/PowerPoint documents (spec 1.3) of folder `folder` of `folders`, `done` of `total` files.
     case none, building(folder: Int, folders: Int, done: Int, total: Int), recognizing(folder: Int, folders: Int, done: Int, total: Int)
     case layingOut(folder: Int, folders: Int, done: Int, total: Int)
+    /// `preparingWordParts` (1.3.12): the trigram index of folder `folder` of `folders` is filled, `done` of `total` pages.
+    case preparingWordParts(folder: Int, folders: Int, done: Int, total: Int)
     case upToDate, problems(failed: [String], noText: [String]), unreachable
 }

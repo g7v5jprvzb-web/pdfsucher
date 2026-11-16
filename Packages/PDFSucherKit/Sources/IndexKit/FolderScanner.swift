@@ -47,6 +47,13 @@ public struct FolderScanner: Sendable {
         self.includeOffice = includeOffice
     }
 
+    /// The same scanner for a folder `depth` levels below the root of a full scan, so it reaches exactly as deep
+    /// (1.4.0 P3: scans of the changed subfolders only); nil when the folder is already at the depth limit.
+    public func scoped(depth: Int) -> FolderScanner? {
+        guard maxDepth - depth >= 0 else { return nil }
+        return FolderScanner(maxDepth: maxDepth - depth, includeImages: includeImages, includeOffice: includeOffice)
+    }
+
     private func isIndexed(_ name: String) -> Bool {
         // Office lock files (`~$name.docx`) are never documents (`SupportedSourceTypes`).
         SupportedSourceTypes.accepts(fileName: name, includeImages: includeImages, includeOffice: includeOffice)
@@ -54,8 +61,13 @@ public struct FolderScanner: Sendable {
 
     private static let keys: Set<URLResourceKey> = [
         .isDirectoryKey, .isPackageKey, .isHiddenKey, .isSymbolicLinkKey, .isRegularFileKey,
-        .fileSizeKey, .contentModificationDateKey, .fileResourceIdentifierKey,
+        .fileSizeKey, .contentModificationDateKey, .fileResourceIdentifierKey, .fileIdentifierKey,
     ]
+
+    /// The volume of a folder, for `ScannedFile.fileID` (once per folder; a mount point is a folder).
+    private static func volume(of dir: URL) -> String? {
+        try? dir.resourceValues(forKeys: [.volumeUUIDStringKey]).volumeUUIDString
+    }
 
     public func scan(root: URL) throws -> [ScannedFile] {
         try scanDetailed(root: root).files
@@ -91,6 +103,7 @@ public struct FolderScanner: Sendable {
             var linkedDirs: [(Dir, NSObject)] = []
             for dir in level {
                 if Task.isCancelled { throw CancellationError() }
+                let volume = Self.volume(of: dir.physical)
                 guard let children = try? FileManager.default.contentsOfDirectory(
                     at: dir.physical, includingPropertiesForKeys: Array(Self.keys), options: []) else {
                     unreadable.append(dir.prefix)
@@ -130,11 +143,14 @@ public struct FolderScanner: Sendable {
                         let entry = (Dir(physical: physical, logical: logical, prefix: relativePath), id)
                         if isLink { linkedDirs.append(entry) } else { realDirs.append(entry) }
                     } else if values.isRegularFile == true, isIndexed(name) {
+                        // A linked file may lie on another volume: its own volume then.
+                        let fileVolume = isLink ? Self.volume(of: physical.deletingLastPathComponent()) : volume
                         files.append(ScannedFile(
                             relativePath: relativePath,
                             url: logical,
                             fileSize: Int64(values.fileSize ?? 0),
-                            modifiedAt: values.contentModificationDate ?? Date(timeIntervalSince1970: 0)))
+                            modifiedAt: values.contentModificationDate ?? Date(timeIntervalSince1970: 0),
+                            fileID: fileVolume.flatMap { v in values.fileIdentifier.map { "\(v)/\($0)" } }))
                     }
                 }
             }

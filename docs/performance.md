@@ -661,3 +661,67 @@ beim Öffnen eines Decks, bei Kacheln neben Index-Layouts und während der Schri
 allerersten Kachel einer Datei: bei Folien bleiben Text setzen und Bilder dekodieren (A1 kalt 1,0–1,1×), bei Word
 Import und Umbruch des ganzen Dokuments (B1 1,0×). Das wäre der nächste Hebel (Word seitenweise umbrechen, SlideKit-
 Einmalkosten je Prozess).
+
+## index-speed-1: Phase 1 schreibt entkoppelt, größte Dateien zuerst (2026-11-16)
+
+Release-Build, M3 Max (12 Leistungs- + 4 Effizienzkerne), Dateicache warm, je ein Lauf in einen temporären Index
+(`IndexScalingBenchmark`, `PDFSUCHER_PDF_SCALING_BENCH=1`). „Voll“ = alle PDFs eines echten Ordners
+(einige tausend PDFs, rund hunderttausend Seiten); „Stichprobe“ = 400 davon (Seed 42).
+
+| Lauf | Wand Phase 1 | Summe PDF-Lesen | Parallelität | DB-Schreiben | Extraktion wartet auf Schreiber |
+|---|---|---|---|---|---|
+| Voll vorher | 78,7 s | 496 s | 6,3 | 58,6 s (in der Ergebnisschleife) | – |
+| Voll nachher | **58,2 s** (−26 %) | 491 s | 8,4 | 53,6 s (eigener Task) | 30,4 s |
+| Stichprobe vorher | 11,3 s | 44,3 s | 3,9 | 3,9 s | – |
+| Stichprobe nachher | 9,9 s (−12 %) | 41,6 s | 4,2 | 3,7 s | 0,6 s |
+
+DB-Schreiben aufgeteilt (voll, vorher): Seiten + beide FTS5-Indizes 90,5 %, Commit inkl. WAL-Checkpoint 9,2 %, Rest
+< 0,3 %. Getrennt (Stichprobe, vier Schemas): beide Indizes 3,56 s, nur Wort 0,86 s, nur Trigramm 2,73 s, ohne FTS
+0,08 s → **Trigramm ≈ 75 %** der Schreibzeit. PRAGMAs: WAL, synchronous=NORMAL (1), cache_size=2000, page_size=4096,
+wal_autocheckpoint=1000, FTS5 automerge Standard.
+
+Skalierung PDF-Lesen (Stichprobe, `PDFKitTextSource`): 1/4/8/15 Tasks = 32,2/9,9/8,5/8,3 s Wand; die Wand ist ab 8 Tasks
+die längste Einzeldatei (7,1 s allein). Threads gegen Prozesse (`scripts/pdfkit-process-bench.swift`, Summe der
+Einzelzeiten): 1×1 30,1 s, 1×4 Threads 32,1 s, 4 Prozesse×1 30,1 s, 1×15 Threads 41,0 s, 4×4 38,8 s → PDFKit bremst
+prozessintern kaum; ab 12+ Arbeitern werden die Einzelzeiten in beiden Fällen ≈ 30 % langsamer.
+
+Befund: Nach dem Entkoppeln ist der eine Schreiber die Untergrenze (Wand 58 s ≈ 54 s Schreiben). Nächster Hebel:
+schneller schreiben (Trigramm-Index, Commit/Checkpoint, vorbereitete Statements) – nicht Teil dieses Schritts.
+Je ein Lauf, Streuung nicht gemessen.
+
+## 1.3.12: Wortteil-Index im Hintergrund (2026-11-16)
+
+Release-Build, M3 Max, Dateicache warm, je ein Lauf, alle PDFs eines echten Ordners (einige tausend PDFs) in einen
+temporären Index (`WordPartsBenchmark`, `PDFSUCHER_PDF_SCALING_BENCH=1`; „vorher“ mit derselben Messung ohne Wortteil-Schritt
+auf 1.3.11).
+
+| | 1.3.11 | 1.3.12 |
+|---|---|---|
+| Phase 1 (Wand) = normale Suche nutzbar | 56,3 s | **36,1 s** |
+| Wortteil-Index im Hintergrund | – (in Phase 1) | ≈ 24,0 s (Transaktionen à ≈ 1000 Seiten) |
+| Gesamt bis alles fertig | 56,3 s | ≈ 60,1 s |
+| Präfixsuche `vertrag*` | 0,21 s | 0,29 s |
+| Infix `*vertrag*` / `*rechnung*` / `*steuer*`, alles wartend | – | 1,33 / 0,62 / 0,62 s |
+| … Hälfte übertragen | – | 0,40 / 0,41 / 0,39 s |
+| … fertig | 0,12 / 0,21 / 0,18 s | 0,10 / 0,14 / 0,13 s |
+
+Trefferzahlen (Dokumente) in allen Zuständen gleich. DB-Schreiben in Phase 1: 58,6 s (1.3.10) → 14,5 s.
+Gesamt ≈ 4 s länger, weil Phase 1 und Hintergrundaufbau nicht mehr überlappen; dafür ist die Suche 20 s früher da.
+
+## 1.4.0 (2026-11-16)
+
+Release-Build, M3 Max, je ein Lauf in temporäre Indizes (`ReleaseBenchmark`, `PDFSUCHER_RELEASE_BENCH=1`; „vorher“ dieselbe Messung
+auf 1.3.12), echter Ordner mit einigen zehntausend Dateien (Bilder eingeschlossen; PDF, Word, PowerPoint).
+
+| | 1.3.12 | 1.4.0 |
+|---|---|---|
+| Phase 1 (normale Suche nutzbar) | 35,0 s | 35,6 s |
+| Word-Dokumente mit „und“ gefunden nach Phase 1 | keine | fast alle (97 % derer nach dem Layout) |
+| Wortteil-Index danach | 26,3 s | 25,4 s |
+| Layout Word/PowerPoint | 20,8 s | 19,6 s |
+| Gesamt ohne OCR | 82,1 s | 80,5 s |
+| Größter Unterordner zuerst, dann Elternordner: Phase 1 des Eltern | 36,1 s, nichts übernommen | **20,5 s, alle Dateien des Unterordners übernommen** |
+| 300 PDFs, 100 davon verschoben + umbenannt: Lauf danach | 0,43 s, 100 neu gelesen | **0,01 s, 100 erkannt** |
+
+OCR-Parallelität (48 echte Scanseiten): 1/2/3/4/6 → 3,3/5,7/6,8/7,3/7,8 Seiten/s, gleicher Text. Langsamste PDFs: siehe
+decisions „1.4.0 P6“.

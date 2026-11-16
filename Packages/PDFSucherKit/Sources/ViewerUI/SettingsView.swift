@@ -21,6 +21,8 @@ public struct SettingsView: View {
     private let office: OfficePreferences?
     private let layoutCounts: ((URL) async -> LayoutCounts?)?
     private let onClearSlideCache: (() async -> Void)?
+    /// 1.3.10: sizes and more deleting in „Speicher“ (orphan indexes, OCR, slide cache).
+    private let storage: StorageActions?
 
     /// - Parameters:
     ///   - folderSources: loaded folders; empty disables „Index löschen …“.
@@ -33,7 +35,8 @@ public struct SettingsView: View {
                 ocrCounts: ((URL) async -> (pages: Int, images: Int)?)? = nil, onRerunOCR: ((URL) -> Void)? = nil,
                 folderSources: [URL] = [], onDeleteIndex: ((URL?) -> Void)? = nil, history: SearchHistory? = nil,
                 office: OfficePreferences? = nil, layoutCounts: ((URL) async -> LayoutCounts?)? = nil,
-                onClearSlideCache: (() async -> Void)? = nil, tileCache: TileDiskCache? = nil) {
+                onClearSlideCache: (() async -> Void)? = nil, tileCache: TileDiskCache? = nil, storage: StorageActions? = nil) {
+        self.storage = storage
         self.office = office
         self.layoutCounts = layoutCounts
         self.onClearSlideCache = onClearSlideCache
@@ -63,7 +66,8 @@ public struct SettingsView: View {
                     .tabItem { Label("Word/PowerPoint", systemImage: "doc.richtext") }.tag(SettingsTab.office)
             }
             if onDeleteIndex != nil || tileCache != nil {
-                StorageTab(folderSources: folderSources, onDeleteIndex: onDeleteIndex, tileCache: tileCache)
+                StorageTab(folderSources: folderSources, onDeleteIndex: onDeleteIndex, tileCache: tileCache, storage: storage,
+                           ocrCounts: ocrCounts, onClearSlideCache: onClearSlideCache)
                     .tabItem { Label("Speicher", systemImage: "internaldrive") }.tag(SettingsTab.storage)
             }
             keys.tabItem { Label("Tastatur", systemImage: "keyboard") }.tag(SettingsTab.keyboard)

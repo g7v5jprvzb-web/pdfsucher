@@ -26,8 +26,8 @@ struct IndexStoreOCRTests {
         try store.upsert(file(path, size: size), pages: [PageText(pageIndex: 0, text: "", needsOCR: true)], status: .noText)
     }
 
-    @Test func schemaVersionIsThree() {
-        #expect(IndexStore.schemaVersion == 3)
+    @Test func schemaVersionIsFive() {
+        #expect(IndexStore.schemaVersion == 5)
     }
 
     @Test func schemaVersion1FileIsRebuilt() throws {
@@ -244,6 +244,7 @@ struct IndexStoreOCRTests {
             #expect(try store.storeOCR(try #require(try store.pendingOCRJobs().first), text: "alter Text", words: []))
             try store.resetOCR()
             #expect(try store.storeOCR(try #require(try store.pendingOCRJobs().first), text: "neuer Inhalt", words: []))
+            try store.fillTrigramIndex(maxPages: 1_000)          // schema 4: the image's page waited for the trigram index
             #expect(try store.match("alter", in: .words).isEmpty)
             #expect(try store.match("\"lte\"", in: .trigram).isEmpty)
             #expect(try store.match("Inhalt", in: .words).count == 1)

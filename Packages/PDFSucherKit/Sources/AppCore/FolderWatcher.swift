@@ -8,8 +8,10 @@ import UniformTypeIdentifiers
 /// Watches the folder sources. `onChange` gets the watched roots below which something relevant changed;
 /// the model indexes them again (incrementally) and rebuilds the tree. `urgent`: the roots themselves went
 /// away or came back (volume ejected or mounted, folder moved), which the model does not hold back.
+/// `scopes` (1.4.0 P3): for a root, the folders (relative, no trailing "/") below which the batch changed something;
+/// a root without an entry needs a full scan (lost events, the root itself changed, a change directly in it).
 @MainActor public protocol FolderWatching: AnyObject {
-    var onChange: (@MainActor (_ roots: [String], _ urgent: Bool) -> Void)? { get set }
+    var onChange: (@MainActor (_ roots: [String], _ urgent: Bool, _ scopes: [String: [String]]) -> Void)? { get set }
     /// The roots to watch from now on (replaces the earlier set); whether image files count.
     func watch(_ roots: [String], includeImages: Bool)
 }
@@ -23,7 +25,7 @@ import UniformTypeIdentifiers
 /// - A stream that cannot be created is tried again after 1, 2, 4 … 60 s, then not until the next `watch`
 ///   call (sources or the images setting changed); once it runs after a failure, one report covers the gap.
 @MainActor public final class FSEventsFolderWatcher: FolderWatching {
-    public var onChange: (@MainActor (_ roots: [String], _ urgent: Bool) -> Void)?
+    public var onChange: (@MainActor (_ roots: [String], _ urgent: Bool, _ scopes: [String: [String]]) -> Void)?
     private var stream: FSEventStreamRef?
     private var sink: Unmanaged<Sink>?
     /// The roots asked for (also while the stream is retried).
@@ -80,8 +82,8 @@ import UniformTypeIdentifiers
     private func start(attempt: Int) {
         // The stream holds the sink, not the watcher: a callback still running after `stop` finds the
         // watcher gone and does nothing.
-        let sink = Unmanaged.passRetained(Sink(filter: filter) { [weak self] changed, urgent in
-            Task { @MainActor [weak self] in self?.onChange?(changed, urgent) }
+        let sink = Unmanaged.passRetained(Sink(filter: filter) { [weak self] changed, urgent, scopes in
+            Task { @MainActor [weak self] in self?.onChange?(changed, urgent, scopes) }
         })
         var context = FSEventStreamContext(version: 0, info: sink.toOpaque(), retain: nil, release: nil, copyDescription: nil)
         let flags = FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagWatchRoot
@@ -109,7 +111,7 @@ import UniformTypeIdentifiers
         stream = created
         self.sink = sink
         // Changes while there was no stream were not reported: one report lets the sources be checked (review).
-        if attempt > 0 { onChange?(roots, false) }
+        if attempt > 0 { onChange?(roots, false, [:]) }
     }
 
     private func stop() {
@@ -128,8 +130,11 @@ import UniformTypeIdentifiers
     /// What the stream's callback needs, off the main actor.
     private final class Sink: Sendable {
         let filter: EventFilter
-        let deliver: @Sendable ([String], Bool) -> Void
-        init(filter: EventFilter, deliver: @escaping @Sendable ([String], Bool) -> Void) { self.filter = filter; self.deliver = deliver }
+        let deliver: @Sendable ([String], Bool, [String: [String]]) -> Void
+        init(filter: EventFilter, deliver: @escaping @Sendable ([String], Bool, [String: [String]]) -> Void) {
+            self.filter = filter
+            self.deliver = deliver
+        }
     }
 
     /// On the stream's queue: the filter runs there (it may look at the disk), the report on the main actor.
@@ -140,8 +145,8 @@ import UniformTypeIdentifiers
         let events = (0..<min(count, list.count)).map { (path: list[$0], flags: flags[$0]) }
         let urgent = sink.filter.urgentRoots(events)
         let changed = sink.filter.changedRoots(events).filter { !urgent.contains($0) }
-        if !urgent.isEmpty { sink.deliver(urgent, true) }
-        if !changed.isEmpty { sink.deliver(changed, false) }
+        if !urgent.isEmpty { sink.deliver(urgent, true, [:]) }
+        if !changed.isEmpty { sink.deliver(changed, false, sink.filter.changedScopes(events)) }
     }
 }
 
@@ -191,6 +196,31 @@ final class EventFilter: @unchecked Sendable {
                 }
             }
             return found
+        }
+    }
+
+    /// 1.4.0 P3: per root, the folders to scan again: the parent folder of every relevant changed item (a deleted or
+    /// renamed folder is seen from its parent). A root is left out (full scan) for lost events, a change of the root
+    /// itself or of an item directly in it. Relative paths, no trailing "/", nested ones dropped.
+    func changedScopes(_ events: [(path: String, flags: FSEventStreamEventFlags)]) -> [String: [String]] {
+        lock.withLock {
+            var scopes: [String: Set<String>] = [:], full: Set<String> = []
+            for (path, flags) in events {
+                let path = path.hasSuffix("/") && path.count > 1 ? String(path.dropLast()) : path
+                for root in roots where isRelevant(path, flags: flags, root: root.real) {
+                    let inside = Self.isInside(path, root.real)
+                    guard flags & Self.lost == 0, inside, path != root.real else { full.insert(root.reported); continue }
+                    let relative = String(path.dropFirst(root.real == "/" ? 1 : root.real.count + 1))
+                    let parent = (relative as NSString).deletingLastPathComponent
+                    if parent.isEmpty { full.insert(root.reported) } else { scopes[root.reported, default: []].insert(parent) }
+                }
+            }
+            var result: [String: [String]] = [:]
+            for (root, set) in scopes where !full.contains(root) {
+                let sorted = set.sorted()
+                result[root] = sorted.filter { scope in !sorted.contains { $0 != scope && scope.hasPrefix($0 + "/") } }
+            }
+            return result
         }
     }
 

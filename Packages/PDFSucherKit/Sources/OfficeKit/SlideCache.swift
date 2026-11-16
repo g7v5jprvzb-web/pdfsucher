@@ -222,6 +222,18 @@ public final class SlideCache: Sendable {
         if let firstError { throw firstError }
     }
 
+    /// Size of every file in the cache in bytes (settings „Speicher“), `.tmp` folders included.
+    public var byteCount: Int {
+        let keys: Set<URLResourceKey> = [.isRegularFileKey, .totalFileAllocatedSizeKey, .fileSizeKey]
+        guard let walker = FileManager.default.enumerator(at: root, includingPropertiesForKeys: Array(keys)) else { return 0 }
+        var total = 0
+        for case let url as URL in walker {
+            guard let values = try? url.resourceValues(forKeys: keys), values.isRegularFile == true else { continue }
+            total += values.totalFileAllocatedSize ?? values.fileSize ?? 0
+        }
+        return total
+    }
+
     private func existingNames() throws -> [String] {
         guard FileManager.default.fileExists(atPath: root.path) else { return [] }
         return try FileManager.default.contentsOfDirectory(atPath: root.path)

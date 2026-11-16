@@ -14,6 +14,15 @@ public enum IndexStoreError: Error, Equatable {
 
 /// The SQLite index of one PDF folder (schema: spec §4.1, extended by spec 1.2 §4).
 ///
+/// - Schema 5 (1.4.0 P4): `documents.file_id` („<volume UUID>/<file id>“) to recognize moved and renamed files;
+///   schema 3 and 4 are migrated in place (the column starts empty and is filled by the next scans).
+/// - Schema 4 (1.3.12, Wortteil-Index im Hintergrund): pages inserted by phase 1 (`source = 'text'`) go into
+///   `pages_words` at once but into `pages_trigram` only later (`fillTrigramIndex`); until then their id is in
+///   `trigram_pending`. Invariant: a page is in exactly one of `pages_trigram` and `trigram_pending`. Layout pages go into
+///   both FTS tables at once; a text update (OCR) keeps a page where it is. Trigram searches add the pending pages as
+///   candidates (`matchBatches`), so an incomplete trigram index never hides a hit. Schema 3 is migrated in place
+///   (its pages are all in `pages_trigram`; nothing is re-indexed).
+///
 /// - Schema 3 (Office, spec 1.3): `documents.renderer`/`layout_version`/`needs_layout` and
 ///   `page_text.source = 'layout'` for pages of laid-out Office documents; older indexes are rebuilt.
 /// - Schema 2 (OCR): `documents.kind` (`pdf`/`image`); `page_text.source` (`text`/`ocr`: OCR
@@ -32,7 +41,7 @@ public enum IndexStoreError: Error, Equatable {
 ///   is thrown and the file is left alone. `wasRebuilt` reports whether a rebuild happened.
 /// - `modified_at` is seconds since 1970.
 public final class IndexStore: IndexReading, @unchecked Sendable {
-    public static let schemaVersion = 3
+    public static let schemaVersion = 5
 
     /// `~/Library/Application Support/PDFSucher/Indexes/<sha256 hex of standardized folder path>.sqlite`
     public static func location(forFolder root: URL) -> URL {
@@ -61,8 +70,9 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
     /// Every call holds this shared for as long as it uses a connection; recovery takes it
     /// exclusively, so no old connection is still open when the files are replaced.
     private let access = ReadWriteLock()
-    private let fileURL: URL
-    private let root: URL
+    /// The index file (`-wal` and `-shm` lie next to it).
+    public let fileURL: URL
+    let root: URL
     private static let log = Logger(subsystem: "local.pdfsucher", category: "IndexStore")
 
     public var wasRebuilt: Bool { state.withLock { $0.rebuilt } }
@@ -83,7 +93,7 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
 
     // MARK: Opening and recovery
 
-    private enum Health { case fresh, current, mismatch }
+    private enum Health { case fresh, current, schema3, schema4, mismatch }
 
     private static func open(fileURL: URL, root: URL) throws -> (SQLiteConnection, Bool) {
         do {
@@ -93,6 +103,13 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
                 return (db, false)
             case .fresh:
                 try createSchema(db, root: root)
+                return (db, false)
+            case .schema3:
+                try migrateFrom3(db)
+                try migrateFrom4(db)
+                return (db, false)
+            case .schema4:
+                try migrateFrom4(db)
                 return (db, false)
             case .mismatch:
                 log.notice("Index schema mismatch, rebuilding \(fileURL.path, privacy: .public)")
@@ -185,7 +202,10 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
         if tables.isEmpty { return .fresh }
         guard tables.contains(where: { $0["name"] == .text("meta") }) else { return .mismatch }
         let rows = try db.query("SELECT value FROM meta WHERE key = 'schema_version'", [])
-        guard rows.count == 1, rows[0]["value"] == .text(String(schemaVersion)) else { return .mismatch }
+        guard rows.count == 1 else { return .mismatch }
+        if rows[0]["value"] == .text("3") { return .schema3 }
+        if rows[0]["value"] == .text("4") { return .schema4 }
+        guard rows[0]["value"] == .text(String(schemaVersion)) else { return .mismatch }
         return .current
     }
 
@@ -208,7 +228,8 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
           kind TEXT NOT NULL DEFAULT 'pdf',
           renderer TEXT,
           layout_version INTEGER,
-          needs_layout INTEGER NOT NULL DEFAULT 0
+          needs_layout INTEGER NOT NULL DEFAULT 0,
+          file_id TEXT
         );
         CREATE INDEX documents_needs_layout ON documents(needs_layout) WHERE needs_layout = 1;
         CREATE TABLE page_text(
@@ -236,22 +257,60 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
           text, content='page_text', content_rowid='id',
           tokenize = 'trigram case_sensitive 0 remove_diacritics 1'
         );
+        CREATE TABLE trigram_pending(page_id INTEGER PRIMARY KEY);
+        \(triggersSQL)
+        CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+        """
+
+    /// Schema 4 triggers (see the type's doc): phase-1 pages (`source = 'text'`) wait in `trigram_pending`; the trigram
+    /// index is only told to delete what it holds (an external-content FTS5 'delete' with text it never indexed would
+    /// damage it).
+    private static let triggersSQL = """
         CREATE TRIGGER page_text_ai AFTER INSERT ON page_text BEGIN
           INSERT INTO pages_words(rowid, text) VALUES (new.id, new.text);
-          INSERT INTO pages_trigram(rowid, text) VALUES (new.id, new.text);
+          INSERT INTO pages_trigram(rowid, text) SELECT new.id, new.text WHERE new.source <> 'text';
+          INSERT INTO trigram_pending(page_id) SELECT new.id WHERE new.source = 'text';
         END;
         CREATE TRIGGER page_text_ad AFTER DELETE ON page_text BEGIN
           INSERT INTO pages_words(pages_words, rowid, text) VALUES ('delete', old.id, old.text);
-          INSERT INTO pages_trigram(pages_trigram, rowid, text) VALUES ('delete', old.id, old.text);
+          INSERT INTO pages_trigram(pages_trigram, rowid, text) SELECT 'delete', old.id, old.text
+            WHERE NOT EXISTS (SELECT 1 FROM trigram_pending WHERE page_id = old.id);
+          DELETE FROM trigram_pending WHERE page_id = old.id;
         END;
         CREATE TRIGGER page_text_au AFTER UPDATE OF text ON page_text BEGIN
           INSERT INTO pages_words(pages_words, rowid, text) VALUES ('delete', old.id, old.text);
-          INSERT INTO pages_trigram(pages_trigram, rowid, text) VALUES ('delete', old.id, old.text);
           INSERT INTO pages_words(rowid, text) VALUES (new.id, new.text);
-          INSERT INTO pages_trigram(rowid, text) VALUES (new.id, new.text);
+          INSERT INTO pages_trigram(pages_trigram, rowid, text) SELECT 'delete', old.id, old.text
+            WHERE NOT EXISTS (SELECT 1 FROM trigram_pending WHERE page_id = old.id);
+          INSERT INTO pages_trigram(rowid, text) SELECT new.id, new.text
+            WHERE NOT EXISTS (SELECT 1 FROM trigram_pending WHERE page_id = old.id);
         END;
-        CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
         """
+
+    /// Schema 3 → 4 in one transaction: the pending table and the new triggers; every existing page stays indexed.
+    private static func migrateFrom3(_ db: SQLiteConnection) throws {
+        try db.transaction {
+            try db.execute("""
+                CREATE TABLE trigram_pending(page_id INTEGER PRIMARY KEY);
+                DROP TRIGGER page_text_ai;
+                DROP TRIGGER page_text_ad;
+                DROP TRIGGER page_text_au;
+                \(triggersSQL)
+                """)
+            try db.run("UPDATE meta SET value = '4' WHERE key = 'schema_version'", [])
+        }
+        log.notice("Index migrated to schema 4")
+    }
+
+    /// Schema 4 → 5: the file identity column (empty; the next scans fill it without reading any file again).
+    private static func migrateFrom4(_ db: SQLiteConnection) throws {
+        try db.transaction {
+            let columns = try db.query("PRAGMA table_info(documents)", []).compactMap { $0["name"] }
+            if !columns.contains(.text("file_id")) { try db.execute("ALTER TABLE documents ADD COLUMN file_id TEXT") }
+            try db.run("UPDATE meta SET value = ? WHERE key = 'schema_version'", [.text(String(schemaVersion))])
+        }
+        log.notice("Index migrated to schema \(schemaVersion)")
+    }
 
     private static func createSchema(_ db: SQLiteConnection, root: URL) throws {
         try db.transaction {
@@ -265,6 +324,11 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
 
     /// Runs `body` in one write transaction on the writer connection. Internal (tests).
     /// `body` must use the given connection only, never other store methods (see `using`).
+    /// The writer connection without a transaction around `body` (ATTACH must run outside one); same rules as `batch`.
+    func batchOutsideTransaction<T>(_ body: (SQLiteConnection) throws -> T) throws -> T {
+        try using(.writer, body)
+    }
+
     func batch(_ body: (SQLiteConnection) throws -> Void) throws {
         try using(.writer) { db in try db.transaction { try body(db) } }
     }
@@ -280,54 +344,86 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
         try upsertBatch(items.map { ($0.file, $0.pages, $0.status, false) })
     }
 
+    /// Time of one `upsertBatch` by step (measurement log `db_batch`, 1.3.9). `pagesMs` includes both FTS5 indexes
+    /// (`page_text` triggers); `commitMs` includes an automatic WAL checkpoint; `lockWaitMs` is the wait for the writer
+    /// connection (e.g. behind a search).
+    public struct UpsertTiming: Sendable {
+        public var lockWaitMs = 0.0, lookupMs = 0.0, deleteOldMs = 0.0, documentMs = 0.0, pagesMs = 0.0, commitMs = 0.0
+        public init() {}
+    }
+
     /// Several upserts in one transaction; items with `needsLayout` are stored like
     /// `upsertAwaitingLayout` (used by the `Indexer` for Office files).
-    func upsertBatch(_ items: [(file: ScannedFile, pages: [PageText], status: DocumentStatus, needsLayout: Bool)]) throws {
-        guard !items.isEmpty else { return }
+    @discardableResult
+    func upsertBatch(_ items: [(file: ScannedFile, pages: [PageText], status: DocumentStatus, needsLayout: Bool)]) throws -> UpsertTiming {
+        var timing = UpsertTiming()
+        guard !items.isEmpty else { return timing }
+        let asked = ContinuousClock.now
         try using(.writer) { db in
+            let acquired = ContinuousClock.now
+            timing.lockWaitMs = IndexMetrics.ms(acquired - asked)
+            var bodyEnd = acquired
             try db.transaction {
                 for item in items {
-                    try Self.upsert(item.file, pages: item.pages, status: item.status, needsLayout: item.needsLayout, in: db)
+                    try Self.upsert(item.file, pages: item.pages, status: item.status, needsLayout: item.needsLayout, in: db,
+                                    timing: &timing)
                 }
+                bodyEnd = .now
             }
+            timing.commitMs = IndexMetrics.ms(since: bodyEnd)
         }
+        return timing
     }
 
     /// Stores an Office document that still waits for layout: no pages, status `noText` (so search
     /// ignores it), `needs_layout = 1`; an earlier layout (renderer, version, pages) is dropped.
     public func upsertAwaitingLayout(_ file: ScannedFile) throws {
+        var timing = UpsertTiming()
         try using(.writer) { db in
-            try db.transaction { try Self.upsert(file, pages: [], status: .noText, needsLayout: true, in: db) }
+            try db.transaction { try Self.upsert(file, pages: [], status: .noText, needsLayout: true, in: db, timing: &timing) }
         }
     }
 
     private static func upsert(_ file: ScannedFile, pages: [PageText], status: DocumentStatus,
-                               needsLayout: Bool = false, in db: SQLiteConnection) throws {
+                               needsLayout: Bool = false, in db: SQLiteConnection, timing: inout UpsertTiming) throws {
+        var mark = ContinuousClock.now
+        func lap(_ field: WritableKeyPath<UpsertTiming, Double>) {
+            let now = ContinuousClock.now
+            let (sec, atto) = (now - mark).components          // unrounded: one lap is often below 0.1 ms
+            timing[keyPath: field] += Double(sec) * 1000 + Double(atto) / 1e15
+            mark = now
+        }
         let existing = try db.query("SELECT id FROM documents WHERE path = ?", [.text(file.relativePath)])
+        lap(\.lookupMs)
         let docId: Int64
         let meta: [SQLiteValue] = [
+            // A document waiting for layout has no known page count (0: the grid shows „wird vorbereitet“), also with
+            // a provisional page (1.4.0 P5: Word text before the layout; a hit shows just that page).
             .int(file.fileSize), .double(file.modifiedAt.timeIntervalSince1970),
-            .int(Int64(pages.count)), .text(status.rawValue), .text(file.kind.rawValue),
-            .int(needsLayout ? 1 : 0),
+            .int(needsLayout ? 0 : Int64(pages.count)), .text(status.rawValue), .text(file.kind.rawValue),
+            .int(needsLayout ? 1 : 0), file.fileID.map(SQLiteValue.text) ?? .null,
         ]
         if case .int(let id)? = existing.first?["id"] {
             docId = id
             try db.run("DELETE FROM page_text WHERE doc_id = ?", [.int(id)])
+            lap(\.deleteOldMs)
             try db.run("""
                 UPDATE documents SET file_size = ?, modified_at = ?, page_count = ?, status = ?, kind = ?,
-                  needs_layout = ?, renderer = NULL, layout_version = NULL
+                  needs_layout = ?, file_id = ?, renderer = NULL, layout_version = NULL
                 WHERE id = ?
                 """, meta + [.int(id)])
         } else {
             docId = try db.run("""
-                INSERT INTO documents(path, file_size, modified_at, page_count, status, kind, needs_layout)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO documents(path, file_size, modified_at, page_count, status, kind, needs_layout, file_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, [.text(file.relativePath)] + meta)
         }
+        lap(\.documentMs)
         for page in pages {
             try db.run("INSERT INTO page_text(doc_id, page_index, text, needs_ocr) VALUES (?, ?, ?, ?)",
                        [.int(docId), .int(Int64(page.pageIndex)), .text(page.text), .int(page.needsOCR ? 1 : 0)])
         }
+        lap(\.pagesMs)
     }
 
     // MARK: OCR (spec 1.2 §3, §4)
@@ -649,6 +745,31 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
             && abs(row.double("modified_at") - job.modifiedAt.timeIntervalSince1970) < 0.001
     }
 
+    /// 1.4.0 P4: stored documents found under another path (moved or renamed on their volume) take the new path, keeping
+    /// their pages, recognized text and layout; one transaction.
+    public func move(_ moves: [(from: String, to: String, fileID: String?)]) throws {
+        guard !moves.isEmpty else { return }
+        try using(.writer) { db in
+            try db.transaction {
+                for move in moves {
+                    try db.run("UPDATE documents SET path = ?, file_id = ? WHERE path = ?",
+                               [.text(move.to), move.fileID.map(SQLiteValue.text) ?? .null, .text(move.from)])
+                }
+            }
+        }
+    }
+
+    /// 1.4.0 P4: the file identity of documents stored without one (index of an older version), so a later move is
+    /// recognized; one transaction.
+    public func setFileIDs(_ ids: [(path: String, fileID: String)]) throws {
+        guard !ids.isEmpty else { return }
+        try using(.writer) { db in
+            try db.transaction {
+                for id in ids { try db.run("UPDATE documents SET file_id = ? WHERE path = ?", [.text(id.fileID), .text(id.path)]) }
+            }
+        }
+    }
+
     /// Removes the documents (and their pages); unknown paths are ignored.
     public func remove(relativePaths: [String]) throws {
         guard !relativePaths.isEmpty else { return }
@@ -672,6 +793,7 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
                         DROP TABLE IF EXISTS ocr_words;
                         DROP TABLE IF EXISTS pages_words;
                         DROP TABLE IF EXISTS pages_trigram;
+                        DROP TABLE IF EXISTS trigram_pending;
                         DROP TABLE IF EXISTS page_text;
                         DROP TABLE IF EXISTS documents;
                         DROP TABLE IF EXISTS meta;
@@ -705,10 +827,10 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
         }
     }
 
-    private static let documentColumns = "id, path, file_size, modified_at, page_count, status, kind, renderer, layout_version"
+    private static let documentColumns = "id, path, file_size, modified_at, page_count, status, kind, renderer, layout_version, file_id"
 
     private static func storedDocument(_ row: [String: SQLiteValue]) -> StoredDocument {
-        StoredDocument(
+        var doc = StoredDocument(
             id: row.int("id"),
             relativePath: row.text("path"),
             fileSize: row.int("file_size"),
@@ -718,6 +840,8 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
             kind: DocumentKind(rawValue: row.text("kind")) ?? .pdf,
             renderer: row.optionalText("renderer"),
             layoutVersion: row.optionalInt("layout_version").map(Int.init))
+        doc.fileID = row.optionalText("file_id")
+        return doc
     }
 
     /// All pages matching an FTS5 query in the given table (no LIMIT, documents of any status),
@@ -728,11 +852,18 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
         case .words: "pages_words"
         case .trigram: "pages_trigram"
         }
+        // Trigram: the pages still waiting for it are candidates too (one statement, one snapshot).
+        let pending = table == .trigram ? """
+            UNION ALL SELECT p.doc_id AS doc_id, p.page_index AS page_index, 0.0 AS score, p.text AS text
+            FROM trigram_pending t JOIN page_text p ON p.id = t.page_id
+            """ : ""
         return try using(.reader) { db in try db.query("""
-            SELECT p.doc_id AS doc_id, p.page_index AS page_index, bm25(\(name)) AS score, p.text AS text
-            FROM \(name) JOIN page_text p ON p.id = \(name).rowid
-            WHERE \(name) MATCH ?
-            ORDER BY p.doc_id, p.page_index
+            SELECT * FROM (
+              SELECT p.doc_id AS doc_id, p.page_index AS page_index, bm25(\(name)) AS score, p.text AS text
+              FROM \(name) JOIN page_text p ON p.id = \(name).rowid
+              WHERE \(name) MATCH ?
+              \(pending)
+            ) ORDER BY doc_id, page_index
             """, [.text(ftsQuery)]).map(Self.rawMatch) }
     }
 
@@ -748,19 +879,99 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
             var batch: [RawPageMatch] = []
             batch.reserveCapacity(size)
             var going = true
-            try db.queryEach("""
-                SELECT p.doc_id AS doc_id, p.page_index AS page_index, bm25(\(name)) AS score, p.text AS text
-                FROM \(name) JOIN page_text p ON p.id = \(name).rowid
-                WHERE \(name) MATCH ?
-                ORDER BY \(name).rowid
-                """, [.text(ftsQuery)]) { row in
+            func collect(_ row: [String: SQLiteValue]) throws -> Bool {
                 batch.append(Self.rawMatch(row))
                 guard batch.count == size else { return true }
                 going = try body(batch)
                 batch.removeAll(keepingCapacity: true)
                 return going
             }
+            // Trigram: then the pages still waiting for it (schema 4), in the same read transaction, so a page moved
+            // into the index meanwhile is in exactly one of the two. A document's pages are all indexed or all
+            // waiting (`fillTrigramIndex` takes whole documents), so they stay contiguous.
+            try db.transaction {
+                try db.queryEach("""
+                    SELECT p.doc_id AS doc_id, p.page_index AS page_index, bm25(\(name)) AS score, p.text AS text
+                    FROM \(name) JOIN page_text p ON p.id = \(name).rowid
+                    WHERE \(name) MATCH ?
+                    ORDER BY \(name).rowid
+                    """, [.text(ftsQuery)], collect)
+                if going, table == .trigram {
+                    try db.queryEach("""
+                        SELECT p.doc_id AS doc_id, p.page_index AS page_index, 0.0 AS score, p.text AS text
+                        FROM trigram_pending t JOIN page_text p ON p.id = t.page_id ORDER BY t.page_id
+                        """, [], collect)
+                }
+            }
             if going, !batch.isEmpty { _ = try body(batch) }
+        }
+    }
+
+    // MARK: Wortteil-Index (schema 4)
+
+    /// Pages still waiting for the trigram index, and all pages.
+    public func trigramProgress() throws -> (pending: Int, pages: Int) {
+        try using(.reader) { db in
+            let row = try db.query("SELECT (SELECT count(*) FROM trigram_pending) AS pending, (SELECT count(*) FROM page_text) AS pages", [])
+            return (Int(row.first?.int("pending") ?? 0), Int(row.first?.int("pages") ?? 0))
+        }
+    }
+
+    /// Moves waiting pages into the trigram index in one transaction: about `maxPages` (whole documents, in id order,
+    /// so a document is never half indexed). Returns the number of pages moved; 0 when none waits.
+    /// With `preferring` (relative path prefixes ending in "/", 1.4.0 P2) the documents below them go first.
+    @discardableResult
+    public func fillTrigramIndex(maxPages: Int, preferring prefixes: [String]) throws -> Int {
+        guard !prefixes.isEmpty else { return try fillTrigramIndex(maxPages: maxPages) }
+        let moved = try using(.writer) { db in
+            try db.transaction { () -> Int in
+                // Whole waiting documents below the prefixes, in id order, until about `maxPages` pages.
+                let match = prefixes.map { _ in "substr(d.path, 1, ?) = ?" }.joined(separator: " OR ")
+                // substr counts characters (code points), so the length is the prefix's code point count.
+                let charBinds = prefixes.flatMap { [SQLiteValue.int(Int64($0.unicodeScalars.count)), .text($0)] }
+                let docs = try db.query("""
+                    SELECT p.doc_id AS doc, count(*) AS n FROM trigram_pending t
+                    JOIN page_text p ON p.id = t.page_id JOIN documents d ON d.id = p.doc_id
+                    WHERE \(match) GROUP BY p.doc_id ORDER BY min(t.page_id)
+                    """, charBinds)
+                var chosen: [Int64] = [], pages = 0
+                for row in docs where pages < max(maxPages, 1) {
+                    chosen.append(row.int("doc"))
+                    pages += Int(row.int("n"))
+                }
+                guard !chosen.isEmpty else { return 0 }
+                let ids = chosen.map(String.init).joined(separator: ",")      // integers from the index itself
+                try db.run("""
+                    INSERT INTO pages_trigram(rowid, text)
+                    SELECT p.id, p.text FROM trigram_pending t JOIN page_text p ON p.id = t.page_id WHERE p.doc_id IN (\(ids))
+                    """, [])
+                try db.run("DELETE FROM trigram_pending WHERE page_id IN (SELECT id FROM page_text WHERE doc_id IN (\(ids)))", [])
+                return pages
+            }
+        }
+        return moved > 0 ? moved : try fillTrigramIndex(maxPages: maxPages)
+    }
+
+    @discardableResult
+    public func fillTrigramIndex(maxPages: Int) throws -> Int {
+        try using(.writer) { db in
+            try db.transaction {
+                // The last page of the document holding the `maxPages`-th waiting page (or the last waiting page).
+                let limit = try db.query("""
+                    SELECT max(p2.id) AS last FROM page_text p2 WHERE p2.doc_id = (
+                      SELECT p.doc_id FROM trigram_pending t JOIN page_text p ON p.id = t.page_id
+                      ORDER BY t.page_id LIMIT 1 OFFSET ?)
+                    """, [.int(Int64(max(maxPages, 1) - 1))]).first?.optionalInt("last")
+                    ?? (try db.query("SELECT max(page_id) AS last FROM trigram_pending", []).first?.optionalInt("last"))
+                guard let limit else { return 0 }
+                let moved = try db.query("SELECT count(*) AS n FROM trigram_pending WHERE page_id <= ?", [.int(limit)]).first?.int("n") ?? 0
+                try db.run("""
+                    INSERT INTO pages_trigram(rowid, text)
+                    SELECT p.id, p.text FROM trigram_pending t JOIN page_text p ON p.id = t.page_id WHERE t.page_id <= ?
+                    """, [.int(limit)])
+                try db.run("DELETE FROM trigram_pending WHERE page_id <= ?", [.int(limit)])
+                return Int(moved)
+            }
         }
     }
 
@@ -825,7 +1036,7 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
     }
 }
 
-private extension Dictionary where Key == String, Value == SQLiteValue {
+extension Dictionary where Key == String, Value == SQLiteValue {
     func int(_ key: String) -> Int64 {
         switch self[key] {
         case .int(let v)?: v

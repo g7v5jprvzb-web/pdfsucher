@@ -40,7 +40,7 @@ extension AppModel {
             let previous = addTask
             let task = Task {
                 await previous?.value
-                await requestAdd([url])
+                await requestAdd([url], fromPlace: true)
                 if addPrompt == nil { finishPendingPlace() }    // added at once (no prompt, policy)
             }
             addTask = task
@@ -95,6 +95,20 @@ extension AppModel {
             if FolderTree.path(to: folder, in: folderTree) == nil { filter.select(folder, adding: true) }   // toggles it off
         }
         if filter != folderFilter { folderFilter = filter }
+    }
+
+    /// 1.4.0 P2: each folder source works first on the files below the chosen folders inside it (layout, recognition,
+    /// Wortteil-Index); phase 1 keeps the whole tree. The source's own root as filter changes nothing.
+    func updateWorkPriority() {
+        for source in folderSources {
+            guard let index = indexes[source.path] else { continue }
+            let root = source.standardizedFileURL.path + "/"
+            let prefixes = folderFilter.folders.map { $0.standardizedFileURL.path + "/" }
+                .filter { $0.hasPrefix(root) && $0 != root }
+                .map { String($0.dropFirst(root.count)).precomposedStringWithCanonicalMapping }
+            index.setPriority(prefixes)
+            metrics.log("priority", ["source": IndexMetrics.hash(path: source.path), "prefixes": prefixes.count])
+        }
     }
 
     /// Sources removed: their folders leave the tree and the filter.

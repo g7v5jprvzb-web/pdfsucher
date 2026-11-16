@@ -143,7 +143,7 @@ final class SmokeTests: XCTestCase {
             ("Vorschau", app.buttons["Zurücksetzen"]),
             ("Darstellung", app.descendants(matching: .any)["toolbarFontReset"]),
             ("Word/PowerPoint", app.buttons["Folien-Cache leeren"]),
-            ("Speicher", app.buttons["Kachel-Cache leeren"]),
+            ("Speicher", app.descendants(matching: .any)["indexMetricsToggle"]),
             ("Tastatur", app.descendants(matching: .any)["tabIncludesSearchToggle"]),
         ]
         var settingsWindow = window.frame
@@ -440,8 +440,10 @@ final class SmokeTests: XCTestCase {
         let menu = app.descendants(matching: .any).matching(identifier: "sourcesMenu").firstMatch
         let text = { menu.title + " " + menu.label + " " + ((menu.value as? String) ?? "") }
         let deadline = Date().addingTimeInterval(15)
-        while !text().contains(expected), Date() < deadline { Thread.sleep(forTimeInterval: 0.3) }
-        XCTAssertTrue(text().contains(expected), "sources menu shows \(expected), was: \(text())")
+        // „Ersetzen“ shows „Quellen (0)“ for a moment, so the old „Quellen (1)“ alone proves nothing: two reads.
+        let shows = { text().contains(expected) && { Thread.sleep(forTimeInterval: 0.5); return text().contains(expected) }() }
+        while !shows(), Date() < deadline { Thread.sleep(forTimeInterval: 0.3) }
+        XCTAssertTrue(shows(), "sources menu shows \(expected), was: \(text())")
     }
 
     /// Spec 1.1 §7/§9: typing with the focus in the grid searches; ⌫, Esc, ⌘F, Return ticks, Tab order.

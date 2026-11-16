@@ -27,7 +27,7 @@ struct IndexStatusView: View {
             if let status = ViewerText.indexStatus(model.indexStatus, recognitionOn: model.ocrPreferences.recognizeText) {
                 if !model.summary.isEmpty { Text("·").foregroundStyle(.secondary) }
                 switch model.indexStatus {
-                case .building:
+                case .building, .preparingWordParts:
                     ProgressView().controlSize(.small)
                     Text(status).foregroundStyle(.secondary)
                 case .layingOut:

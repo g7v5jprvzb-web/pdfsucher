@@ -145,6 +145,13 @@ public final class SQLiteConnection: @unchecked Sendable {
         }
     }
 
+    /// Rows changed by the last INSERT/UPDATE/DELETE on this connection (`sqlite3_changes`); call it right after `run`
+    /// inside the same transaction body.
+    public var changes: Int {
+        gate.lock(); defer { gate.unlock() }
+        return state.withLock { Int(sqlite3_changes($0.db)) }
+    }
+
     /// BEGIN/COMMIT around `body`; ROLLBACK if it throws. Exclusive for the whole body.
     /// `run/query/execute` may be called from inside `body`. A nested call uses a SAVEPOINT,
     /// so a failure the outer body catches rolls back only the inner work.

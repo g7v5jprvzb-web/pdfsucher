@@ -1453,3 +1453,121 @@ Grundlage: interne Messnotiz, Ergebnis in docs/performance.md „office-speed“
   - AppModel: auch ein gezeigtes SlideKit-Deck setzt das „vor den Schriften gezeigt“-Flag; nach dem Erfolg werden die Kacheln einmal neu geladen (`foreignPagesRevision`). Test umbenannt: `successAfterDecksShownReloadsTilesOnce` (vorher: kein Neuladen, weil SlideKit stattdessen blockierte).
   - Risiko, nicht gemessen: SlideKit zeichnet jetzt mit Core Text, während registriert wird (vorher blockiert). Für TextKit (Word) schützt weiter das Font-Gate; Core Text selbst gilt als threadsicher.
 - **Nebenbefund (nur notiert):** Folienkacheln ohne gespeicherte Wortrahmen haben keine Markierungen, weil `SlidePDFPage` keine Textebene hat. Mit Index-Wortrahmen (`ocr`) sind sie da (Test `highlightsOnSlideTilesComeFromStoredWordBoxes`). Über `ForeignPageProvider.tile` ließe sich das nachrüsten.
+
+## 2026-11-16 — 1.3.9: Mess-Protokoll der Indizierung (Branch `index-metrics`)
+
+- **`IndexMetrics` (IndexKit):** JSON-Zeilen nach `~/Library/Logs/PDFSucher/index-metrics-<Datum>.jsonl` (lokales Datum; App ist nicht sandboxed). Aus = ein atomarer Ladevorgang je Aufruf, die Felder sind ein Autoclosure. An = Kodieren im Aufrufer, Puffern und Schreiben auf eigener serieller Queue (bei 32 KB oder nach 1 s; beim Beenden `flush`). Schreibfehler verwerfen den Puffer, nie blockieren. Schalter: `UserDefaults` `indexMetricsEnabled` (beim Start gelesen) und Toggle im Reiter „Speicher“.
+- **Datenschutz:** Pfade nur als `hash` = erste 12 Hex-Zeichen von SHA-256 des standardisierten absoluten Pfads, plus Endung; Quellen als Hash plus `depth` (Anzahl Pfadkomponenten). Test `onWritesJSONLinesWithoutPlainPathsOrText` prüft, dass weder Datei-, Ordnername, Text noch `/Users/`/`/var/` im Protokoll stehen.
+- **Lauf-ID:** jeder Schritt der AppModel-Warteschlange (Phase 1, Layout, OCR je Ordner) bekommt eine fortlaufende `run`, an den Indexer per `@TaskLocal IndexMetrics.run` durchgereicht (Task-Gruppen erben sie; OCR-Threads loggen nicht selbst). Der Auslöser (`trigger`) wird in `enqueueIndexing(_:trigger:)` gesammelt und beim nächsten Phase-1-Lauf des Ordners geschrieben (mehrere mit `+`). Layout/OCR-Läufe haben `trigger: queue`.
+- **Nicht trennbar:** OCR-Render und -Erkennung (eine Methode in `OCRSource`), daher eine Dauer je Seite. `layout_file.wait_ms` = Zeit vom Start der Layoutphase bis zum Start der Datei.
+- **Doppelarbeit:** `reindexed_file` nur innerhalb einer App-Sitzung (Menge im Logger); über Sitzungen hinweg erkennt das Skript dieselbe Dateiversion (Hash, Größe, Datum, Seite) mehrfach in den Logs.
+- **Indexer/AppModel nehmen ein `IndexMetrics`** (Vorgabe `.shared`), damit Tests in ein Temp-Verzeichnis schreiben.
+
+## 1.3.10 Speicher: Indexe und Caches gezielt löschen
+
+- **Speicher-Reiter:** eine Zeile je Ding auf der Platte (Größe + Knopf, Rückfrage per `confirmationDialog`; „Index löschen“ fragt wie bisher per NSAlert der App). Kompakt statt eigener Abschnitte, damit der Reiter ohne Scrollen passt (UI-Test `testSettingsTabsFitAndSizeIsKept`, letztes Element jetzt `indexMetricsToggle`).
+- **OCR „löschen“ = neu erkennen:** `resetOCR` markiert die Seiten neu; der alte Text bleibt bis zur neuen Erkennung durchsuchbar. Ein echtes Entfernen der OCR-Wörter (FTS-Tabellen) wurde bewusst nicht gebaut.
+- **Verwaiste Indexe:** nur Dateien der Form `<64 hex>.sqlite[-wal|-shm|-journal]` im Index-Ordner; behalten werden geladene Quellen, gemerkte fehlende Quellen (`rememberedMissing`) und jede in diesem Prozess geöffnete `FolderIndex` (auch entfernte Quellen, deren Store noch offen ist). Nur in der echten App (`AppModel.indexDirectory`), nie in UI-Tests.
+- **Mess-Protokolle löschen:** `IndexMetrics.deleteLogs()` schreibt den Puffer, schließt die offene Datei und löscht nur `index-metrics-*.jsonl`; danach beginnt (falls an) eine neue Datei.
+- **Quellen-Menü:** Untermenü je Quelle statt Rechtsklick (NSMenu-Einträge haben kein eigenes Kontextmenü).
+
+## 2026-11-16 — index-speed-1: Phase 1 schreibt entkoppelt, größte Dateien zuerst
+
+- **Schreiber:** `BatchWriter` (Indexer.swift). Fertige Batches (`batchSize`, 50) gehen an je einen eigenen Task, der nach dem
+  vorigen schreibt (Reihenfolge bleibt, ein Schreiber zur Zeit). Höchstens `writesInFlight` = 2 Batches warten oder werden
+  geschrieben; ein weiterer wartet in `submit` (Gegendruck, gemessen als `writer_wait_ms` in `phase_end`). Speicher damit
+  höchstens ≈ 3 Batches + laufende Extraktionen. Die Ergebnisschleife startet währenddessen neue Extraktionen.
+- **Semantik erhalten:** Jeder Weg aus `run` wartet alle Schreib-Tasks ab (`drain`), damit kein Schreiben einen Lauf
+  überlebt (sonst schriebe er nach einem Wipe/Neustart, `resetCount`). Abbruch: offene Datei-Ergebnisse gehen noch in den
+  Schreiber, dann `drain`, Fehler nur geloggt, wie vorher. Ein fehlgeschlagener Batch lässt alle späteren ungeschrieben
+  (verkettete Tasks); der Lauf wirft den ersten Fehler. Unterschied: ein Schreibfehler fällt erst beim nächsten
+  `submit`/`drain` auf, nicht sofort; Fortschritt kommt weiter je Datei, ein Batch ist ggf. einen Batch später durchsuchbar.
+- **Reihenfolge:** Arbeitsliste nach Dateigröße absteigend, Gleichstand nach Pfad (`sortForExtraction`). Kein Test erwartete
+  die Scan-Reihenfolge. Folge: das erste Batch (frühe Treffer) besteht aus großen Dateien und kommt etwas später.
+- **Tests:** `IndexerWriterTests` (Reihenfolge, Gegendruck, Fehler stoppt Spätere, Größe zuerst, Abbruch während des Schreibens
+  speichert alles Gemeldete und danach schreibt nichts mehr — schlägt ohne `drain` fehl, geprüft).
+- Zahlen in docs/performance.md „index-speed-1“.
+
+## 2026-11-16 — 1.3.11 (Build 19): storage-cleanup + index-speed-1 zusammengeführt (Branch `release-1.3.11`)
+
+- Ab `storage-cleanup` (26db6c2, 1.3.10/18, installiert gewesen), `index-speed-1` (c938766) mit --no-ff gemergt. Code ohne
+  Konflikt (IndexStore.swift automatisch). Konflikte nur in decisions.md (beide Einträge behalten) und
+  release-notes-1.3.10.md (Stand von storage-cleanup behalten, denn so wurde 1.3.10 installiert; die Geschwindigkeit steht in
+  release-notes-1.3.11.md). Die Speed-Einträge oben, die „1.3.10“ nennen, meinen den nie installierten Stand des Branches.
+
+## 2026-11-16 — 1.3.12: Wortteil-Index (Trigramm) im Hintergrund nach Phase 1 (Branch `index-speed-2`)
+
+- **Schema 4** (`IndexStore`): Tabelle `trigram_pending(page_id)`. Invariante: jede Seite steht in genau einem von
+  `pages_trigram` und `trigram_pending`. Trigger: Einfügen mit `source = 'text'` (Phase 1) → nur Wort-Index + wartend; andere
+  Quellen (`layout`) → beide Indizes sofort. Löschen: Trigramm-'delete' nur, wenn die Seite nicht wartet (ein 'delete' mit
+  nie indiziertem Text würde den externen-Inhalt-Index beschädigen), Wartezeile weg. Textänderung (OCR): eine indizierte
+  Seite wird sofort nachgeführt, eine wartende bleibt wartend und wird später mit dem aktuellen Text übertragen.
+- **Migration 3 → 4** in einer Transaktion (Tabelle anlegen, Trigger tauschen, Version setzen): alle Seiten eines 3er-Index sind
+  schon im Trigramm-Index, nichts wird neu indiziert. Andere Versionen weiter: Neuaufbau wie bisher.
+- **Aufbau:** `IndexStore.fillTrigramIndex(maxPages:)` überträgt ganze Dokumente in Id-Reihenfolge (≈ `Indexer.wordPartsBatch`
+  = 1000 Seiten, ≈ 0,3 s je Transaktion), damit ein Dokument nie halb indiziert ist (die Suche braucht zusammenhängende Seiten
+  je Dokument). `Indexer.buildWordParts` nimmt den Zug wie die anderen Phasen, prüft vor jeder Transaktion auf Abbruch.
+- **Suche ohne Lücken:** `matchBatches`/`match` auf `.trigram` liefern zusätzlich alle wartenden Seiten als Kandidaten
+  (Bewertung 0), in einer Lesetransaktion mit der FTS-Abfrage (eine in der Zwischenzeit übertragene Seite steht so in genau
+  einem Teil). `PageMatcher` prüft wie immer jede Kandidatenseite; Wort- und Präfixsuche unverändert. Folge: `match(.trigram)`
+  ist eine Obermenge, solange Seiten warten (Tests, die genaue Trigramm-Treffer erwarten, füllen den Index vorher). FTS5s
+  `integrity-check` mit `rank = 1` meldet bei wartenden Seiten „malformed“ (Inhaltstabelle hat mehr Zeilen); kein
+  Produktionscode ruft ihn auf, die Tests prüfen nach dem Füllen.
+- **Warteschlange (AppModel):** `wordPartsPending` nach jedem erfolgreichen Phase-1-Lauf. Reihenfolge: Phase 1 aller Ordner →
+  Einzeldateien (Layout/OCR, klein und gewünscht) → Wortteil-Index → Ordner-Layout → Ordner-OCR. Neues Phase-1-Material und neue
+  Einzeldateien unterbrechen ihn (`preemptWordParts`, Mess-Protokoll `preempt`), er setzt fort. Während eines Folien-Cache-Jobs
+  läuft er ebenfalls (nur Layout wartet). Ein Fehler (außer Schaden → Neuaufbau) wird nur geloggt: die Suche bleibt korrekt,
+  der nächste Phase-1-Lauf stellt ihn wieder an.
+- **Sichtbar:** `IndexStatus.preparingWordParts` → „Wortteil-Suche wird vorbereitet … (x %)“ (x = Anteil dieses Schritts);
+  hinter der Trefferzahl einer Suche mit Trigramm-Plan „Wortteil-Suche kann gerade langsamer sein“, solange ein geladener Ordner
+  wartet oder gerade aufgebaut wird.
+- **Tests:** `WordPartsIndexTests` (IndexKit: Warten/Übertragen, Kandidaten, Änderungen an wartenden und indizierten Seiten inkl.
+  OCR und Layout, ganze Dokumente, Migration 3 → 4, Abbruch/Fortsetzen), `WordPartsSearchTests` (SearchKit: gleiche Treffer bei
+  leerem, halbem und vollem Trigramm-Index, auch mit frühen Treffern; schlägt ohne die Kandidaten fehl, geprüft),
+  `WordPartsQueueTests` (AppCore: Reihenfolge, Unterbrechung, Status, Hinweis). Angepasst: `IndexStoreTests`
+  (`trigramFindsInfix`, `upsertReplacesPages`, `expectFTSIntact` füllen zuerst), `IndexStoreOCRTests` (Schema 4,
+  `rerunWithDifferentTextReplacesOldText` füllt zuerst).
+
+## 2026-11-16 — 1.4.0 (Build 21): Pakete P1–P7 (Branch `release-1.4.0` ab `index-speed-2`)
+
+- **P1 Kind-Indizes übernehmen** (`IndexStore+Import`): Beim ersten `update` einer `FolderIndex`-Instanz (im Indexer-Zug, vor Phase 1)
+  werden Index-Dateien im selben Ordner gesucht, deren `meta.folder_path` unter der Wurzel liegt (Schema 3–5), flachste zuerst. Per
+  ATTACH in einer Transaktion: Dokumente, die der Eltern-Index nicht hat (Pfad mit Präfix, NFC), mit Seiten (`source`, `needs_ocr`),
+  OCR-Wortrahmen, Renderer/Version/`needs_layout`, Größe/Datum. Seiten kommen über die Trigger an (Text-Seiten warten auf den
+  Trigramm-Index). Layout-Renderer je Art: hat der Eltern-Index keinen Eintrag, übernimmt er den des Kindes; weicht er ab, kommen
+  dessen Word/PowerPoint-Dokumente ohne Seiten und warten auf Layout. `meta imported:<datei>` verhindert eine zweite Übernahme
+  (sonst kämen gelöschte Dateien aus dem verwaisten Kind-Index jede Sitzung zurück). Der Kind-Index bleibt liegen und ist damit
+  „verwaist“ (Speicher-Reiter). Fehler: nur Log, Phase 1 liest dann eben. Mess-Protokoll `source_import`.
+- **P2 Orte sofort:** `requestAdd(_:fromPlace:)`: bei „Fragen“ fügt ein Klick auf einen Ort ohne Rückfrage hinzu; „Ersetzen“ und
+  „Zusätzlich“ unverändert, Drops/⌘O fragen weiter. Begründung: Ein Ort-Klick heißt eindeutig „diesen dazu“, die Frage war für
+  Drops gedacht (hinzufügen oder ersetzen); Chris' Wunsch „sofort loslegen“. Tests `placeOutsideLoadsAtOnceAndFilters` (vorher
+  `placeOutsideAsksThenLoadsAndFilters`) und `cancelledDropChangesNothing` (vorher `cancelledPlaceChangesNothing`) bewusst angepasst.
+  **Vorrang nach Filter:** `FolderIndexing.setPriority` mit den relativen Pfaden der gewählten Ordner je Quelle; Layout und OCR
+  nehmen ihre nächste Aufgabe aus `PreferredOrder` (neu sortiert nur, wenn sich der Filter ändert), der Wortteil-Index füllt
+  ganze Dokumente unter den Präfixen zuerst (`fillTrigramIndex(preferring:)`). Laufende Arbeit wird dafür nicht abgebrochen.
+- **P3 Plattenänderungen:** `EventFilter.changedScopes` liefert je Quelle die Elternordner der geänderten Einträge (geschachtelte
+  zusammengefasst); verlorene Ereignisse, Wurzeländerung oder ein Eintrag direkt in der Wurzel → voller Scan. AppModel sammelt die
+  Ordner (`diskScopes`) bis zum Lauf; nur wenn der Lauf ausschließlich wegen Plattenänderungen kommt, ist er begrenzt
+  (`needsFullScan` bei jedem anderen Auslöser, Schaden, Abbruch oder Fehler eines begrenzten Laufs). `Indexer.update(scopes:)`
+  scannt nur diese Ordner mit derselben Tiefengrenze (`FolderScanner.scoped(depth:)`), vergleicht nur Dokumente darunter; ein
+  verschwundener Ordner (Wurzel vorhanden) entfernt seine Dokumente; ein Neustart nach Wipe scannt voll. Layout bei Plattenänderung:
+  `stopLayoutGently` (Zähler im `PriorityBox`): kein weiterer Start, laufende Dateien werden fertig und gespeichert, dann
+  `CancellationError` (Ordner vorn in `layoutPending`). OCR verlor schon vorher nichts (laufende Seiten werden gespeichert).
+- **P4 Verschoben/umbenannt** (Schema 5): `documents.file_id` = Volume-UUID/Datei-ID (`fileIdentifierKey`, Volume je Ordner,
+  bei Links das des Ziels). Neue Datei mit gleicher Identität, Größe, Datum (±1 ms) und Art wie ein im selben Lauf verschwundenes
+  Dokument → `IndexStore.move` (Pfad ändern, alles bleibt). Mehrfach vorkommende Identität (Hardlinks), fehlende Identität,
+  andere Art, andere Größe/Datum → neu lesen. Migration 3/4 → 5 in place (Spalte nur anlegen, wenn sie fehlt); alte Dokumente
+  bekommen ihre Identität beim nächsten Scan (`setFileIDs`, ohne Lesen). Rückweg: 1.3.x erkennt Schema 5 nicht und baut neu auf.
+- **P5 Word vorläufig:** `WordPreviewText` (OfficeKit) liest `w:t`/`w:p`/`w:br`/`w:tab` des Hauptteils (ohne gelöschte
+  Revisionen, Kopf/Fuß/Fußnoten), normalisiert. Phase 1 speichert ihn als eine Seite (Index 0), Status ok, `needs_layout = 1`,
+  `page_count = 0` (Regel im Store: wartend = Seitenzahl unbekannt; das Raster zeigt dann nur Trefferseiten bzw. „wird
+  vorbereitet“, `RowPages` deckt das ab), ohne Wortrahmen (`ocrPage` liefert nil → keine falschen Markierungen). Das Layout
+  löscht und ersetzt die Seiten. .doc und PowerPoint wie bisher. **Nicht gemacht:** Word-Layout selbst beschleunigen
+  (Wortrahmen nur für sichtbare Seiten): Index-Markierungen und Seitentreffer brauchen die Wortrahmen aller Seiten; nicht sicher.
+- **P6 langsame PDFs** (`SlowPDFProfile`, opt-in): die 10 langsamsten aus Chris' Protokoll (lokal per Hash zugeordnet): 85–95 %
+  der Zeit in `PDFPage.string` (PDFKit), Normalisierung 3–11 %, Öffnen < 1 %; Ursache viele Seiten/viel Text (mehrere tausend Seiten,
+  Millionen Zeichen) bzw. teure Einzelseiten (bis 228 ms). Zwei der zehn sind Dubletten (gleiche Datei an zwei Orten). Keine
+  sichere Verbesserung umgesetzt; die Normalisierung zu ändern lohnt die Gefahr für die Markierungs-Zuordnung nicht.
+- **P7 OCR:** `Indexer.ocrParallelism` = Kerne/4, 2…4 (`OCRParallelismBenchmark`, opt-in). dpi, Genauigkeit unverändert, Text in
+  allen Stufen identisch. Tests `atMostOCRParallelismAtOnce`, `wipeDuringOCRStopsAndStartsOver` (12 statt 6 Bilder, damit er bei 4
+  parallel noch etwas prüft) angepasst.

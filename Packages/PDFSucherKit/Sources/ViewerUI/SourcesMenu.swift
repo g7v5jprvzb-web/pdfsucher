@@ -1,8 +1,11 @@
 // SourcesMenu.swift — 1.1 Task 3 (spec 1.1 §4 „Hinzufügen statt Ersetzen“)
+import AppKit
 import SearchKit
 import SwiftUI
 
-/// „Quellen (n)“: every loaded source with ✕ to remove it, plus „Alle entfernen“.
+/// „Quellen (n)“: every loaded source as a submenu (remove it, delete and rebuild its index, show it in the Finder),
+/// plus „Alle entfernen“. 1.3.10: a submenu, because a menu item cannot have a context menu of its own (macOS menus
+/// treat a right click like a click).
 struct SourcesMenu: View {
     let model: any ViewerModel
 
@@ -11,6 +14,7 @@ struct SourcesMenu: View {
         let title: String
         let detail: String
         let symbol: String
+        var isFolder: Bool { symbol == "folder" }
         var accessibilityLabel: String { "„\(title)“ entfernen" }
     }
 
@@ -27,13 +31,24 @@ struct SourcesMenu: View {
         let sources = model.sources
         Menu {
             ForEach(Self.entries(sources), id: \.url) { entry in
-                Button {
-                    model.removeSource(entry.url)
+                Menu {
+                    Button {
+                        model.removeSource(entry.url)
+                    } label: {
+                        Label(ViewerText.removeAsSource, systemImage: "xmark")
+                    }
+                    .help("\(entry.detail) entfernen")
+                    .accessibilityLabel(entry.accessibilityLabel)
+                    if entry.isFolder {
+                        Button(ViewerText.rebuildIndex) { model.requestDeleteIndex(for: entry.url) }
+                            .help("Löscht den gespeicherten Text von „\(entry.title)“ (nach Rückfrage) und indexiert neu")
+                    }
+                    Divider()
+                    Button(ViewerText.revealInFinder) { NSWorkspace.shared.activateFileViewerSelecting([entry.url]) }
                 } label: {
-                    Label("✕  \(entry.title)", systemImage: entry.symbol)
+                    Label(entry.title, systemImage: entry.symbol)
                 }
-                .help("\(entry.detail) entfernen")
-                .accessibilityLabel(entry.accessibilityLabel)
+                .help(entry.detail)
             }
             if !sources.isEmpty {
                 Divider()
@@ -44,7 +59,7 @@ struct SourcesMenu: View {
         }
         .fixedSize()
         .disabled(sources.isEmpty)
-        .help("Geladene Ordner und PDFs; ein Eintrag entfernt die Quelle")
+        .help("Geladene Ordner und Dateien; je Eintrag: entfernen, Index löschen und neu aufbauen, im Finder zeigen")
         .accessibilityIdentifier("sourcesMenu")
     }
 }

@@ -191,13 +191,14 @@ struct IndexerOCRTests {
         #expect(try env.store.match("Fassung", in: .words).count == 1)
     }
 
-    @Test func atMostTwoAtOnce() async throws {
+    /// 1.4.0 P7: at most `ocrParallelism` (2 to 4 by cores; it was 2 before) at once.
+    @Test func atMostOCRParallelismAtOnce() async throws {
         let env = try makeEnv(); defer { env.cleanup() }
         for i in 0..<8 { try addImage(env, "bild\(i).png") }
         let stub = StubOCR(delay: 0.05)
         let report = try await Indexer(root: env.root, store: env.store, ocr: stub).update { _ in }
         #expect(stub.calls.count == 8 && report.ocr.recognized == 8)
-        #expect(stub.maxRunning == 2)
+        #expect(stub.maxRunning == Indexer.ocrParallelism)
     }
 
     @Test(.timeLimit(.minutes(1)))
@@ -325,7 +326,8 @@ struct IndexerOCRTests {
     @Test(.timeLimit(.minutes(1)))
     func wipeDuringOCRStopsAndStartsOver() async throws {
         let env = try makeEnv(); defer { env.cleanup() }
-        for i in 0..<6 { try addImage(env, "bild\(i).png") }
+        // 12 images (1.4.0: up to 4 recognitions at once): pass 1 must stop well before all of them.
+        for i in 0..<12 { try addImage(env, "bild\(i).png") }
         let store = env.store
         let wiped = Mutex(false)
         let stub = StubOCR(delay: 0.05) { url, _ in
@@ -336,9 +338,9 @@ struct IndexerOCRTests {
         }
         let report = try await Indexer(root: env.root, store: env.store, ocr: stub).update { _ in }
         // Pass 1 stops starting new pages after the wipe; pass 2 indexes and recognizes everything.
-        #expect(stub.calls.count < 12, "\(stub.calls)")
+        #expect(stub.calls.count < 24, "\(stub.calls)")
         #expect(try env.store.pendingOCRJobs().isEmpty)
-        #expect(try env.store.documents().count == 6)
-        #expect(report.ocr.recognized == 6)
+        #expect(try env.store.documents().count == 12)
+        #expect(report.ocr.recognized == 12)
     }
 }
