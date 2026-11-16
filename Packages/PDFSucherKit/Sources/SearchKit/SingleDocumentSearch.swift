@@ -36,13 +36,15 @@ public struct SingleDocumentSearch: Sendable {
     public func search(url: URL, query: ParsedQuery, searchNames: Bool = false) throws -> DocumentHit? {
         guard !query.isEmpty else { return nil }
         // Not `url.resourceValues`: URL caches those, and a changed file would look unchanged.
-        let modifiedAt = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let modifiedAt = attributes?[.modificationDate] as? Date
+        let fileSize = (attributes?[.size] as? NSNumber)?.int64Value
         let pages = try cache.pages(for: url, modifiedAt: modifiedAt) { try source.pages(of: url) }
         let matcher = PageMatcher(query)
         let nameMatch = searchNames && matcher.matchCount(in: DocumentHit.searchableName(of: url.lastPathComponent)) != nil
         if pages.allSatisfy({ $0.text.allSatisfy(\.isWhitespace) }) {
             guard nameMatch else { throw SingleDocumentSearchError.noText(url) }
-            return hit(url, modifiedAt: modifiedAt, pageHits: [], pageCount: pages.count, nameMatch: true)
+            return hit(url, modifiedAt: modifiedAt, fileSize: fileSize, pageHits: [], pageCount: pages.count, nameMatch: true)
         }
 
         var pageHits: [PageHit] = []
@@ -54,7 +56,7 @@ public struct SingleDocumentSearch: Sendable {
         }
         guard !pageHits.isEmpty || nameMatch else { return nil }
         pageHits.sort { $0.pageIndex < $1.pageIndex }
-        return hit(url, modifiedAt: modifiedAt, pageHits: pageHits, pageCount: pages.count, nameMatch: nameMatch)
+        return hit(url, modifiedAt: modifiedAt, fileSize: fileSize, pageHits: pageHits, pageCount: pages.count, nameMatch: nameMatch)
     }
 
     /// Whether the file name (without extension) matches `query` (spec 1.3.2 §1). For a file whose text cannot be
@@ -63,7 +65,7 @@ public struct SingleDocumentSearch: Sendable {
         !query.isEmpty && PageMatcher(query).matchCount(in: DocumentHit.searchableName(of: url.lastPathComponent)) != nil
     }
 
-    private func hit(_ url: URL, modifiedAt: Date?, pageHits: [PageHit], pageCount: Int, nameMatch: Bool) -> DocumentHit {
+    private func hit(_ url: URL, modifiedAt: Date?, fileSize: Int64?, pageHits: [PageHit], pageCount: Int, nameMatch: Bool) -> DocumentHit {
         let total = pageHits.reduce(0) { $0 + $1.matchCount }
         return DocumentHit(
             url: url,
@@ -76,7 +78,8 @@ public struct SingleDocumentSearch: Sendable {
             pageCount: pageCount,
             kind: kind,
             isSimplified: isSimplified,
-            nameMatch: nameMatch)
+            nameMatch: nameMatch,
+            fileSize: fileSize)
     }
 }
 

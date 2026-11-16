@@ -36,10 +36,12 @@ public struct DocumentHit: Sendable, Equatable, Identifiable {
     /// The file name (without extension) matched the query (spec 1.3.2 §1). With empty `pageHits` the name
     /// alone matched: the row shows the first pages and „Treffer im Dateinamen“.
     public let nameMatch: Bool
+    /// File size in bytes; nil when unknown (shown behind the name when the setting is on, 1.3.7).
+    public let fileSize: Int64?
 
     public init(url: URL, relativePath: String, modifiedAt: Date, pageHits: [PageHit], totalMatches: Int, relevance: Double,
                 sourceRoot: URL, pageCount: Int, isUnreadable: Bool = false, kind: DocumentKind = .pdf,
-                isSimplified: Bool = false, nameMatch: Bool = false) {
+                isSimplified: Bool = false, nameMatch: Bool = false, fileSize: Int64? = nil) {
         self.url = url
         self.relativePath = relativePath
         self.modifiedAt = modifiedAt
@@ -52,13 +54,14 @@ public struct DocumentHit: Sendable, Equatable, Identifiable {
         self.kind = kind
         self.isSimplified = isSimplified
         self.nameMatch = nameMatch
+        self.fileSize = fileSize
     }
 
     /// This hit with `nameMatch` set.
     public func withNameMatch(_ match: Bool = true) -> DocumentHit {
         DocumentHit(url: url, relativePath: relativePath, modifiedAt: modifiedAt, pageHits: pageHits, totalMatches: totalMatches,
                     relevance: relevance, sourceRoot: sourceRoot, pageCount: pageCount, isUnreadable: isUnreadable, kind: kind,
-                    isSimplified: isSimplified, nameMatch: match)
+                    isSimplified: isSimplified, nameMatch: match, fileSize: fileSize)
     }
 
     /// The name the file name search looks at: the file name without its extension (no folders).

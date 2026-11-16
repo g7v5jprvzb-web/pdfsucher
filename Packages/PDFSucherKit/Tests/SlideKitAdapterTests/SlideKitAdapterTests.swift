@@ -1,7 +1,9 @@
 // SlideKitAdapterTests.swift — SlideKit adapter: layout source, page provider, tile hook, deck cache.
 import AppKit
+import ImageIO
 import Foundation
 import PDFKit
+import Synchronization
 import Testing
 import IndexKit
 import OOXMLKit
@@ -217,6 +219,7 @@ private struct WordStub: ForeignPageProvider {
 
     @Test func contentVersionFollowsTheFontSetting() throws {
         let url = URL(fileURLWithPath: "/tmp/Folien.pptx")
+        SlideDeck.prewarmFonts()          // „~“ only while Office's fonts are not registered (office-speed)
         let pp = SlideKitPages(fontSubstitution: .powerPoint).contentVersion(url)
         let similar = SlideKitPages(fontSubstitution: .similar).contentVersion(url)
         #expect(pp == "slidekit:101:r1")
@@ -353,10 +356,68 @@ private struct WordStub: ForeignPageProvider {
         #expect(try cache.deck(for: url, fontSubstitution: .powerPoint).slideCount == 4)
     }
 
-    /// 1.3.2: a deck at tile/preview size keeps up to ~375 MB of decoded images (docs/performance.md), so the shared
-    /// cache keeps two decks, not four.
-    @Test func sharedCacheKeepsTwoDecks() {
-        #expect(SlideDeckCache.shared.capacity == 2)
+    /// office-speed: the shared cache is bounded by decoded image bytes (a deck drawn large keeps up to ~375 MB,
+    /// docs/performance.md „1.3.2“) and by a count, no longer by two decks.
+    @Test func sharedCacheIsBoundedByMemoryAndCount() {
+        #expect(SlideDeckCache.shared.capacity == 10)
+        #expect(SlideDeckCache.shared.maxBytes == 400 * 1024 * 1024)
+    }
+
+    /// office-speed: six tile workers missing the same deck at once opened it six times; now one opens, the others wait.
+    @Test func simultaneousMissesOpenTheDeckOnce() throws {
+        let tmp = try TempDir()
+        let url = try OfficeFixtures.pptx(slides: (0..<300).map { "Folie \($0) mit etwas Text" }, name: "gross.pptx", in: tmp.url)
+        let cache = SlideDeckCache()
+        DispatchQueue.concurrentPerform(iterations: 8) { _ in
+            _ = try? cache.deck(for: url, fontSubstitution: .powerPoint)
+        }
+        #expect(cache.opens == 1)
+        #expect(cache.count == 1)
+    }
+
+    @Test func aFailedOpenIsSharedByTheWaitersAndNotKept() throws {
+        let tmp = try TempDir()
+        let garbage = try Decks.garbage(in: tmp.url)
+        let cache = SlideDeckCache()
+        let failures = Mutex(0)
+        DispatchQueue.concurrentPerform(iterations: 8) { _ in
+            do { _ = try cache.deck(for: garbage, fontSubstitution: .powerPoint) } catch is SlideKitError {
+                failures.withLock { $0 += 1 }
+            } catch {}
+        }
+        #expect(failures.withLock { $0 } == 8)
+        #expect(cache.count == 0 && cache.failureCount == 1)
+    }
+
+    /// Decks with decoded images beyond `maxBytes` push the older ones out; the most recently used deck stays even
+    /// alone above the limit. Decks without decoded images cost nothing here.
+    private static func png(_ image: CGImage) throws -> Data {
+        let data = NSMutableData()
+        let destination = try #require(CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil))
+        CGImageDestinationAddImage(destination, image, nil)
+        #expect(CGImageDestinationFinalize(destination))
+        return data as Data
+    }
+
+    @Test func dropsOlderDecksBeyondTheMemoryLimit() throws {
+        let tmp = try TempDir()
+        let png = try Self.png(ImageFixtures.render(text: "Bild", size: CGSize(width: 800, height: 600)))
+        let urls = try (0..<3).map { try OfficeFixtures.pptx(slides: ["Bild \($0)"], slideImages: [png], name: "b\($0).pptx", in: tmp.url) }
+        let cache = SlideDeckCache(capacity: 8, maxBytes: 1)
+        let plain = try (0..<2).map { try Decks.basic(in: tmp.url, name: "p\($0).pptx") }
+        for url in plain { _ = try cache.deck(for: url, fontSubstitution: .powerPoint) }
+        #expect(cache.count == 2)                            // nothing decoded: no bytes
+        let first = try cache.deck(for: urls[0], fontSubstitution: .powerPoint)
+        #expect(first.thumbnail(0, maxPixel: 256) != nil)
+        #expect(first.cachedImageBytes > 0)
+        let second = try cache.deck(for: urls[1], fontSubstitution: .powerPoint)
+        #expect(second.thumbnail(0, maxPixel: 256) != nil)
+        _ = try cache.deck(for: urls[2], fontSubstitution: .powerPoint)
+        // urls[1] was the newest with bytes when urls[2] came: the older urls[0] went first, then urls[1].
+        #expect(!cache.contains(urls[0], fontSubstitution: .powerPoint))
+        #expect(!cache.contains(urls[1], fontSubstitution: .powerPoint))
+        #expect(cache.contains(urls[2], fontSubstitution: .powerPoint))
+        #expect(cache.totalImageBytes <= 1 || cache.count == 1)
     }
 
     @Test func dropsTheLeastRecentlyUsedDeck() throws {
@@ -438,6 +499,23 @@ private struct WordStub: ForeignPageProvider {
         let own = SlideDeckCache()                                  // the check does see a deck (own cache: no race)
         _ = try own.deck(for: url, fontSubstitution: .powerPoint)
         #expect(own.contains(url, fontSubstitution: .powerPoint))
+    }
+
+    /// office-speed: the layout uses a deck the tiles already opened, but never opens one into that cache.
+    @Test func layoutBorrowsAnOpenDeckWithoutAddingOne() async throws {
+        let tmp = try TempDir()
+        let open = try Decks.basic(in: tmp.url, name: "offen.pptx")
+        let closed = try Decks.basic(in: tmp.url, name: "zu.pptx")
+        let viewer = SlideDeckCache()
+        let deck = try viewer.deck(for: open, fontSubstitution: .powerPoint)
+        #expect(viewer.openDeck(for: open, fontSubstitution: .powerPoint)?.store === deck.store)
+        #expect(viewer.openDeck(for: open, fontSubstitution: .similar) == nil)
+        #expect(viewer.openDeck(for: closed, fontSubstitution: .powerPoint) == nil)
+        let source = SlideKitLayoutSource(fontSubstitution: .powerPoint, borrowing: viewer)
+        #expect(try await source.layout(of: open, kind: .powerpoint).pages.count == 2)
+        #expect(try await source.layout(of: closed, kind: .powerpoint).pages.count == 2)
+        #expect(viewer.count == 1 && viewer.opens == 1)
+        #expect(!viewer.contains(closed, fontSubstitution: .powerPoint))
     }
 
     @Test func unreadableFileIsRetriedNotMarkedBroken() async throws {

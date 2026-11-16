@@ -125,7 +125,7 @@ public struct SearchService: Sendable {
             result.append(DocumentHit(url: root.appendingPathComponent(doc.relativePath, isDirectory: false), relativePath: doc.relativePath,
                                       modifiedAt: doc.modifiedAt, pageHits: [], totalMatches: 0, relevance: 0, sourceRoot: root,
                                       pageCount: doc.status == .error ? 0 : doc.pageCount, isUnreadable: doc.status == .error,
-                                      kind: doc.kind, isSimplified: doc.isSimplified, nameMatch: true))
+                                      kind: doc.kind, isSimplified: doc.isSimplified, nameMatch: true, fileSize: doc.fileSize))
         }
         return result
     }
@@ -149,7 +149,8 @@ public struct SearchService: Sendable {
                 sourceRoot: root,
                 pageCount: doc.pageCount,
                 kind: doc.kind,
-                isSimplified: doc.isSimplified)
+                isSimplified: doc.isSimplified,
+                fileSize: doc.fileSize)
         }
     }
 

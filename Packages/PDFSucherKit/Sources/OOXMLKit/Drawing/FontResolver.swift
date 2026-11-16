@@ -65,11 +65,21 @@ public final class FontResolver: Sendable {
     /// `work` must never call back into `offPool` (it would deadlock on the serial queue).
     private static func offPool<T: Sendable>(_ work: @escaping @Sendable () -> T) -> T {
         dispatchPrecondition(condition: .notOnQueue(fontQueue))
+        dispatchPrecondition(condition: .notOnQueue(provisionalQueue))
         let box = ResultBox<T>()
         let done = DispatchSemaphore(value: 0)
-        fontQueue.async {
-            box.value = work()
-            done.signal()
+        // A caller that does not wait for Office's registration (`withoutWaitingForRegistration`) must not queue
+        // behind it on the font queue: its own queue, marked the same way for the work.
+        if notWaiting {
+            provisionalQueue.async {
+                box.value = withoutWaitingForRegistration(work)
+                done.signal()
+            }
+        } else {
+            fontQueue.async {
+                box.value = work()
+                done.signal()
+            }
         }
         done.wait()
         return box.value!  // set before signal; never nil here (not file data)
@@ -82,6 +92,8 @@ public final class FontResolver: Sendable {
     /// running are not tracked. `generation` keeps a map built before a registration from being stored after it.
     private struct InstalledState {
         var map: [String: String]?
+        /// Families before the registration, for callers that do not wait for it (`withoutWaitingForRegistration`).
+        var provisional: [String: String]?
         var generation = 0
         /// How often the list was built (tests).
         var builds = 0
@@ -90,6 +102,13 @@ public final class FontResolver: Sendable {
 
     private static var installed: [String: String] {
         if let cached = installedState.withLock({ $0.map }) { return cached }
+        if notWaiting { return provisionalFamilies }
+        return registeredFamilies
+    }
+
+    /// The list after Office's registration (which runs here once, on the font queue).
+    private static var registeredFamilies: [String: String] {
+        if let cached = installedState.withLock({ $0.map }) { return cached }
         // Built and stored on the serial font queue: concurrent first callers queue up behind the first and then
         // find its list instead of building their own.
         return offPool {
@@ -97,13 +116,55 @@ public final class FontResolver: Sendable {
             let generation = installedState.withLock { $0.generation }
             if let cached = installedState.withLock({ $0.map }) { return cached }
             let map = availableFamilies()
-            installedState.withLock { state in
+            let hadProvisional = installedState.withLock { state -> Bool in
                 state.builds += 1
                 if state.generation == generation, state.map == nil { state.map = map }
+                defer { state.provisional = nil }
+                return state.provisional != nil
             }
+            // Lookups of the time before are not kept (they were not stored), but be safe: start the memos over.
+            if hadProvisional { memos.withLock { $0 = Memos(generation: $0.generation &+ 1) } }
             return map
         }
     }
+
+    /// The families installed now, without Office's registration (substitutes until it is done); built once on the
+    /// provisional queue and dropped when the registered list is built.
+    private static var provisionalFamilies: [String: String] {
+        if let cached = installedState.withLock({ $0.provisional }) { return cached }
+        return offPool {
+            if let cached = installedState.withLock({ $0.provisional }) { return cached }
+            let map = availableFamilies()
+            installedState.withLock { if $0.map == nil { $0.provisional = map } }
+            return map
+        }
+    }
+
+    // MARK: not waiting for the registration (office-speed)
+
+    static let provisionalQueue = DispatchQueue(label: "OOXMLKit.FontResolver.provisional", qos: .userInitiated)
+    private static let notWaitingKey = "OOXMLKit.FontResolver.notWaiting"
+
+    /// Runs `body` on this thread so that font resolution does not wait for Office's font registration: until the
+    /// registered list exists (`officeFontsReady`), fonts resolve against what is installed now (Office's fonts
+    /// drawn with substitutes) and nothing is registered or remembered process-wide. For display paths (tiles, the
+    /// preview) that are drawn again once the fonts are there; layout and output must wait (`prewarm()`).
+    public static func withoutWaitingForRegistration<T>(_ body: () throws -> T) rethrows -> T {
+        let dictionary = Thread.current.threadDictionary
+        let previous = dictionary[notWaitingKey]
+        dictionary[notWaitingKey] = true
+        defer { dictionary[notWaitingKey] = previous }
+        return try body()
+    }
+
+    /// Whether this thread resolves without waiting and the registered list is not built yet.
+    private static var notWaiting: Bool {
+        Thread.current.threadDictionary[notWaitingKey] != nil && installedState.withLock { $0.map == nil }
+    }
+
+    /// Whether Office's registration has finished and the installed-family list after it is built (then no font
+    /// resolution waits any more). Does not wait.
+    public static var officeFontsReady: Bool { installedState.withLock { $0.map != nil } }
 
     /// Per-name lookups that depend on the installed fonts; emptied by `fontsChanged()`. `generation` keeps a
     /// lookup made before a registration (tests: `registerFonts(in:)`) from being stored after it.
@@ -131,7 +192,7 @@ public final class FontResolver: Sendable {
             guard norm(full) == norm(key) || norm(ps) == norm(key) else { return nil }
             return Face(family: CTFontCopyFamilyName(font) as String, postScript: ps)
         }
-        memos.withLock { if $0.generation == generation { $0.face[key] = .some(found) } }
+        if !notWaiting { memos.withLock { if $0.generation == generation { $0.face[key] = .some(found) } } }
         return found
     }
 
@@ -163,6 +224,7 @@ public final class FontResolver: Sendable {
     static func fontsChanged() {
         installedState.withLock { state in
             state.map = nil
+            state.provisional = nil
             state.generation += 1
         }
         memos.withLock { $0 = Memos(generation: $0.generation &+ 1) }
@@ -295,7 +357,7 @@ public final class FontResolver: Sendable {
     /// and thread-safe: once done it returns at once; concurrent first calls wait for the first one's list.
     /// Without it the same happens lazily on the first font resolution.
     public static func prewarm() {
-        _ = installed
+        _ = registeredFamilies
     }
 
     /// Whether Office's fonts are only partly there in this process: the registration (`prewarm()`) gave up on
@@ -557,7 +619,7 @@ public final class FontResolver: Sendable {
             return known.map { CTFontCreateWithName($0 as CFString, size, nil) }
         }
         let found = findRegularFace(family: family)
-        memos.withLock { if $0.generation == generation { $0.regularFace[memoKey] = .some(found) } }
+        if !notWaiting { memos.withLock { if $0.generation == generation { $0.regularFace[memoKey] = .some(found) } } }
         return found.map { CTFontCreateWithName($0 as CFString, size, nil) }
     }
 

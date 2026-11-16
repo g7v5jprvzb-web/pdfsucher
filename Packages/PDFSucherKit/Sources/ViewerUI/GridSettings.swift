@@ -42,6 +42,8 @@ public enum PreviewPosition: String, CaseIterable, Sendable {
         static let zoomLevels = "preview.zoomLevels"
         static let previewPosition = "layout.previewPosition"
         static let showAllPages = "grid.showAllPages"
+        static let showFileSize = "grid.showFileSize"
+        static let showModifiedDate = "grid.showModifiedDate"
         static let highlightColor = "highlight.color"
         static let addSourcesPolicy = "sources.addPolicy"
         static let toolbarFontSize = "toolbar.fontSize"
@@ -163,6 +165,20 @@ public enum PreviewPosition: String, CaseIterable, Sendable {
         set { storedShowAllPages = newValue; defaults.set(newValue, forKey: Key.showAllPages) }
     }
 
+    /// 1.3.7: file size behind the file name in the row header (default off).
+    private var storedShowFileSize: Bool
+    public var showFileSize: Bool {
+        get { storedShowFileSize }
+        set { storedShowFileSize = newValue; defaults.set(newValue, forKey: Key.showFileSize) }
+    }
+
+    /// 1.3.7: modification date behind the file name in the row header (default off).
+    private var storedShowModifiedDate: Bool
+    public var showModifiedDate: Bool {
+        get { storedShowModifiedDate }
+        set { storedShowModifiedDate = newValue; defaults.set(newValue, forKey: Key.showModifiedDate) }
+    }
+
     private var storedPreviewPosition: PreviewPosition
     public var previewPosition: PreviewPosition {
         get { storedPreviewPosition }
@@ -263,6 +279,10 @@ public enum PreviewPosition: String, CaseIterable, Sendable {
         set { storedPartialWords = newValue; defaults.set(newValue, forKey: Key.partialWords) }
     }
 
+    /// ⇧Tab hid the large preview (1.3.6).
+    /// shortcut: not stored, every launch shows the preview again; store it like the folder bar if Chris wants that.
+    public var previewHidden = false
+
     /// „Vorschaubreite an Zoom anpassen“ (spec 1.3.2 §12): the preview beside the grid is as wide as the zoomed page,
     /// at most the width the user set. On by default.
     public var previewFollowsZoom: Bool {
@@ -296,6 +316,8 @@ public enum PreviewPosition: String, CaseIterable, Sendable {
         storedColumnsMode = defaults.string(forKey: Key.columnsMode).flatMap(ColumnsMode.init(rawValue:)) ?? .fixed
         storedDebounceMs = Self.validDebounce(defaults.integer(forKey: Key.debounceMs))
         storedShowAllPages = defaults.bool(forKey: Key.showAllPages)
+        storedShowFileSize = defaults.bool(forKey: Key.showFileSize)
+        storedShowModifiedDate = defaults.bool(forKey: Key.showModifiedDate)
         storedHighlightColor = defaults.data(forKey: Key.highlightColor).flatMap { try? JSONDecoder().decode(RGBA.self, from: $0) } ?? .yellow
         storedPreviewPosition = defaults.string(forKey: Key.previewPosition).flatMap(PreviewPosition.init(rawValue:)) ?? .top
         let levels = (defaults.array(forKey: Key.zoomLevels) as? [Int]).map { $0.map(Self.validZoomLevel) }

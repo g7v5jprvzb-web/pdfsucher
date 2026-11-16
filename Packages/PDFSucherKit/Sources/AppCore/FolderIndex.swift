@@ -266,7 +266,8 @@ public final class FolderIndex: FolderIndexing {
             DocumentHit(url: root.appendingPathComponent(doc.relativePath, isDirectory: false), relativePath: doc.relativePath,
                         modifiedAt: doc.modifiedAt, pageHits: [], totalMatches: 0, relevance: 0,
                         sourceRoot: root, pageCount: doc.status == .error ? 0 : doc.pageCount,
-                        isUnreadable: doc.status == .error, kind: doc.kind, isSimplified: doc.isSimplified)
+                        isUnreadable: doc.status == .error, kind: doc.kind, isSimplified: doc.isSimplified,
+                        fileSize: doc.fileSize)
         }
         guard includingScan else { return entries }
         let known = Set(stored.map(\.relativePath))
@@ -274,7 +275,7 @@ public final class FolderIndex: FolderIndexing {
             entries.append(DocumentHit(url: root.appendingPathComponent(file.relativePath, isDirectory: false),
                                        relativePath: file.relativePath, modifiedAt: file.modifiedAt, pageHits: [],
                                        totalMatches: 0, relevance: 0, sourceRoot: root, pageCount: 0,
-                                       kind: file.kind))
+                                       kind: file.kind, fileSize: file.fileSize))
         }
         return entries
     }

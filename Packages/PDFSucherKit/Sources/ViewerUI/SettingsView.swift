@@ -210,6 +210,10 @@ public struct SettingsView: View {
                 Stepper("Sichtbare Reihen: \(settings.rows)", value: $settings.rows, in: GridSettings.range)
                     .disabled(!settings.rowsApply)
                 Toggle("Alle Seiten der Treffer-Dokumente zeigen", isOn: $settings.showAllPages)
+                Toggle("Dateigröße hinter dem Dateinamen zeigen", isOn: $settings.showFileSize)
+                    .accessibilityIdentifier("showFileSizeToggle")
+                Toggle("Änderungsdatum hinter dem Dateinamen zeigen", isOn: $settings.showModifiedDate)
+                    .accessibilityIdentifier("showModifiedDateToggle")
                 Stepper("Überschriften: \(settings.headerFontSize) pt", value: $settings.headerFontSize,
                         in: GridSettings.headerFontRange, step: GridSettings.headerFontStep)
                 Picker("Sortierung", selection: $settings.sort) {

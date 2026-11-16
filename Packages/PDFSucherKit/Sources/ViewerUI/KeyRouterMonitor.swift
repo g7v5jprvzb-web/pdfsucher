@@ -24,6 +24,11 @@ import SwiftUI
             openHistory()
         case .focusFolderTree:
             break                                           // the monitor does it (it has the window)
+        case .cycleLayout:
+            let next = KeyRouting.nextLayout(folderBar: model.folderBar.isVisible, preview: !model.settings.previewHidden)
+            model.folderBar.isVisible = next.folderBar
+            model.settings.previewHidden = !next.preview
+            setFocus(.grid)                                 // the grid always stays: the focus goes there
         case .navigate(let direction):
             setFocus(.grid)
             // 1.3.3 (Chris): the search shows its first hit by itself; the first ↓ from the field enters the grid
@@ -156,6 +161,7 @@ struct KeyRouterInstaller: NSViewRepresentable {
                                      responderTakesArrows: Self.responderTakesArrows(window.firstResponder, searchFocused: searchFocused),
                                      folderTreeFocused: window.firstResponder is NSTableView,     // the folder bar's list
                                      folderBarVisible: shortcut.key == "tab" && Self.folderTree(in: window) != nil,   // only for Tab: walks the views
+                                     previewVisible: !model.settings.previewHidden,
                                      shortcuts: model.keyboard.all)
             let decision = KeyRouting.decide(KeyInput(shortcut: shortcut, characters: event.characters ?? ""), in: context)
             guard decision != .passThrough else { return event }
@@ -165,6 +171,9 @@ struct KeyRouterInstaller: NSViewRepresentable {
             }
             if case .moveFocus(let area) = decision, area != .search, searchFocused {
                 window.makeFirstResponder(nil)          // the field editor gives up the focus first
+            }
+            if decision == .cycleLayout {
+                window.makeFirstResponder(nil)          // the folder list or the field gives up the keyboard first
             }
             if case .navigate = decision, searchFocused {
                 window.makeFirstResponder(nil)

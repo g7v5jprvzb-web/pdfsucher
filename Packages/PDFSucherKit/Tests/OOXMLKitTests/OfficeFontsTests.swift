@@ -335,6 +335,45 @@ private final class FixtureFonts {
         #expect(readerStarted.withLock { $0 } != nil)
     }
 
+    /// office-speed: display paths (`withoutWaitingForRegistration`) resolve during a slow registration without
+    /// waiting for it, with substitutes and without remembering anything; afterwards every caller gets the registered
+    /// font. A caller that waits (layout, output) still waits.
+    @Test func displayLookupsDoNotWaitForTheRegistration() throws {
+        let apps = try Self.fakeApplications(tag: "Pdfsra")
+        let cloud = try FixtureFonts(tag: "Pdfsrb", previewTag: "Pdfsrc")
+        var previous: OfficeFontRoots?
+        defer {
+            FontResolver.resetOfficeFontsForTests(roots: previous, cloudFiles: nil)
+            try? FileManager.default.removeItem(at: apps.root)
+            withExtendedLifetime(cloud) {}
+        }
+        let cloudFile = OfficeFonts.fontFiles(in: [cloud.root])
+        let readerStarted = DispatchSemaphore(value: 0)
+        previous = FontResolver.resetOfficeFontsForTests(
+            roots: OfficeFontRoots(applications: apps.root, home: URL(fileURLWithPath: "/nonexistent")),
+            cloudFiles: { readerStarted.signal(); Thread.sleep(forTimeInterval: 0.8); return cloudFile })
+        let registered = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async { FontResolver.prewarm(); registered.signal() }
+        #expect(readerStarted.wait(timeout: .now() + 5) == .success)
+        #expect(!FontResolver.officeFontsReady)
+        let started = ContinuousClock.now
+        let cloudFamily = cloud.family
+        let early = FontResolver.withoutWaitingForRegistration { () -> String in
+            let r = FontResolver(theme: nil)
+            _ = r.font(typeface: cloudFamily, size: 12, bold: false, italic: false)
+            return r.resolvedFamily(cloudFamily)
+        }
+        let waited = ContinuousClock.now - started
+        #expect(waited < .milliseconds(400), "a display lookup waited \(waited)")
+        #expect(early != cloudFamily, "the cloud font is not there before its registration")
+        #expect(!FontResolver.officeFontsReady)
+        #expect(registered.wait(timeout: .now() + 10) == .success)
+        #expect(FontResolver.officeFontsReady)
+        // Nothing provisional was kept: the same name resolves to the registered font now, waiting or not.
+        #expect(FontResolver(theme: nil).resolvedFamily(cloudFamily) == cloudFamily)
+        #expect(FontResolver.withoutWaitingForRegistration { FontResolver(theme: nil).resolvedFamily(cloudFamily) } == cloudFamily)
+    }
+
     /// The cloud read given up after the limit is reported (`cloudMissed`; the once-per-process path stores it as
     /// `FontResolver.officeFontsIncomplete`). Fake reader, no real fonts, no group container.
     @Test func missedCloudReadIsReported() {

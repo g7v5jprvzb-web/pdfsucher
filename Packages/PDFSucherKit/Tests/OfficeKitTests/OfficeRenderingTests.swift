@@ -129,6 +129,7 @@ struct OfficeRenderingTests {
         let layout = OfficeLayoutSource.standard(cache: cache, rendering: PowerPointDisplaySetting(.default))
         let pptx = dir.appendingPathComponent("Vortrag.pptx"), docx = dir.appendingPathComponent("Brief.docx")
 
+        OfficeDisplay.prewarmFonts()       // SlideKit's version has a „~“ until Office's fonts are registered
         let own = OfficeDisplay.pages(for: .default, cache: cache, renderers: layout)
         let slides = try #require(own as? SlideKitPages)
         #expect(slides.fontSubstitution == .powerPoint)

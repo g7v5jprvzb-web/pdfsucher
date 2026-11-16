@@ -32,6 +32,8 @@ public struct SlideDeck: Sendable {
     /// Visible slides only, in presentation.xml order; index i = the i-th visible slide.
     let slides: [SlideRef]
     private let size: CGSize
+    /// False: fonts resolve without waiting for Office's registration (`FontResolver.withoutWaitingForRegistration`).
+    let waitsForFonts: Bool
 
     /// Throws `SlideKitError` (.notAZip, .encrypted, .malformed, .unsupportedFormat).
     /// Reads only the zip directory, presentation.xml and the slide roots' `show` attribute.
@@ -40,7 +42,11 @@ public struct SlideDeck: Sendable {
     /// PowerPoint for Mac, `.similar` the closest-looking macOS font. Meant for an app setting
     /// (`OfficeRenderSettings.fontSubstitutionKey`). Text layout, rendering and `wordBoxes` depend on it, so
     /// callers must re-render and re-index a deck when the setting changes. Each deck has its own caches.
-    public init(url: URL, fontSubstitution: FontSubstitution = .powerPoint) throws {
+    ///
+    /// `waitsForFonts` false (office-speed, display decks): drawing and text never wait for Office's font
+    /// registration; until it is done they use substitutes, so open such a deck again once `officeFontsReady`.
+    public init(url: URL, fontSubstitution: FontSubstitution = .powerPoint, waitsForFonts: Bool = true) throws {
+        self.waitsForFonts = waitsForFonts
         let parsed = try DeckParser.open(url: url)
         package = parsed.package
         slides = parsed.slides
@@ -58,6 +64,15 @@ public struct SlideDeck: Sendable {
         FontResolver.prewarm()
     }
 
+    /// Whether Office's font registration is done in this process (decks opened now draw with Office's fonts and
+    /// never wait). Does not wait.
+    public static var officeFontsReady: Bool { FontResolver.officeFontsReady }
+
+    /// `body`, without waiting for Office's fonts unless this deck `waitsForFonts`.
+    private func fonts<T>(_ body: () -> T) -> T {
+        waitsForFonts ? body() : FontResolver.withoutWaitingForRegistration(body)
+    }
+
     /// Thumbnails never exceed this many pixels on the long side (larger `maxPixel` values are clamped).
     static let maxThumbnailPixel = 16384
 
@@ -70,18 +85,22 @@ public struct SlideDeck: Sendable {
     /// Slide size in points.
     public var slideSize: CGSize { size }
 
+    /// Bytes of decoded images this deck (and its copies) keeps now, at most `ImageDecoder.maxCacheBytes`; the bulk
+    /// of an open deck's memory once drawn. For caches that bound open decks by memory.
+    public var cachedImageBytes: Int { store.images.cachedBytes }
+
     /// Normalized slide text (IndexKit.TextNormalizer) of the slide's own shapes in z-order (groups depth-first,
     /// tables row by row); master and layout text, hidden shapes and bullets are not included. Cached per slide.
     /// Out-of-range index → "".
     public func slideText(_ i: Int) -> String {
-        slide(i).map { store.slideText($0, slideSize: size).text } ?? ""
+        fonts { slide(i).map { store.slideText($0, slideSize: size).text } ?? "" }
     }
 
     /// Word ranges in `slideText(i)` with boxes normalized to 0…1, origin top left (rotated text: the axis-aligned
     /// bounding box; clamped to the slide, words entirely off the slide are left out). A word broken across
     /// lines gives one entry per line; table cells included. Out of range → [].
     public func wordBoxes(_ i: Int) -> [OCRWord] {
-        slide(i).map { store.slideText($0, slideSize: size).words } ?? []
+        fonts { slide(i).map { store.slideText($0, slideSize: size).words } ?? [] }
     }
 
     /// Draws slide i into `rect` (user space of a y-up context): uniform aspect-fit scaling, centred, clipped
@@ -129,6 +148,10 @@ public struct SlideDeck: Sendable {
     /// Maps the slide onto `rect` (may stretch slightly; callers pass a fitted rect), flips to y down, clips.
     func render(_ i: Int, in ctx: CGContext, rect: CGRect) {
         guard let ref = slide(i), size.width > 0, size.height > 0 else { return }
+        fonts { render(ref, in: ctx, rect: rect) }
+    }
+
+    private func render(_ ref: SlideRef, in ctx: CGContext, rect: CGRect) {
         let model = store.slideModel(ref.partPath)
         ctx.saveGState()
         ctx.translateBy(x: rect.minX, y: rect.maxY)

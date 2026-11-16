@@ -28,6 +28,8 @@ public final class FontRegistrationGate: Sendable {
         case start
         /// Wait only for one already started (display).
         case join
+        /// Do not wait at all (tiles, office-speed): drawn again once the fonts are there (`+fonts` in the tile key).
+        case skip
     }
 
     /// How long callers wait for the registration in all: more than OOXMLKit's 2 s limit for the cloud font cache
@@ -127,6 +129,7 @@ public final class FontRegistrationGate: Sendable {
         switch mode {
         case .start: wait()
         case .join: join()
+        case .skip: isDone
         }
     }
 }

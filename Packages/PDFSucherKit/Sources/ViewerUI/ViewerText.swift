@@ -65,6 +65,25 @@ public enum ViewerText {
 
     static func pages(_ n: Int) -> String { n == 1 ? "1 Seite" : "\(number(n)) Seiten" }
 
+    /// Behind the row header (1.3.7): „2,4 MB · 14.11.2026, 09:12“, each part only when switched on and known;
+    /// nil when nothing is shown.
+    static func rowDetails(_ hit: DocumentHit, showSize: Bool, showDate: Bool) -> String? {
+        var parts: [String] = []
+        if showSize, let size = hit.fileSize { parts.append(fileSize(size)) }
+        if showDate, hit.modifiedAt.timeIntervalSince1970 > 0 { parts.append(modifiedDate(hit.modifiedAt)) }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    /// File size as Finder shows it, German: „2,4 MB“, „830 KB“.
+    static func fileSize(_ bytes: Int64) -> String { bytes.formatted(.byteCount(style: .file).locale(german)) }
+
+    /// Date and time, German: „14.11.2026, 09:12“.
+    static func modifiedDate(_ date: Date) -> String {
+        // Fixed pattern: `.shortened` gives „9:12“ in German, we want Finder-style „09:12“.
+        date.formatted(.verbatim("\(day: .twoDigits).\(month: .twoDigits).\(year: .defaultDigits), \(hour: .twoDigits(clock: .twentyFourHour, hourCycle: .zeroBased)):\(minute: .twoDigits)",
+                                 locale: german, timeZone: .current, calendar: .current))
+    }
+
     /// Summary while browsing (spec 1.1 §12): „1.234 Dateien, 25.310 Seiten“.
     public static func browseSummary(files: Int, pages: Int) -> String {
         (files == 1 ? "1 Datei" : "\(number(files)) Dateien") + ", " + self.pages(pages)

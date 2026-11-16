@@ -46,7 +46,7 @@ public struct TextKitWordSource: PageLayoutSource {
         pages.reserveCapacity(document.pageCount)
         for index in 0..<document.pageCount {
             try Task.checkCancellation()
-            pages.append(document.page(index))
+            pages.append(document.page(index, turn: .layout))   // tiles and the preview go first
         }
         return LayoutResult(pages: pages, renderer: document.laidOutWithOfficeFonts ? "textkit" : Self.substituteRenderer,
                             layoutVersion: 1)

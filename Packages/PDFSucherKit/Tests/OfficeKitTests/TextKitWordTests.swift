@@ -3,6 +3,7 @@ import CoreGraphics
 import Foundation
 import IndexKit
 import OOXMLKit
+import Synchronization
 import Testing
 import TestSupport
 @testable import OfficeKit
@@ -281,6 +282,52 @@ struct TextKitWordTests {
         #expect(TextKitWordDocument.cacheMaxPages == 2_000)
     }
 
+    /// office-speed: simultaneous misses on one key make one value; the others wait for it (six tile workers imported
+    /// one document six times, one after the other under `textKit`).
+    @Test func lruSimultaneousMissesMakeOneValue() {
+        final class Box: Sendable {}
+        let lru = DocumentLRU<String, Box>(capacity: 4)
+        let made = Mutex(0)
+        let ids = Mutex<Set<ObjectIdentifier>>([])
+        DispatchQueue.concurrentPerform(iterations: 8) { _ in
+            let box = lru.value(for: "a") {
+                made.withLock { $0 += 1 }
+                Thread.sleep(forTimeInterval: 0.05)
+                return Box()
+            }
+            ids.withLock { _ = $0.insert(ObjectIdentifier(box)) }
+        }
+        #expect(made.withLock { $0 } == 1)
+        #expect(ids.withLock { $0.count } == 1)
+    }
+
+    /// A failing `make` is shared by the waiters and not kept: the next request tries again.
+    @Test func lruSharesAFailureWithoutKeepingIt() {
+        final class Box: Sendable {}
+        struct Boom: Error {}
+        let lru = DocumentLRU<String, Box>(capacity: 4)
+        let made = Mutex(0), failed = Mutex(0), arrived = Mutex(0)
+        DispatchQueue.concurrentPerform(iterations: 6) { _ in
+            arrived.withLock { $0 += 1 }
+            do {
+                _ = try lru.value(for: "a") { () throws -> Box in
+                    made.withLock { $0 += 1 }
+                    // Fail only once every caller is on its way (a caller after the failure would make again).
+                    while arrived.withLock({ $0 }) < 6 { Thread.sleep(forTimeInterval: 0.001) }
+                    Thread.sleep(forTimeInterval: 0.05)
+                    throw Boom()
+                }
+            } catch { failed.withLock { $0 += 1 } }
+        }
+        #expect(made.withLock { $0 } == 1 && failed.withLock { $0 } == 6)
+        #expect(lru.keys.isEmpty)
+        #expect((try? lru.value(for: "a") { Box() }) != nil)
+    }
+
+    @Test func sharedWordCacheKeepsMoreDocuments() {
+        #expect(TextKitWordDocument.cacheCapacity == 16)
+    }
+
     @Test func lruReplacesMatchingEntries() {
         final class Box: Sendable {}
         let lru = DocumentLRU<String, Box>(capacity: 4)
@@ -370,6 +417,31 @@ struct TextKitWordTests {
             #expect(early == .timedOut, "\(name) ran while textKit was held")
             #expect(finished.wait(timeout: .now() + 20) == .success, "\(name) did not run after textKit was free")
         }
+    }
+
+    /// office-speed: tiles and the preview go before a running layout at `textKit`: the layout paginates in chunks
+    /// and steps aside while a display path waits (30 tiles took 1 s behind two layouts instead of 76 ms).
+    @Test(.timeLimit(.minutes(1))) func displayGoesBeforeARunningLayout() throws {
+        let tile = try TextKitWordDocument(url: try OfficeFixtures.docx(paragraphs: ["Kachel"], name: "Kachel.docx", in: dir))
+        let paragraphs = (0..<400).map { "Abschnitt \($0): " + String(repeating: "Text zum Umbrechen ", count: 20) }
+        let big = try OfficeFixtures.docx(paragraphs: paragraphs, pageBreakAfter: Set(0..<400), name: "Gross.docx", in: dir)
+        let gate = FontRegistrationGate(timeout: .seconds(5)) {}
+        gate.wait()
+        let layoutDone = Mutex(false)
+        let finished = DispatchSemaphore(value: 0)
+        Thread {
+            _ = try? TextKitWordDocument(url: big, maxPages: TextKitWordDocument.maxPages, fontGate: gate, fonts: .start)
+            layoutDone.withLock { $0 = true }
+            finished.signal()
+        }.start()
+        // Until the layout holds the lock.
+        while TextKitWordDocument.textKit.try() {
+            TextKitWordDocument.textKit.unlock()
+            Thread.sleep(forTimeInterval: 0.001)
+        }
+        for _ in 0..<30 { _ = tile.thumbnail(0, maxPixel: 200) }
+        #expect(!layoutDone.withLock { $0 }, "the tiles waited for the whole layout")
+        #expect(finished.wait(timeout: .now() + 50) == .success)
     }
 
     @Test func pageSetupFallsBackToA4() {

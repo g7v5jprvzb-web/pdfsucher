@@ -121,6 +121,18 @@ public struct OfficePages: ForeignPageProvider {
         }
     }
 
+    /// Word (office-speed): the page drawn by TextKit straight into the tile's bitmap, marks from the laid-out words
+    /// (`TextKitWordDocument.page`). Does not wait for a running font registration (`.skip`): the tile key carries the
+    /// font state (`contentVersion`), so such a tile is drawn again once the fonts are there. Nil for PowerPoint (its pages need no PDF round trip) and pages it does not have.
+    public func tile(_ ref: PageRef) -> ForeignTile? {
+        guard Self.kind(of: ref.url) == .word, ref.pageIndex >= 0,
+              let document = try? TextKitWordDocument.cached(url: ref.url, fonts: .skip), ref.pageIndex < document.pageCount
+        else { return nil }
+        let index = ref.pageIndex
+        return ForeignTile(size: document.pageSize(index), draw: { document.draw(page: index, in: $0) },
+                           text: { let page = document.page(index); return (page.text, page.words) })
+    }
+
     /// A one-page PDF page for the large preview, the same as in output (`makePage`); nil when there is none.
     public func previewPage(_ ref: PageRef) -> PDFPage? {
         try? makePage(ref)

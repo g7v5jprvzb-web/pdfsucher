@@ -90,6 +90,37 @@ private func deck(attrs: String = "", sz: String = "<p:sldSz cx=\"12192000\" cy=
         #expect(info.slides.map(\.hidden) == [false])
     }
 
+    /// office-speed: only a slide's root tag is read for `show` (no tree of the whole slide); `show` on an inner
+    /// element does not hide it, and a hidden root on a slide that does not parse still counts as visible (as before).
+    @Test func showIsReadFromTheRootOnly() throws {
+        var b = OOXMLBuilder()
+        b.add("_rels/.rels", "<Relationships xmlns=\"\(relNS)\"><Relationship Id=\"r1\" Type=\"x/officeDocument\" Target=\"ppt/presentation.xml\"/></Relationships>")
+        let ids = (1...4).map { "<p:sldId id=\"\($0)\" r:id=\"rId\($0)\"/>" }.joined()
+        b.add("ppt/presentation.xml", "<p:presentation xmlns:p=\"\(NS.p)\" xmlns:r=\"\(NS.r)\"><p:sldIdLst>\(ids)</p:sldIdLst></p:presentation>")
+        let rels = (1...4).map { "<Relationship Id=\"rId\($0)\" Type=\"x/slide\" Target=\"slides/s\($0).xml\"/>" }.joined()
+        b.add("ppt/_rels/presentation.xml.rels", "<Relationships xmlns=\"\(relNS)\">\(rels)</Relationships>")
+        let body = String(repeating: "<p:sp><p:nvSpPr><p:cNvPr id=\"1\" name=\"x\"/></p:nvSpPr></p:sp>", count: 2000)
+        b.add("ppt/slides/s1.xml", "<?xml version=\"1.0\"?><p:sld xmlns:p=\"\(NS.p)\" show=\"0\"><p:cSld><p:spTree>\(body)</p:spTree></p:cSld></p:sld>")
+        b.add("ppt/slides/s2.xml", "<p:sld xmlns:p=\"\(NS.p)\"><p:cSld show=\"0\"/></p:sld>")
+        b.add("ppt/slides/s3.xml", "<p:sld xmlns:p=\"\(NS.p)\" show=\"1\"><oops>")
+        b.add("ppt/slides/s4.xml", "<p:sld xmlns:p=\"\(NS.p)\" show=\"FALSE\"><p:cSld/></p:sld>")
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("pi-\(UUID().uuidString).zip")
+        try b.build().write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let info = try PresentationInfo(package: OPCPackage(zip: try ZipArchive(url: url)))
+        #expect(info.slides.map(\.hidden) == [true, false, false, true])
+        #expect(info.slides.map(\.powerPointNumber) == [1, 2, 3, 4])
+    }
+
+    @Test func rootShowReader() {
+        #expect(PresentationInfo.rootShowsHidden(Data("<p:sld xmlns:p=\"x\" show=\"0\"><a>".utf8)))
+        #expect(PresentationInfo.rootShowsHidden(Data("<p:sld show=\"false\"/>".utf8)))
+        #expect(!PresentationInfo.rootShowsHidden(Data("<p:sld show=\"1\"/>".utf8)))
+        #expect(!PresentationInfo.rootShowsHidden(Data("<p:sld><p:x show=\"0\"/></p:sld>".utf8)))
+        #expect(!PresentationInfo.rootShowsHidden(Data("kein xml".utf8)))
+        #expect(!PresentationInfo.rootShowsHidden(Data()))
+    }
+
     @Test func malformedPresentation() throws {
         var b = OOXMLBuilder()
         b.add("_rels/.rels", "<Relationships xmlns=\"\(relNS)\"><Relationship Id=\"r1\" Type=\"x/officeDocument\" Target=\"ppt/presentation.xml\"/></Relationships>")

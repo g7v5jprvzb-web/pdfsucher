@@ -14,7 +14,7 @@ import SlideKit
 /// Tile hook: `ThumbnailCache` renders foreign tiles through `pageDocument(_:maxPixel:)` and folds
 /// `contentVersion(_:)` into the tile key (ThumbnailCache+Foreign). The content version is
 /// `"slidekit:<layout version>:r<renderVersion>"` (layout version from `SlideKitLayoutSource`, same
-/// `FontSubstitution`), so switching the setting shows new tiles in memory and on disk without a file change, and
+/// `FontSubstitution`; a trailing `~` while Office's fonts are not registered yet), so switching the setting shows new tiles in memory and on disk without a file change, and
 /// a SlideKit drawing fix that leaves text alone bumps only `renderVersion` (new tiles, no new layout).
 ///
 /// When the font setting changes, build the provider (and the `ThumbnailCache` holding it) and the Indexer's
@@ -53,13 +53,22 @@ public struct SlideKitPages: ForeignPageProvider {
         return deck(url)?.slideCount
     }
 
-    /// A `SlidePDFPage` of slide `pageIndex`. Throws `OutputError.cannotOpen` for an unreadable deck (or a file no
-    /// provider handles) and `pageOutOfRange` for a slide it does not have.
+    /// A `SlidePDFPage` of slide `pageIndex` for output (merge, print): waits for Office's font registration (and
+    /// starts it, as before office-speed), so saved pages never carry substitute fonts. Throws
+    /// `OutputError.cannotOpen` for an unreadable deck (or a file no provider handles) and `pageOutOfRange` for a
+    /// slide it does not have.
     public func makePage(_ ref: PageRef) throws -> PDFPage {
         guard Self.isPowerPoint(ref.url) else {
             guard let fallback, fallback.handles(ref.url) else { throw OutputError.cannotOpen(ref.url) }
             return try fallback.makePage(ref)
         }
+        if !SlideDeck.officeFontsReady { SlideDeck.prewarmFonts() }
+        return try displayPage(ref)
+    }
+
+    /// A `SlidePDFPage` for display (tiles, the large preview): never waits for Office's fonts. Until they are
+    /// registered the deck draws with substitutes and `contentVersion` says so, so it is drawn again after.
+    private func displayPage(_ ref: PageRef) throws -> PDFPage {
         guard let deck = deck(ref.url) else { throw OutputError.cannotOpen(ref.url) }
         guard ref.pageIndex >= 0, ref.pageIndex < deck.slideCount else { throw OutputError.pageOutOfRange(ref) }
         return SlidePDFPage(deck: deck, index: ref.pageIndex)
@@ -69,7 +78,7 @@ public struct SlideKitPages: ForeignPageProvider {
     /// no such slide.
     public func pageDocument(_ ref: PageRef, maxPixel: Int?) -> PDFDocument? {
         guard Self.isPowerPoint(ref.url) else { return fallback?.pageDocument(ref, maxPixel: maxPixel) }
-        guard let page = try? makePage(ref) else { return nil }
+        guard let page = try? displayPage(ref) else { return nil }
         let document = PDFDocument()
         document.insert(page, at: 0)
         return document
@@ -80,7 +89,8 @@ public struct SlideKitPages: ForeignPageProvider {
     public func contentVersion(_ url: URL) -> String {
         guard Self.isPowerPoint(url) else { return fallback?.contentVersion(url) ?? "" }
         let layout = SlideKitLayoutSource.layoutVersion(for: fontSubstitution)
-        return "\(SlideKitLayoutSource.rendererName):\(layout):r\(Self.renderVersion)"
+        // „~“ while Office's fonts are not registered (substitutes): such tiles are not reused after it.
+        return "\(SlideKitLayoutSource.rendererName):\(layout):r\(Self.renderVersion)" + (SlideDeck.officeFontsReady ? "" : "~")
     }
 
     /// Slide `pageIndex` as an image, long side `maxPixel` (`SlideDeck.thumbnail`, background included). Nil for an
@@ -90,8 +100,14 @@ public struct SlideKitPages: ForeignPageProvider {
         return deck.thumbnail(ref.pageIndex, maxPixel: maxPixel)
     }
 
+    /// The fallback's direct tile for other files (Word); none for slides (drawn through `SlidePDFPage`, which costs
+    /// nothing measurable beside a direct bitmap).
+    public func tile(_ ref: PageRef) -> ForeignTile? {
+        Self.isPowerPoint(ref.url) ? nil : fallback?.tile(ref)
+    }
+
     /// The page for the large preview, the same as in output (`makePage`); nil when there is none.
     public func previewPage(_ ref: PageRef) -> PDFPage? {
-        try? makePage(ref)
+        Self.isPowerPoint(ref.url) ? try? displayPage(ref) : try? makePage(ref)
     }
 }
