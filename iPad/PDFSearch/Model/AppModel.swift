@@ -4,6 +4,7 @@ import Observation
 import OCRKit
 import SearchKit
 import UIKit
+import os
 
 enum KindFilter: String, CaseIterable, Identifiable {
     case all, pdf, jpeg
@@ -88,6 +89,8 @@ final class AppModel {
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     /// The index run was stopped because the app went to the background; it continues on return.
     private(set) var interrupted = false
+    /// How often an index run was stopped by the background (shown in „Ordner und Index“).
+    private(set) var interruptions = 0
 
     init() {
         // UI tests: start from the default view settings (before any view reads them).
@@ -163,15 +166,22 @@ final class AppModel {
 
     /// Indexes all places in the foreground: iCloud downloads, text, word parts, text recognition.
     func reindex() async {
-        if let indexTask { await indexTask.value; return }
+        // A run in progress counts, unless it was stopped (background): then wait for it to end and start anew.
+        // (Before: a resume right after the stop found the stopped run and did nothing.)
+        while let running = indexTask {
+            await running.value
+            if indexTask == running { indexTask = nil }
+            if !running.isCancelled { return }
+        }
         let task = Task { await runIndex() }
         indexTask = task
         await task.value
-        indexTask = nil
+        if indexTask == task { indexTask = nil }
     }
 
     private func runIndex() async {
         isIndexing = true
+        interrupted = false
         UIApplication.shared.isIdleTimerDisabled = true
         defer {
             isIndexing = false
@@ -226,6 +236,7 @@ final class AppModel {
                 }
             }
         }
+        Self.log.notice("index run ended, cancelled: \(Task.isCancelled, privacy: .public)")
         unreadable = problems
         if !Task.isCancelled { lastIndexed = Date() }
         refreshCounts()
@@ -236,24 +247,31 @@ final class AppModel {
 
     /// The app went to the background: iPadOS gives a running index some seconds more, then the run stops
     /// (everything stored so far stays) and continues when the app is active again.
+    private static let log = Logger(subsystem: "local.pdfsearch.ipad", category: "App")
+
     func enteredBackground() {
+        Self.log.notice("background, indexing: \(self.isIndexing, privacy: .public)")
         guard isIndexing, backgroundTask == .invalid else { return }
+        if UserDefaults.standard.bool(forKey: "uiTestBackgroundExpiresAtOnce") {
+            stopForBackground()  // UI test: the grace period ends at once
+            return
+        }
         backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "Indizieren") { [weak self] in
             MainActor.assumeIsolated { self?.stopForBackground() }
         }
     }
 
     func becameActive() {
+        Self.log.notice("active, interrupted: \(self.interrupted, privacy: .public)")
         endBackgroundTask()
-        if interrupted {
-            interrupted = false
-            Task { await reindex() }
-        }
+        // `interrupted` stays set until the next run starts (the stopped run may still be ending).
+        if interrupted { Task { await reindex() } }
     }
 
     private func stopForBackground() {
         if isIndexing {
             interrupted = true
+            interruptions += 1
             indexTask?.cancel()
         }
         endBackgroundTask()
@@ -267,6 +285,7 @@ final class AppModel {
 
     private func show(_ p: IndexProgress, place: String) {
         guard isIndexing else { return }
+        if p.done == 0 || p.done == p.total { Self.log.debug("\(p.phase.rawValue, privacy: .public) \(p.done)/\(p.total)") }
         let phase = switch p.phase {
         case .text: "Text lesen"
         case .ocr: "Texterkennung"

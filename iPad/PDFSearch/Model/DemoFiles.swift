@@ -27,6 +27,11 @@ enum DemoFiles {
         })
         try jpeg(folder, "Fotos/Kassenbon Bäckerei.jpg", ["Bäckerei Morgenrot", "2 Brötchen 1,20", "Summe 4,70 EUR", "Rechnung Nr. 8812"])
         try jpeg(folder, "Fotos/Quittung Baumarkt.jpg", ["QUITTUNG", "Schrauben 4,99", "Summe 11,48 EUR", "Rechnung auf Wunsch"])
+        // `-uiTestExtraImages n`: more photos, so an index run lasts long enough to be interrupted.
+        let extra = UserDefaults.standard.integer(forKey: "uiTestExtraImages")
+        for i in 0..<extra {
+            try jpeg(folder, "Stapel/Notiz \(i).jpg", ["Notiz \(i)", "Einkauf Brot Milch", "Termin Werkstatt", "Anruf Vermieter"])
+        }
     }
 
     private static func pdf(_ folder: URL, _ path: String, _ pages: [String]) throws {

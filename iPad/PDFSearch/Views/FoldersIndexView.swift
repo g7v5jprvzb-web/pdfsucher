@@ -71,6 +71,10 @@ struct FoldersIndexView: View {
                         }
                     } else {
                         LabeledContent("Stand", value: model.indexStatus)
+                        if model.interruptions > 0 {
+                            LabeledContent("Im Hintergrund unterbrochen", value: "\(model.interruptions)×, danach fortgesetzt")
+                                .accessibilityIdentifier("interruptions")
+                        }
                         Button {
                             Task { await model.reindex() }
                         } label: {

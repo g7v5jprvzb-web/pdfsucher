@@ -187,6 +187,41 @@ final class MainViewUITests: XCTestCase {
         }
     }
 
+    /// Index stopped in the background (grace period ends at once by launch argument) and continued on return.
+    func testIndexingContinuesAfterBackground() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-uiTestDemoFiles", "YES", "-demoQuery", "Summe", "-uiTestResetSettings", "YES",
+                               "-uiTestBackgroundExpiresAtOnce", "YES", "-uiTestExtraImages", "60"]
+        app.launch()
+        self.app = app
+        // Leave while the first run is still recognizing the photos.
+        XCUIDevice.shared.press(.home)
+        XCTAssertTrue(app.wait(for: .runningBackground, timeout: 10) || app.state == .runningBackgroundSuspended)
+        // Back at once, while the stopped run is still ending (the case that used to leave the rest undone).
+        app.activate()
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
+        // Right after the return a tap can get lost in the scene transition: retry.
+        for _ in 0..<5 where !app.navigationBars["Ordner und Index"].exists {
+            element("openFolders").tap()
+            _ = app.navigationBars["Ordner und Index"].waitForExistence(timeout: 2)
+        }
+        XCTAssertTrue(app.navigationBars["Ordner und Index"].exists)
+        // „Jetzt indizieren“ is offered only when no run is going.
+        XCTAssertTrue(app.buttons["Jetzt indizieren"].waitForExistence(timeout: 120), "der fortgesetzte Lauf endet")
+        XCTAssertTrue(element("interruptions").exists, "der Lauf wurde wirklich im Hintergrund unterbrochen")
+        XCTAssertFalse(app.staticTexts.matching(NSPredicate(format: "label CONTAINS 'unterbrochen, wird fortgesetzt'")).firstMatch.exists)
+        app.buttons["Fertig"].tap()
+        // The JPEG matches come from text recognition, the last step of a run: present = the resumed run completed.
+        XCTAssertTrue(element("tile-Kassenbon Bäckerei.jpg-1").waitForExistence(timeout: 10))
+        XCTAssertTrue(element("tile-Quittung Baumarkt.jpg-1").exists)
+        // Every photo is recognized, also those the stopped run had not reached.
+        let field = element("searchField")
+        field.tap()
+        app.buttons["Suche löschen"].tap()
+        field.typeText("Werkstatt")
+        XCTAssertTrue(waitFor(element("resultsSummary"), prefix: "60 Dateien", timeout: 15), element("resultsSummary").label)
+    }
+
     func testFoldersScreenOpens() {
         launch()
         element("openFolders").tap()
