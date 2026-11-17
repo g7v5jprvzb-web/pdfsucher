@@ -77,6 +77,7 @@ def analyse(events):
     seen = {}
     log_repeats = Counter()
     log_repeat_ms = 0.0
+    dedup = Counter()           # pdf-dubletten: copies taken over (files, pages) and hashing in phase_end
     starts = [e for e in events if e.get("event") in ("app_start", "logging_on")]
 
     for e in events:
@@ -107,8 +108,14 @@ def analyse(events):
             for k in DB_PARTS:
                 db_split[k] += float(e.get(k, 0) or 0)
             db_split["chars"] += e.get("chars", 0) or 0
+        if ev == "file" and e.get("dedup"):
+            dedup["copy_pages"] += e.get("pages", 0) or 0
         if ev == "phase_end":
             wall[e.get("phase")] += float(e.get("wall_ms", 0))
+            if e.get("phase") == "text":
+                dedup["copies"] += e.get("dedup", 0) or 0
+                dedup["hashed"] += e.get("hashed", 0) or 0
+                dedup["hash_ms"] += float(e.get("hash_ms", 0) or 0)
         elif ev == "run_start" and e.get("phase") == "text":
             for t in str(e.get("trigger", "unknown")).split("+"):
                 triggers[t] += 1
@@ -163,6 +170,10 @@ def analyse(events):
         "repeated_across_logs_s": round(log_repeat_ms / 1000, 3),
         "db_split_s": {k: round(db_split[k] / 1000, 3) for k in DB_PARTS},
         "db_chars": int(db_split["chars"]),
+        "dedup_copies": int(dedup["copies"]),
+        "dedup_copy_pages": int(dedup["copy_pages"]),
+        "dedup_hashed": int(dedup["hashed"]),
+        "dedup_hash_s": round(dedup["hash_ms"] / 1000, 3),
         "sources_replaced": len(replaced),
         "replaced_documents": sum(e.get("old_documents", 0) for e in replaced),
     }
@@ -218,6 +229,8 @@ def print_report(r):
           f'{r["reindexed_in_session"] or ""}  verlorene Zeit {fmt(r["reindexed_in_session_s"])} s')
     print(f'  gleiche Dateiversion mehrfach in den Logs:  {sum(r["repeated_across_logs"].values())} '
           f'{r["repeated_across_logs"] or ""}  verlorene Zeit {fmt(r["repeated_across_logs_s"])} s')
+    print(f'  PDF-Dubletten übernommen (nicht gelesen): {r["dedup_copies"]} Dateien, {r["dedup_copy_pages"]} Seiten; '
+          f'gehasht {r["dedup_hashed"]} Dateien in {fmt(r["dedup_hash_s"])} s (Wand)')
     print(f'  Quellen durch Elternordner ersetzt: {r["sources_replaced"]} '
           f'(Dokumente im alten Index, die neu indexiert werden: {r["replaced_documents"]})')
 

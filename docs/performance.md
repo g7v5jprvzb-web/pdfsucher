@@ -725,3 +725,22 @@ auf 1.3.12), echter Ordner mit einigen zehntausend Dateien (Bilder eingeschlosse
 
 OCR-Parallelität (48 echte Scanseiten): 1/2/3/4/6 → 3,3/5,7/6,8/7,3/7,8 Seiten/s, gleicher Text. Langsamste PDFs: siehe
 decisions „1.4.0 P6“.
+
+## PDF-Dubletten in Phase 1 (2026-11-17, Branch `pdf-dubletten`)
+
+Release-Build, M3 Max, echter Ordner, nur PDFs (einige tausend Dateien), Phase 1 in temporäre Indizes
+(`DuplicateBenchmark`, `PDFSUCHER_PDF_SCALING_BENCH=1`). Je Build zwei Reihen à zwei Läufe (der erste wärmt den Dateicache,
+ist hier aber mit aufgeführt); Reihe 1: vorher, dann nachher; Reihe 2 umgekehrt. Streuung deutlich (vorher 35,9–45,3 s).
+
+| | release-1.4.0 (vorher) | pdf-dubletten (nachher) |
+|---|---|---|
+| Phase 1 Wand, 4 Läufe | 40,0 / 45,3 / 38,4 / 35,9 s (Median ≈ 39,2 s) | 35,8 / 35,0 / 32,5 / 31,9 s (Median ≈ 33,8 s) |
+| Summe PDF-Lesen | 542 / 633 / 530 / 492 s | 444 / 446 / 416 / 407 s |
+| Kopien übernommen (nicht gelesen) | – | rund ein Fünftel der PDFs |
+| Hashen (nur Dateien mit geteilter Größe) | – | 0,46–0,99 s Wand |
+| DB-Schreiben | 14,1 / 16,1 s (Reihe 1) | 14,1 / 14,2 s (Reihe 1) |
+
+Ergebnis gleich: unlesbare Dateien, Dateien ohne Text, Seitenzahl und die Treffer (Seiten/Dokumente) für sechs Suchwörter
+sind vorher und nachher identisch.
+Phase 1 wird ≈ 5 s (≈ 13 %) schneller, weniger als die gesparte Lesezeit (≈ 100 s Summe) vermuten ließ (Schätzung vorher
+≈ 29 s): die Wand bleibt durch die großen Einzeldateien am Ende und das Schreiben begrenzt.

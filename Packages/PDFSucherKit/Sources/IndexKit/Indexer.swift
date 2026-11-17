@@ -11,7 +11,8 @@ import Synchronization
 /// 3. removes documents whose files are gone — except below paths the scan could not reach
 ///    (unreadable subdirectories, links to a missing target), whose documents are kept,
 /// 4. extracts text of new and changed files in parallel and writes the results in
-///    transactions of `batchSize` files.
+///    transactions of `batchSize` files. Byte-identical PDFs among them (SHA-256, see `duplicateGroups`) are read once;
+///    each copy gets the same pages and status, and is handed on together with the file actually read (pdf-dubletten).
 ///
 /// Parallelism: at most `activeProcessorCount - 1` extractions at once (min. 1). Extraction is
 /// synchronous PDFKit work on the cooperative pool; leaving one thread free keeps other async
@@ -140,6 +141,8 @@ public actor Indexer {
         var needsLayout = false
         /// Extraction time (measurement log).
         var ms = 0.0
+        /// pdf-dubletten: a byte-identical copy of another file of this run; its result was taken over, not read.
+        var dedup = false
     }
 
     /// - Parameter atTurnStart: runs once this call has the turn, before any work (no other run of this Indexer is
@@ -296,9 +299,11 @@ public actor Indexer {
         let metrics = metrics, source = metricsSource
         let phaseStart = ContinuousClock.now
         var extractMs = 0.0, dbMs = 0.0, writerWaitMs = 0.0, extracted = 0
+        var hashMs = 0.0, hashed = 0, dedupCount = 0
         defer {
             metrics.log("phase_end", ["source": source, "phase": "text", "wall_ms": IndexMetrics.ms(since: phaseStart),
-                                      "sum_ms": extractMs, "db_ms": dbMs, "writer_wait_ms": writerWaitMs, "count": extracted])
+                                      "sum_ms": extractMs, "db_ms": dbMs, "writer_wait_ms": writerWaitMs, "count": extracted,
+                                      "hash_ms": hashMs, "hashed": hashed, "dedup": dedupCount])
         }
         let scan = try self.scan(scopes: scopes)
         if metrics.isEnabled {
@@ -369,6 +374,19 @@ public actor Indexer {
         // OCRSource) is recognized later although its files are unchanged.
         let ocrWillRun = ocr != nil && ocrSettings.recognizeText
         let limit = max(1, ProcessInfo.processInfo.activeProcessorCount - 1)
+
+        // pdf-dubletten: byte-identical PDFs of this run are read once (the first in work order, the "lead"); each copy
+        // takes over the lead's result when it arrives. Only PDFs sharing their size with another one are hashed.
+        let hashStart = ContinuousClock.now
+        let duplicates = try await Self.duplicateGroups(work.map(\.file), limit: limit)
+        hashMs = IndexMetrics.ms(since: hashStart)
+        hashed = duplicates.hashed
+        var copies: [String: [(file: ScannedFile, isNew: Bool)]] = [:]
+        if !duplicates.copies.isEmpty {
+            let byPath = Dictionary(work.map { ($0.file.relativePath, $0) }, uniquingKeysWith: { a, _ in a })
+            for (copy, lead) in duplicates.copies { if let item = byPath[copy] { copies[lead, default: []].append(item) } }
+            work.removeAll { duplicates.copies[$0.file.relativePath] != nil }
+        }
         var pending: [Extracted] = []
         let writer = BatchWriter(maxInFlight: Self.writesInFlight) { [self] batch in try upsert(batch) }
         defer { dbMs = writer.writtenMs; writerWaitMs = writer.waitMs }
@@ -391,30 +409,40 @@ public actor Indexer {
                     guard let item = queue.next() else { break }
                     group.addTask(operation: makeTask(item))
                 }
-                while let result = try await group.next() {
-                    done += 1
-                    extracted += 1
-                    extractMs += result.ms
-                    if metrics.isEnabled { logFile(result) }
-                    if result.isNew { report.added += 1 } else { report.updated += 1 }
-                    switch result.status {
-                    case .error: failed.append(result.file.relativePath)
-                    case .noText where result.needsLayout: break // nothing looked at yet
-                    // A queued PDF is reported like 1.0 unless phase 2 follows; a queued image never
-                    // (nothing was looked at yet).
-                    case .noText where !result.pages.contains(where: \.needsOCR)
-                        || (!ocrWillRun && result.file.kind == .pdf):
-                        noText.append(result.file.relativePath)
-                    case .noText, .ok: break
+                while let lead = try await group.next() {
+                    // The lead and its copies are handed on together, so a cancel never stores a copy without its lead.
+                    let results = [lead] + (copies[lead.file.relativePath] ?? []).map {
+                        Extracted(file: $0.file, isNew: $0.isNew, pages: lead.pages, status: lead.status,
+                                  needsLayout: lead.needsLayout, ms: 0, dedup: true)
                     }
-                    pending.append(result)
+                    for result in results {
+                        extracted += 1
+                        extractMs += result.ms
+                        if result.dedup { dedupCount += 1 }
+                        if metrics.isEnabled { logFile(result) }
+                        if result.isNew { report.added += 1 } else { report.updated += 1 }
+                        switch result.status {
+                        case .error: failed.append(result.file.relativePath)
+                        case .noText where result.needsLayout: break // nothing looked at yet
+                        // A queued PDF is reported like 1.0 unless phase 2 follows; a queued image never
+                        // (nothing was looked at yet).
+                        case .noText where !result.pages.contains(where: \.needsOCR)
+                            || (!ocrWillRun && result.file.kind == .pdf):
+                            noText.append(result.file.relativePath)
+                        case .noText, .ok: break
+                        }
+                        pending.append(result)
+                    }
                     try Task.checkCancellation()
                     if pending.count >= batchSize {
                         let batch = pending
                         pending.removeAll(keepingCapacity: true)
                         try await writer.submit(batch)
                     }
-                    progress(IndexProgress(done: done, total: total, currentFile: result.file.relativePath))
+                    for result in results {
+                        done += 1
+                        progress(IndexProgress(done: done, total: total, currentFile: result.file.relativePath))
+                    }
                     if let item = queue.next() { group.addTask(operation: makeTask(item)) }
                 }
             }
@@ -483,9 +511,11 @@ public actor Indexer {
     private func logFile(_ r: Extracted) {
         let file = IndexMetrics.hash(r.file.url), ext = r.file.url.pathExtension.lowercased()
         let mtime = IndexMetrics.stamp(r.file.modifiedAt)
-        metrics.log("file", ["source": metricsSource, "file": file, "ext": ext, "kind": r.file.kind.rawValue,
-                             "bytes": r.file.fileSize, "mtime": mtime, "new": r.isNew, "ms": r.ms, "pages": r.pages.count,
-                             "needs_ocr": r.pages.filter(\.needsOCR).count, "status": r.status.rawValue])
+        var fields: [String: Any] = ["source": metricsSource, "file": file, "ext": ext, "kind": r.file.kind.rawValue,
+                                     "bytes": r.file.fileSize, "mtime": mtime, "new": r.isNew, "ms": r.ms, "pages": r.pages.count,
+                                     "needs_ocr": r.pages.filter(\.needsOCR).count, "status": r.status.rawValue]
+        if r.dedup { fields["dedup"] = true }
+        metrics.log("file", fields)
         // Only PDFs are read here; images and Office files are only listed (their work is OCR / layout).
         if r.file.kind == .pdf { metrics.noteDone(phase: "text", file: file, ext: ext, key: "\(r.file.fileSize)|\(mtime)", ms: r.ms) }
     }

@@ -189,7 +189,7 @@ struct IndexerTests {
     @Test(.timeLimit(.minutes(1))) func indexerCancels() async throws {
         let env = try makeEnv()
         defer { env.cleanup() }
-        for i in 0..<40 { try Data("x".utf8).write(to: env.root.appendingPathComponent("f\(i).pdf")) }
+        for i in 0..<40 { try Data("x\(i)".utf8).write(to: env.root.appendingPathComponent("f\(i).pdf")) }
         let source = GateSource()
         let indexer = Indexer(root: env.root, store: env.store, source: source, batchSize: 50)
         let (stream, continuation) = AsyncStream<IndexProgress>.makeStream()
@@ -214,7 +214,7 @@ struct IndexerTests {
     @Test func concurrentUpdatesRunOneAfterAnother() async throws {
         let env = try makeEnv()
         defer { env.cleanup() }
-        for i in 0..<20 { try Data("x".utf8).write(to: env.root.appendingPathComponent("f\(i).pdf")) }
+        for i in 0..<20 { try Data("x\(i)".utf8).write(to: env.root.appendingPathComponent("f\(i).pdf")) }
         let source = CountingSource()
         let indexer = Indexer(root: env.root, store: env.store, source: source)
         async let a = indexer.update { _ in }
@@ -228,7 +228,7 @@ struct IndexerTests {
     @Test(.timeLimit(.minutes(1))) func cancelledWaitingUpdateStopsAtOnce() async throws {
         let env = try makeEnv()
         defer { env.cleanup() }
-        for i in 0..<5 { try Data("x".utf8).write(to: env.root.appendingPathComponent("f\(i).pdf")) }
+        for i in 0..<5 { try Data("x\(i)".utf8).write(to: env.root.appendingPathComponent("f\(i).pdf")) }
         let source = GateSource()
         let indexer = Indexer(root: env.root, store: env.store, source: source)
         let (stream, continuation) = AsyncStream<IndexProgress>.makeStream()
@@ -287,7 +287,7 @@ struct IndexerTests {
     @Test func deleteIndexDuringUpdateIsRefilledCompletely() async throws {
         let env = try makeEnv()
         defer { env.cleanup() }
-        for i in 0..<6 { try Data("x".utf8).write(to: env.root.appendingPathComponent("f\(i).pdf")) }
+        for i in 0..<6 { try Data("x\(i)".utf8).write(to: env.root.appendingPathComponent("f\(i).pdf")) }
         let indexer = Indexer(root: env.root, store: env.store, source: SlowSource(delay: 0))
         _ = try await indexer.update { _ in }
         // Change one file so the next run has work, then wipe the index while it runs.

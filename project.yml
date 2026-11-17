@@ -40,8 +40,8 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_CFBundleDisplayName: PDFSucher
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        MARKETING_VERSION: "1.4.0"
-        CURRENT_PROJECT_VERSION: "21"
+        MARKETING_VERSION: "1.4.1"
+        CURRENT_PROJECT_VERSION: "22"
         ENABLE_HARDENED_RUNTIME: NO
     scheme:
       testTargets: [PDFSucherUITests]

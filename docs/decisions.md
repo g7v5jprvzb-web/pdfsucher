@@ -1571,3 +1571,31 @@ Grundlage: interne Messnotiz, Ergebnis in docs/performance.md „office-speed“
 - **P7 OCR:** `Indexer.ocrParallelism` = Kerne/4, 2…4 (`OCRParallelismBenchmark`, opt-in). dpi, Genauigkeit unverändert, Text in
   allen Stufen identisch. Tests `atMostOCRParallelismAtOnce`, `wipeDuringOCRStopsAndStartsOver` (12 statt 6 Bilder, damit er bei 4
   parallel noch etwas prüft) angepasst.
+
+## 2026-11-17 — PDF-Dubletten in Phase 1 (Branch `pdf-dubletten` ab `release-1.4.0` 51b0def)
+
+- **Befund** (Mess-Protokoll 16.11., echter Ordner): rund 20 % der PDFs sind byte-gleiche Kopien (SHA-256), meist paarweise,
+  einzelne mehrfach; sie kosten 88,7 s von 452 s PDF-Lesezeit (19,6 %). Phase 1 ist durch PDFKit begrenzt.
+- **Umsetzung** (`DuplicateFinder.swift`, `Indexer.run`): nach dem Diff (und nach P4 „verschoben“) werden unter den zu lesenden
+  PDFs (neu/geändert, nur `kind == .pdf`) die nach Größe gruppiert; nur Gruppen mit > 1 Datei werden per SHA-256 (CryptoKit,
+  1-MiB-Blöcke) gehasht, so parallel wie die Extraktion, abbrechbar. Gleiche Größe + gleicher Hash → die erste in der
+  Arbeitsreihenfolge (größte zuerst, dann Pfad) ist die Leit-Datei und wird normal über die `TextSource` gelesen; die Kopien
+  verlassen die Arbeitsliste. Kommt das Leit-Ergebnis, bekommt jede Kopie dieselben Seiten und denselben Status (ok, noText,
+  error, `needsOCR`-Seiten) mit ihrem eigenen `ScannedFile`. Eine Datei, die sich nicht hashen lässt, wird normal gelesen.
+- **Begründung:** gleiche Bytes → gleiches PDFKit-Ergebnis, also gleiche Seiten und Markierungen. Keine Schemaänderung.
+- **Semantik:** Leit-Datei und Kopien gehen gemeinsam in `pending`, danach erst die Abbruchprüfung: ein Abbruch speichert nie
+  eine Kopie ohne ihre Leit-Datei; wird die Leit-Datei selbst abgebrochen, wird keine der beiden gespeichert und der nächste
+  Lauf holt beide nach. Fortschritt: weiter ein Wert je fertiger Datei, auch für Kopien (`total` enthält sie), Kopien direkt
+  nach ihrer Leit-Datei. Batches können um die Kopien einer Leit-Datei größer als `batchSize` werden. Wipe-Neustart hasht neu.
+  Das Hashen läuft nach dem Fortschrittswert `(0, total)` und vor der ersten Extraktion (gemessen 0,5–1,0 s).
+- **Mess-Protokoll:** Kopien als `file` mit `ms` 0 und `"dedup": true`; `phase_end` (text) mit `hash_ms`, `hashed`, `dedup`.
+  `scripts/index-metrics-report.py` zeigt sie unter „Doppelarbeit“.
+- **Tests:** `DuplicatePDFTests` (zählende Spy-Quelle: zwei Kopien in verschiedenen Ordnern → 1× gelesen, beide gespeichert und
+  suchbar; gleiche Größe, anderer Inhalt → 2×; unlesbare Kopien → beide error, 1×; Abbruch während die Leit-Datei liest → nichts
+  gespeichert, nächster Lauf holt beide nach; Fortschritt zählt alle; Mess-Protokoll). Alle sechs vor der Umsetzung rot.
+  Angepasst: vier `IndexerTests` (`indexerCancels`, `concurrentUpdatesRunOneAfterAnother`, `cancelledWaitingUpdateStopsAtOnce`
+  und der Wipe-Test) legten 5–40 byte-gleiche Dateien „x“ an, während ihre Fake-Quelle je Dateiname anderen Text liefert; sie
+  bekommen jetzt je Datei eigenen Inhalt („x0“, „x1“ …), die geprüfte Absicht bleibt.
+- **Nicht in v1 (nächste Schritte):** Dubletten gegen schon gespeicherte Dokumente früherer Läufe (bräuchte eine Hash-Spalte,
+  Schemaänderung); OCR-Ergebnisse auf Kopien übertragen (Kopien warten jede für sich auf Phase 2); Word, PowerPoint und Bilder.
+  Messwerte in docs/performance.md „PDF-Dubletten“.
