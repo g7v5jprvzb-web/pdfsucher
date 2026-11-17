@@ -104,7 +104,7 @@ final class AppModel {
         var stored = PlaceStorage.load()
         var runtimes: [PlaceRuntime] = []
         var errors: [String] = []
-        let builtIn = SharedPlace(id: SharedPlace.builtInID, name: "PDF Search (auf diesem iPad)", bookmark: nil)
+        let builtIn = SharedPlace(id: SharedPlace.builtInID, name: "Auf diesem iPad", bookmark: nil)
         if let runtime = PlaceStorage.resolve(builtIn).runtime { runtimes.append(runtime) }
         var changed = false
         for (i, place) in stored.enumerated() {

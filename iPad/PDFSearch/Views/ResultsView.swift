@@ -62,7 +62,7 @@ private struct FileCard: View {
     private var columns: Int { min(pages.count, tileSize < 60 ? 6 : 4) }
     private var width: CGFloat {
         let tiles = CGFloat(columns) * (tileSize + 4) - 4
-        return max(tiles, 120) + 16
+        return max(tiles, 150) + 16
     }
 
     var body: some View {
@@ -72,9 +72,6 @@ private struct FileCard: View {
                     .font(.caption2.bold())
                     .padding(.horizontal, 4).padding(.vertical, 1)
                     .background(hit.kind == .image ? Color.orange.opacity(0.25) : Color.red.opacity(0.2), in: RoundedRectangle(cornerRadius: 3))
-                Text(hit.displayName)
-                    .font(.caption.weight(.semibold))
-                    .lineLimit(1).truncationMode(.middle)
                 Spacer(minLength: 2)
                 Text("\(hit.totalMatches)")
                     .font(.caption2.monospacedDigit().bold())
@@ -82,6 +79,10 @@ private struct FileCard: View {
                     .background(Color.accentColor.opacity(0.2), in: Capsule())
                     .accessibilityLabel("\(hit.totalMatches) Treffer")
             }
+            Text(hit.displayName)
+                .font(.caption.weight(.semibold))
+                .lineLimit(2).truncationMode(.middle)
+                .fixedSize(horizontal: false, vertical: true)
             FlowLayout(spacing: 4) {
                 ForEach(pages, id: \.self) { page in
                     PageTile(hit: hit, page: page, size: tileSize,

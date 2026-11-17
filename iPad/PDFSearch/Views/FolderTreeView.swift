@@ -45,6 +45,7 @@ private struct FolderNodeRow: View {
     let isPlace: Bool
     @State private var expanded = false
     @State private var children: [(name: String, url: URL)]?
+    @State private var didAppear = false
 
     private var me: FolderSelection { FolderSelection(placeID: placeID, relativePath: relativePath) }
     private var isSelected: Bool { model.selection == me }
@@ -92,6 +93,13 @@ private struct FolderNodeRow: View {
             }
         }
         .font(.subheadline)
+        .onAppear {
+            // Places start expanded, so their top folders are visible at once.
+            guard isPlace, !didAppear else { return }
+            didAppear = true
+            children = Self.subfolders(of: url)
+            expanded = true
+        }
     }
 
     static func subfolders(of url: URL) -> [(name: String, url: URL)] {
