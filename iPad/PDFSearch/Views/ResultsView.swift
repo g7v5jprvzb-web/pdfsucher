@@ -42,19 +42,55 @@ struct ResultsView: View {
             } else if model.hits.isEmpty && !model.isSearching {
                 placeholder("Keine Treffer", detail: "in \(model.selectionTitle)", symbol: "doc.text.magnifyingglass")
             } else {
-                ScrollView {
-                    FlowLayout(spacing: 10) {
-                        ForEach(model.hits) { hit in
-                            FileCard(hit: hit, tileSize: tileSize)
+                GeometryReader { geo in
+                    let rows = Self.rows(model.hits, tileSize: tileSize, width: geo.size.width - 24, spacing: 10)
+                    ScrollView {
+                        // Lazy rows: only the cards near the screen exist, so a search with thousands of
+                        // hit pages does not render every thumbnail at once (measured: 1.4 GB → see docs).
+                        LazyVStack(alignment: .leading, spacing: 10) {
+                            ForEach(rows) { row in
+                                HStack(alignment: .top, spacing: 10) {
+                                    ForEach(row.hits) { hit in
+                                        FileCard(hit: hit, tileSize: tileSize)
+                                    }
+                                }
+                            }
                         }
+                        .padding(12)
                     }
-                    .padding(12)
+                    .accessibilityIdentifier("resultsScroll")
                 }
-                .accessibilityIdentifier("resultsScroll")
             }
         }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("resultsPane")
+    }
+
+    /// One row of file cards. It carries the hits themselves: indices into `model.hits` crashed when a lazy row
+    /// outlived a search that returned fewer hits (2026-11-17, UI test testKindFilter).
+    struct Row: Identifiable {
+        let hits: [DocumentHit]
+        var id: String { hits.map(\.id).joined(separator: "\n") }
+    }
+
+    /// Packs the file cards into rows (left to right, then down) by their known widths.
+    static func rows(_ hits: [DocumentHit], tileSize: Double, width: CGFloat, spacing: CGFloat) -> [Row] {
+        var rows: [Row] = []
+        var row: [DocumentHit] = []
+        var used: CGFloat = 0
+        for hit in hits {
+            let w = FileCard.width(tiles: min(hit.tilePages.count, maxTilesPerFile), tileSize: tileSize)
+            let needed = row.isEmpty ? w : used + spacing + w
+            if needed > width, !row.isEmpty {
+                rows.append(Row(hits: row))
+                row = []
+                used = 0
+            }
+            used = row.isEmpty ? w : used + spacing + w
+            row.append(hit)
+        }
+        if !row.isEmpty { rows.append(Row(hits: row)) }
+        return rows
     }
 
     private var summary: String {
@@ -69,16 +105,19 @@ struct ResultsView: View {
     }
 }
 
-private struct FileCard: View {
+struct FileCard: View {
     @Environment(AppModel.self) private var model
     let hit: DocumentHit
     let tileSize: Double
 
     private var pages: [Int] { Array(hit.tilePages.prefix(ResultsView.maxTilesPerFile)) }
-    private var columns: Int { min(pages.count, tileSize < 60 ? 6 : 4) }
-    private var width: CGFloat {
-        let tiles = CGFloat(columns) * (tileSize + 4) - 4
-        return max(tiles, 150) + 16
+    private var width: CGFloat { Self.width(tiles: pages.count, tileSize: tileSize) }
+
+    /// Card width for `tiles` page tiles: 4 per row (6 when small), at least room for the file name.
+    static func width(tiles: Int, tileSize: Double) -> CGFloat {
+        let columns = min(max(tiles, 1), tileSize < 60 ? 6 : 4)
+        let row = CGFloat(columns) * (tileSize + 4) - 4
+        return max(row, 150) + 16
     }
 
     var body: some View {
@@ -164,6 +203,8 @@ private struct PageTile: View {
             let pixel = Int((size * 1.3 * scale).rounded(.up) / 64 + 1) * 64
             image = await Thumbnails.shared.image(url: hit.url, page: page, isImage: hit.kind == .image, pixel: pixel)
         }
+        // Lazy rows keep views that scrolled away; drop their images (the cache keeps the recent ones).
+        .onDisappear { image = nil }
     }
 }
 

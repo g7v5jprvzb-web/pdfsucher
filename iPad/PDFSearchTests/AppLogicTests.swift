@@ -128,3 +128,39 @@ struct SettingsTests {
         #expect(hit("a/b.pdf").displayName == "b.pdf")
     }
 }
+
+@Suite("Kachelzeilen")
+struct RowPackingTests {
+    private func hits(_ n: Int, pages: Int = 1) -> [DocumentHit] {
+        (0..<n).map { i in
+            DocumentHit(url: URL(fileURLWithPath: "/tmp/\(i).pdf"), relativePath: "\(i).pdf", modifiedAt: .now,
+                        pageHits: (0..<pages).map { PageHit(pageIndex: $0, matchCount: 1) }, totalMatches: pages, relevance: 1,
+                        sourceRoot: URL(fileURLWithPath: "/tmp"), pageCount: pages)
+        }
+    }
+
+    @Test func everyHitOnceInOrder() {
+        let all = hits(37, pages: 3)
+        let rows = ResultsView.rows(all, tileSize: 60, width: 700, spacing: 10)
+        #expect(rows.flatMap(\.hits).map(\.id) == all.map(\.id))
+        #expect(Set(rows.map(\.id)).count == rows.count)
+    }
+
+    @Test func rowsFitTheWidthAndSmallTilesFitMore() {
+        let all = hits(20)
+        for size in [40.0, 80, 120] {
+            for row in ResultsView.rows(all, tileSize: size, width: 600, spacing: 10) where row.hits.count > 1 {
+                let width = row.hits.reduce(0) { $0 + FileCard.width(tiles: $1.tilePages.count, tileSize: size) } + CGFloat(row.hits.count - 1) * 10
+                #expect(width <= 600)
+            }
+        }
+        let small = ResultsView.rows(hits(20, pages: 4), tileSize: 40, width: 900, spacing: 10).count
+        let big = ResultsView.rows(hits(20, pages: 4), tileSize: 120, width: 900, spacing: 10).count
+        #expect(small < big)
+    }
+
+    @Test func tooWideCardGetsItsOwnRow() {
+        let rows = ResultsView.rows(hits(3, pages: 8), tileSize: 120, width: 300, spacing: 10)
+        #expect(rows.map(\.hits.count) == [1, 1, 1])
+    }
+}

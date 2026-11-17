@@ -11,7 +11,10 @@ actor Thumbnails {
     private var documents: [URL: PDFDocument] = [:]
     private var documentOrder: [URL] = []
 
-    init() { cache.countLimit = 600 }
+    init() {
+        cache.countLimit = 800
+        cache.totalCostLimit = 96 * 1024 * 1024  // bytes of decoded images
+    }
 
     /// `pixel` is the longer side in pixels.
     func image(url: URL, page: Int, isImage: Bool, pixel: Int) -> UIImage? {
@@ -27,7 +30,10 @@ actor Thumbnails {
         } else {
             made = nil
         }
-        if let made { cache.setObject(made, forKey: key) }
+        if let made {
+            let cost = Int(made.size.width * made.scale * made.size.height * made.scale * 4)
+            cache.setObject(made, forKey: key, cost: cost)
+        }
         return made
     }
 
@@ -36,7 +42,7 @@ actor Thumbnails {
         guard let doc = PDFDocument(url: url) else { return nil }
         documents[url] = doc
         documentOrder.append(url)
-        if documentOrder.count > 24 { documents[documentOrder.removeFirst()] = nil }
+        if documentOrder.count > 8 { documents[documentOrder.removeFirst()] = nil }
         return doc
     }
 }
