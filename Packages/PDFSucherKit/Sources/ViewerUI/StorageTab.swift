@@ -42,6 +42,8 @@ struct StorageTab: View {
     @State private var running: Set<Item> = []
     /// 1.3.9: measurement log of the indexing (`IndexMetrics`), off by default.
     @AppStorage(IndexMetrics.defaultsKey) private var metricsEnabled = false
+    /// 1.4.2: diagnosis log of the result rows (`RowDiagnostics`), off by default.
+    @AppStorage(IndexMetrics.rowsDefaultsKey) private var rowDiagnosticsEnabled = false
 
     enum Item: String, Identifiable, CaseIterable {
         case ocr, orphans, slides, tiles, logs
@@ -116,10 +118,13 @@ struct StorageTab: View {
                 Toggle("Mess-Protokoll für Indizierung schreiben", isOn: $metricsEnabled)
                     .onChange(of: metricsEnabled) { _, on in IndexMetrics.shared.setEnabled(on) }
                     .accessibilityIdentifier("indexMetricsToggle")
+                Toggle("Diagnose-Protokoll für Ergebniszeilen schreiben", isOn: $rowDiagnosticsEnabled)
+                    .onChange(of: rowDiagnosticsEnabled) { _, on in IndexMetrics.rows.setEnabled(on) }
+                    .accessibilityIdentifier("rowDiagnosticsToggle")
             } header: {
                 Text("Messung")
             } footer: {
-                Text("Dauer je Datei und Phase, ohne Dateiinhalte und ohne Dateinamen: ~/Library/Logs/PDFSucher")
+                Text("Dauer je Datei und Phase bzw. Aufbau der Ergebniszeilen, ohne Dateiinhalte und ohne Dateinamen: ~/Library/Logs/PDFSucher")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -206,7 +211,10 @@ struct StorageTab: View {
             case .tiles:
                 sizes.tiles = nil
                 await tileCache?.removeAll()
-            case .logs: await Task.detached(priority: .userInitiated) { IndexMetrics.shared.deleteLogs() }.value
+            case .logs: await Task.detached(priority: .userInitiated) {
+                IndexMetrics.shared.deleteLogs()
+                IndexMetrics.rows.deleteLogs()
+            }.value
             }
             running.remove(item)
             await measureSlow()
@@ -226,7 +234,7 @@ struct StorageTab: View {
             sizes.ocr = (pages, images)
         }
         sizes.logs = await Task.detached(priority: .utility) {
-            let files = IndexMetrics.shared.logFiles()
+            let files = IndexMetrics.shared.logFiles() + IndexMetrics.rows.logFiles()
             return (files.count, Self.bytes(of: files))
         }.value
     }

@@ -19,7 +19,18 @@ import SearchKit
     private var entries: [URL: Entry] = [:]
     private var pending: [URL: Task<CGFloat?, Never>] = [:]
 
-    init() {}
+    /// 1.4.2: diagnosis log of the rows of this grid (off unless `IndexMetrics.rows` is on).
+    let diagnostics: RowDiagnostics
+
+    init(diagnostics: RowDiagnostics = RowDiagnostics()) {
+        self.diagnostics = diagnostics
+        diagnostics.shapes = self
+    }
+
+    /// A lookup finished for this file (diagnosis).
+    func hasEntry(_ url: URL) -> Bool { entries[url] != nil }
+    /// A lookup for this file is running (diagnosis).
+    func isPending(_ url: URL) -> Bool { pending[url] != nil }
 
     /// The shape used for drawing now: the known one, else a guess by kind (nil = A4 portrait).
     func aspect(for hit: DocumentHit) -> CGFloat? {
@@ -37,17 +48,22 @@ import SearchKit
 
     /// Looks the shape up once (concurrent callers share the lookup); returns the shape to draw with.
     @discardableResult
-    func resolve(_ hit: DocumentHit, revision: Int, cache: ThumbnailCache) async -> CGFloat? {
+    func resolve(_ hit: DocumentHit, revision: Int, cache: ThumbnailCache,
+                 source: RowDiagnostics.Source = .row) async -> CGFloat? {
         let url = hit.url
         if isResolved(url, revision: revision) { return aspect(for: hit) }
         let task: Task<CGFloat?, Never>
+        let started = ContinuousClock.now
+        let joined = pending[url] != nil
         if let running = pending[url] {
             task = running
         } else {
             task = Task.detached(priority: .userInitiated) { cache.pageAspect(of: url) }
             pending[url] = task
         }
+        diagnostics.shapeRequested(url, source: source, joined: joined)
         let value = await task.value
+        if !joined { diagnostics.shapeLoaded(url, source: source, ms: IndexMetrics.ms(since: started), found: value != nil) }
         if pending[url] == task { pending[url] = nil }
         let previous = entries[url]
         entries[url] = Entry(aspect: value ?? previous?.aspect, revision: max(revision, previous?.revision ?? 0))
@@ -57,7 +73,7 @@ import SearchKit
     /// Starts the lookup without waiting (prefetch of rows not on screen yet).
     func request(_ hit: DocumentHit, revision: Int, cache: ThumbnailCache) {
         guard !isResolved(hit.url, revision: revision), pending[hit.url] == nil else { return }
-        Task { await resolve(hit, revision: revision, cache: cache) }
+        Task { await resolve(hit, revision: revision, cache: cache, source: .prefetch) }
     }
 
     /// Tile size of a row: the shape fitted into the A4 tile `base` (`GridLayout.tileSize(base:pageAspect:)`).

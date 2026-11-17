@@ -109,7 +109,9 @@ struct ResultGridView: View {
                     }
                     log.debug("autoscroll stop")
                 }
-                .task { await PreviewTiming.runAutoNext(model) }   // measurement only (1.3.4): `-uiTestAutoNextDocMS <ms>`
+                .task { await PreviewTiming.runAutoNext(model) }
+                // 1.4.2: diagnosis log of the rows (only while it is on).
+                .onChange(of: model.hits, initial: true) { _, hits in pageShapes.diagnostics.hitsChanged(hits) }   // measurement only (1.3.4): `-uiTestAutoNextDocMS <ms>`
                 .onChange(of: metrics.columns, initial: true) { _, columns in
                     if model.settings.automaticColumns != columns { model.settings.automaticColumns = columns }
                 }

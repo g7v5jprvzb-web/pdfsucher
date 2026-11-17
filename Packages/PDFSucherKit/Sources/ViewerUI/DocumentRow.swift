@@ -32,6 +32,8 @@ struct DocumentRow: View {
         let shapeRevision = hit.kind.isOffice ? model.layoutRevision : 0
         let shapeReady = shapeLookups >= 0 && shapes.isResolved(hit.url, revision: shapeRevision)
         let tileSize = shapes.tileSize(for: hit, base: baseTileSize)
+        let showsHint = hit.isUnreadable || RowPages.count(for: hit, showAll: model.settings.showAllPages) == 0
+        let _ = shapes.diagnostics.built(hit.url, placeholder: !showsHint && !shapeReady)
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 if let symbol = ViewerText.rowSymbol(hit) {
@@ -151,12 +153,21 @@ struct DocumentRow: View {
             }
         }
         .task(id: ShapeLookup(url: hit.url, revision: shapeRevision)) {
-            guard !shapes.isResolved(hit.url, revision: shapeRevision) else { return }
-            await shapes.resolve(hit, revision: shapeRevision, cache: cache)
+            let known = shapes.isResolved(hit.url, revision: shapeRevision)
+            if !known {
+                await shapes.resolve(hit, revision: shapeRevision, cache: cache)
+            }
+            // Always redraw: the row may have been built ahead without its shape, and the tile prefetcher looked the
+            // shape up meanwhile (`PageShapes` is not observed). Without this the empty stand-in stayed (1.4.1).
             shapeLookups += 1
+            shapes.diagnostics.redraw(hit.url, reason: known ? "shape_known_at_task" : "shape_loaded")
         }
         // A Word document or deck in view: the app may start Office's font registration (1.3.2).
-        .onAppear { if hit.kind.isOffice { model.officeDocumentShown(hit.url) } }
+        .onAppear {
+            if hit.kind.isOffice { model.officeDocumentShown(hit.url) }
+            shapes.diagnostics.visible(hit.url)
+        }
+        .onDisappear { shapes.diagnostics.hidden(hit.url) }
         // The whole row (header and tiles), so UI tests find a row's checkboxes inside it.
         .accessibilityElement(children: .contain)
         .accessibilityLabel(ViewerText.rowHeader(hit))

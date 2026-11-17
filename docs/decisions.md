@@ -1599,3 +1599,17 @@ Grundlage: interne Messnotiz, Ergebnis in docs/performance.md „office-speed“
 - **Nicht in v1 (nächste Schritte):** Dubletten gegen schon gespeicherte Dokumente früherer Läufe (bräuchte eine Hash-Spalte,
   Schemaänderung); OCR-Ergebnisse auf Kopien übertragen (Kopien warten jede für sich auf Phase 2); Word, PowerPoint und Bilder.
   Messwerte in docs/performance.md „PDF-Dubletten“.
+
+## 2026-11-17 — 1.4.2: leere Ergebniszeilen, Diagnose-Protokoll (Branch `fix-dubletten-kacheln` ab `release-1.4.1`)
+
+- **Befund:** Eine Ergebniszeile blieb leer. Nachgespielt mit einer Kopie des echten Index, der
+  echten Suche samt Zwischenergebnissen und dem echten Raster: das Raster baut die Zeile vorab ohne Seitenform (Platzhalter),
+  der Kachel-Prefetcher holt die Form, die eigene Abfrage der Zeile fand sie dann schon vor und kehrte ohne Neuzeichnen
+  zurück (`PageShapes` wird nicht beobachtet). Nicht die Dublettenerkennung, keine NFC/NFD-Schlüssel (URL ist einheitlich).
+- **Fix** (e5c055d): die Abfrage zählt `shapeLookups` immer hoch. Test `RowShapeRedrawTests`.
+- **Diagnose-Protokoll** (`RowDiagnostics`, je `PageShapes` eins): `IndexMetrics` hat jetzt ein Datei-Präfix; `IndexMetrics.rows`
+  schreibt `ui-rows-<Datum>.jsonl`, eigener Schalter `rowDiagnosticsEnabled` (Einstellungen → Speicher → Messung), dazu
+  `Logger` Kategorie `Rows`. Ereignisse `hits`, `row_built`, `shape_request`, `shape_loaded`, `row_redraw`, `row_visible`,
+  `row_hidden`, `row_stuck` (Wächter alle 0,5 s, nur bei eingeschaltetem Protokoll und sichtbaren Zeilen; sichtbar und > 2 s
+  Platzhalter). Aus: eine atomare Abfrage je Aufruf. Auswertung `scripts/ui-rows-report.py`. Tests `RowDiagnosticsTests`
+  (mit dem 1.4.1-Verhalten meldet der Ablaufstest `row_stuck`).

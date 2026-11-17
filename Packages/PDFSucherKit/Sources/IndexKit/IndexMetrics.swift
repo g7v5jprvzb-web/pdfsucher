@@ -3,7 +3,8 @@ import CryptoKit
 import Foundation
 import Synchronization
 
-/// Writes one JSON object per line to `<directory>/index-metrics-<YYYY-MM-DD>.jsonl` (local date), off by default.
+/// Writes one JSON object per line to `<directory>/<prefix>-<YYYY-MM-DD>.jsonl` (local date), off by default.
+/// Two logs use it: the indexing (`shared`, `index-metrics-…`) and the result rows (`rows`, `ui-rows-…`, 1.4.2).
 ///
 /// Privacy: no file content, no text, no plain path. Files and sources appear only as `hash` (first 12 hex digits of
 /// SHA-256 of the absolute path) plus the extension.
@@ -14,6 +15,10 @@ public final class IndexMetrics: Sendable {
     public static let shared = IndexMetrics(directory: defaultDirectory)
     /// `defaults write local.pdfsucher indexMetricsEnabled -bool YES` (read at launch).
     public static let defaultsKey = "indexMetricsEnabled"
+    /// 1.4.2: diagnosis log of the result rows (`ui-rows-<date>.jsonl`, `RowDiagnostics`), off by default.
+    public static let rows = IndexMetrics(directory: defaultDirectory, prefix: "ui-rows")
+    /// `defaults write local.pdfsucher rowDiagnosticsEnabled -bool YES` (read at launch).
+    public static let rowsDefaultsKey = "rowDiagnosticsEnabled"
     public static var defaultDirectory: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/PDFSucher", isDirectory: true)
     }
@@ -22,6 +27,8 @@ public final class IndexMetrics: Sendable {
     @TaskLocal public static var run = 0
 
     public let directory: URL
+    /// File name start: `index-metrics` or `ui-rows`.
+    public let prefix: String
     private let enabled = Atomic(false)
     private let runs = Atomic(0)
     private let queue = DispatchQueue(label: "local.pdfsucher.index-metrics", qos: .utility)
@@ -35,7 +42,10 @@ public final class IndexMetrics: Sendable {
     private let output = Mutex(Output())      // only touched on `queue`
     private let done = Mutex(Set<String>())
 
-    public init(directory: URL) { self.directory = directory }
+    public init(directory: URL, prefix: String = "index-metrics") {
+        self.directory = directory
+        self.prefix = prefix
+    }
 
     public var isEnabled: Bool { enabled.load(ordering: .relaxed) }
 
@@ -77,10 +87,10 @@ public final class IndexMetrics: Sendable {
         if !fresh { log("reindexed_file", ["phase": phase, "file": file, "ext": ext, "key": key, "ms": ms]) }
     }
 
-    /// The protocol files in `directory` (`index-metrics-*.jsonl`), oldest first.
+    /// The protocol files in `directory` (`<prefix>-*.jsonl`), oldest first.
     public func logFiles() -> [URL] {
         let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
-        return names.filter { $0.hasPrefix("index-metrics-") && $0.hasSuffix(".jsonl") }.sorted()
+        return names.filter { $0.hasPrefix(prefix + "-") && $0.hasSuffix(".jsonl") }.sorted()
             .map { directory.appendingPathComponent($0, isDirectory: false) }
     }
 
@@ -144,7 +154,7 @@ public final class IndexMetrics: Sendable {
         out.flushScheduled = false
         guard !out.buffer.isEmpty else { return }
         defer { out.buffer.removeAll(keepingCapacity: true) }         // cannot write: dropped, never blocks
-        let name = "index-metrics-\(out.day).jsonl"
+        let name = "\(prefix)-\(out.day).jsonl"
         if out.handle == nil || out.name != name {
             try? out.handle?.close()
             out.handle = openFile(name)

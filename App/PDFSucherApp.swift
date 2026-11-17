@@ -55,8 +55,11 @@ struct PDFSucherApp: App {
         } else {
             // Measurement log of the indexing (1.3.9), off by default; written at most 1 s late, flushed at quit.
             IndexMetrics.shared.setEnabled(UserDefaults.standard.bool(forKey: IndexMetrics.defaultsKey), atLaunch: true)
+            // 1.4.2: diagnosis log of the result rows, off by default.
+            IndexMetrics.rows.setEnabled(UserDefaults.standard.bool(forKey: IndexMetrics.rowsDefaultsKey), atLaunch: true)
             NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { _ in
                 IndexMetrics.shared.flush()
+                IndexMetrics.rows.flush()
             }
             let model = AppModel(settings: GridSettings(), environment: SystemEnvironment())
             tileDisk = .standard
