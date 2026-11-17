@@ -8,6 +8,6 @@ APP=./.build/xcode/Build/Products/Debug-iphonesimulator/PDFSearch.app
 DEVICE=$(xcrun simctl list devices available | grep -m1 -E '^\s+iPhone' | sed -E 's/.*\(([0-9A-F-]{36})\).*/\1/')
 [ -n "$DEVICE" ] || { echo "Kein iPhone-Simulator gefunden (Xcode > Settings > Components)" >&2; exit 1; }
 xcrun simctl boot "$DEVICE" 2>/dev/null || true
-open -a Simulator
+open -a Simulator 2>/dev/null || echo "Simulator.app nicht gefunden – App läuft trotzdem im Hintergrund-Simulator $DEVICE"
 xcrun simctl install "$DEVICE" "$APP"
 xcrun simctl launch "$DEVICE" local.pdfsearch
