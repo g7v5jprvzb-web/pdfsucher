@@ -32,6 +32,8 @@ struct FolderTreeView: View {
             IndexStatusFooter()
         }
         .background(Color(.systemGroupedBackground))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("folderTree")
     }
 }
 
@@ -81,6 +83,7 @@ private struct FolderNodeRow: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .accessibilityIdentifier("folder-\(relativePath.isEmpty ? name : relativePath)")
             }
             .padding(.leading, CGFloat(depth) * 14)
 

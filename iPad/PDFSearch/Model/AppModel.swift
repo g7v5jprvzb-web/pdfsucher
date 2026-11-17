@@ -85,12 +85,18 @@ final class AppModel {
 
     private var searchTask: Task<Void, Never>?
     private var indexTask: Task<Void, Never>?
+    private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+    /// The index run was stopped because the app went to the background; it continues on return.
+    private(set) var interrupted = false
 
     init() {}
 
     // MARK: Start
 
     func start() async {
+        if DemoFiles.isRequested {
+            do { try DemoFiles.install() } catch { placeErrors.append("Testdateien: \(error.localizedDescription)") }
+        }
         loadPlaces()
         if let demo = UserDefaults.standard.string(forKey: "demoQuery"), !demo.isEmpty {
             await reindex()
@@ -168,6 +174,7 @@ final class AppModel {
         }
         var problems: [UnreadableFile] = []
         for runtime in places {
+            if Task.isCancelled { break }
             guard let store = runtime.store else {
                 problems.append(UnreadableFile(place: runtime.place.name, path: "–", reason: "Index nicht zu öffnen: \(runtime.openError ?? "")"))
                 continue
@@ -188,7 +195,9 @@ final class AppModel {
                     problems.append(UnreadableFile(place: name, path: Self.relative(url, to: root), reason: "iCloud-Datei nicht geladen"))
                 }
             }
-            let indexer = Indexer(root: root, store: store, ocr: VisionOCRSource(),
+            let indexer = Indexer(root: root, store: store,
+                                  scanner: FolderScanner(includeImages: true, imageExtensions: SupportedSourceTypes.iPadImageExtensions),
+                                  ocr: VisionOCRSource(),
                                   ocrSettings: OCRSettings(recognizeText: true, includeImages: true))
             let progress: @Sendable (IndexProgress) -> Void = { p in
                 Task { @MainActor in self.show(p, place: name) }
@@ -198,6 +207,8 @@ final class AppModel {
                 _ = try await indexer.buildWordParts(progress: progress)
                 problems += report.failed.map { UnreadableFile(place: name, path: $0, reason: "nicht lesbar") }
                 problems += report.ocr.failed.map { UnreadableFile(place: name, path: $0, reason: "Texterkennung fehlgeschlagen") }
+            } catch is CancellationError {
+                break
             } catch {
                 problems.append(UnreadableFile(place: name, path: "–", reason: "Indizieren abgebrochen: \(error.localizedDescription)"))
             }
@@ -209,9 +220,42 @@ final class AppModel {
             }
         }
         unreadable = problems
-        lastIndexed = Date()
+        if !Task.isCancelled { lastIndexed = Date() }
         refreshCounts()
         scheduleSearch(immediately: true)
+    }
+
+    // MARK: Background
+
+    /// The app went to the background: iPadOS gives a running index some seconds more, then the run stops
+    /// (everything stored so far stays) and continues when the app is active again.
+    func enteredBackground() {
+        guard isIndexing, backgroundTask == .invalid else { return }
+        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "Indizieren") { [weak self] in
+            MainActor.assumeIsolated { self?.stopForBackground() }
+        }
+    }
+
+    func becameActive() {
+        endBackgroundTask()
+        if interrupted {
+            interrupted = false
+            Task { await reindex() }
+        }
+    }
+
+    private func stopForBackground() {
+        if isIndexing {
+            interrupted = true
+            indexTask?.cancel()
+        }
+        endBackgroundTask()
+    }
+
+    private func endBackgroundTask() {
+        guard backgroundTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundTask)
+        backgroundTask = .invalid
     }
 
     private func show(_ p: IndexProgress, place: String) {
@@ -231,7 +275,9 @@ final class AppModel {
     private func refreshCounts() {
         documentCount = places.reduce(0) { $0 + ((try? $1.store?.documents().count) ?? 0) }
         let time = lastIndexed.map { $0.formatted(date: .omitted, time: .shortened) } ?? "–"
-        indexStatus = "\(documentCount) Dateien im Index · Stand \(time)"
+        indexStatus = interrupted
+            ? "\(documentCount) Dateien im Index · unterbrochen, wird fortgesetzt"
+            : "\(documentCount) Dateien im Index · Stand \(time)"
     }
 
     private static func relative(_ url: URL, to root: URL) -> String {
@@ -246,7 +292,7 @@ final class AppModel {
         let text = query
         let parsed = QueryParser.parse(text, partialWords: false)
         let targets: [(UUID, IndexStore, URL)] = places.compactMap { r in r.store.map { (r.id, $0, r.url) } }
-        let selection = wholeIPad ? nil : self.selection
+        let selection = SearchScope.effectiveSelection(self.selection, wholeIPad: wholeIPad)
         let kind = kindFilter
         let sortMode = sort.mode
         searchTask = Task {
@@ -261,20 +307,11 @@ final class AppModel {
             self.isSearching = true
             let found = await Task.detached(priority: .userInitiated) { () -> [DocumentHit] in
                 var all: [DocumentHit] = []
-                for (id, store, root) in targets {
-                    if let selection, selection.placeID != id { continue }
+                for (id, store, root) in targets where SearchScope.includes(place: id, selection: selection) {
                     guard let hits = try? SearchService(index: store, root: root).search(parsed, sort: sortMode, searchNames: true) else { continue }
                     all += hits
                 }
-                return all.filter { hit in
-                    switch kind {
-                    case .all: break
-                    case .pdf: guard hit.kind == .pdf else { return false }
-                    case .jpeg: guard hit.kind == .image else { return false }
-                    }
-                    guard let selection, !selection.relativePath.isEmpty else { return true }
-                    return hit.relativePath.hasPrefix(selection.relativePath + "/")
-                }
+                return SearchScope.filter(all, kind: kind, selection: selection)
             }.value
             guard !Task.isCancelled else { return }
             self.parsedQuery = parsed
@@ -303,6 +340,30 @@ final class AppModel {
         if wholeIPad { return "Ganzes iPad (alle freigegebenen Orte)" }
         guard let selection, let place = places.first(where: { $0.id == selection.placeID }) else { return "Alle freigegebenen Orte" }
         return selection.relativePath.isEmpty ? place.place.name : "\(place.place.name) › \(selection.relativePath.replacingOccurrences(of: "/", with: " › "))"
+    }
+}
+
+/// Which places and hits a search covers: „Ganzes iPad“ ignores the tree selection; a selected folder
+/// keeps its own place and the files below it; the type filter keeps PDF or JPEG.
+enum SearchScope {
+    static func effectiveSelection(_ selection: FolderSelection?, wholeIPad: Bool) -> FolderSelection? {
+        wholeIPad ? nil : selection
+    }
+
+    static func includes(place: UUID, selection: FolderSelection?) -> Bool {
+        selection.map { $0.placeID == place } ?? true
+    }
+
+    static func filter(_ hits: [DocumentHit], kind: KindFilter, selection: FolderSelection?) -> [DocumentHit] {
+        hits.filter { hit in
+            switch kind {
+            case .all: break
+            case .pdf: guard hit.kind == .pdf else { return false }
+            case .jpeg: guard hit.kind == .image else { return false }
+            }
+            guard let selection, !selection.relativePath.isEmpty else { return true }
+            return hit.relativePath.hasPrefix(selection.relativePath + "/")
+        }
     }
 }
 

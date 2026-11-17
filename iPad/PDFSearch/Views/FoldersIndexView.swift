@@ -93,6 +93,7 @@ struct FoldersIndexView: View {
                     Text("Nicht lesbare Dateien (\(model.unreadable.count))")
                 }
             }
+            .accessibilityIdentifier("foldersSheet")
             .navigationTitle("Ordner und Index")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

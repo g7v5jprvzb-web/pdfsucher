@@ -29,7 +29,8 @@ enum ICloudPlaceholders {
     }
 
     private static func accepted(_ name: String) -> Bool {
-        SupportedSourceTypes.accepts(fileName: name, includeImages: true, includeOffice: false)
+        let ext = (name as NSString).pathExtension.lowercased()
+        return SupportedSourceTypes.pdfExtensions.contains(ext) || SupportedSourceTypes.iPadImageExtensions.contains(ext)
     }
 
     private static func isLocal(_ url: URL) -> Bool {

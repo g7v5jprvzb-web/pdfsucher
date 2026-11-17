@@ -35,6 +35,8 @@ struct PreviewPane: View {
             }
         }
         .background(Color(.systemGray6))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("previewPane")
     }
 
     private var header: some View {
@@ -42,26 +44,32 @@ struct PreviewPane: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text(model.preview?.hit.displayName ?? "Vorschau")
                     .font(.subheadline.weight(.semibold)).lineLimit(1).truncationMode(.middle)
+                    .accessibilityIdentifier("previewTitle")
                 if let hit = model.preview?.hit {
                     Text(hit.kind == .image ? "JPEG · Texterkennung" : "Seite \(currentPage + 1) von \(hit.pageCount)")
                         .font(.caption).foregroundStyle(.secondary)
+                        .accessibilityIdentifier("previewPage")
                 }
             }
             Spacer()
             if matchCount > 0 {
                 Text("Treffer \(matchIndex + 1) von \(matchCount)")
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    .accessibilityIdentifier("matchCounter")
             }
             Button { step(-1) } label: { Image(systemName: "chevron.up") }
                 .disabled(matchCount == 0)
                 .accessibilityLabel("Vorheriger Treffer")
+                .accessibilityIdentifier("prevMatch")
             Button { step(1) } label: { Image(systemName: "chevron.down") }
                 .disabled(matchCount == 0)
                 .accessibilityLabel("Nächster Treffer")
+                .accessibilityIdentifier("nextMatch")
             Button { fullScreen.toggle() } label: {
                 Image(systemName: fullScreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
             }
             .accessibilityLabel(fullScreen ? "Vollbild beenden" : "Vollbild")
+            .accessibilityIdentifier("fullScreen")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)

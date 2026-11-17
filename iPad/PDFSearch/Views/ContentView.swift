@@ -2,11 +2,12 @@ import SwiftUI
 
 struct ContentView: View {
     @Environment(AppModel.self) private var model
-    @AppStorage("showFolderTree") private var showTree = true
-    @AppStorage("previewOnLeft") private var previewOnLeft = false
-    @AppStorage("tileSize") private var tileSize = 80.0
+    @AppStorage(SettingsKey.showFolderTree) private var showTree = true
+    @AppStorage(SettingsKey.previewOnLeft) private var previewOnLeft = false
+    @AppStorage(SettingsKey.tileSize) private var tileSize = 80.0
     @State private var showFolders = false
     @State private var fullScreenPreview = false
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         VStack(spacing: 0) {
@@ -26,9 +27,9 @@ struct ContentView: View {
                         PreviewPane(fullScreen: $fullScreenPreview)
                             .frame(width: previewWidth(geo.size.width))
                         Divider()
-                        ResultsView(tileSize: $tileSize)
+                        ResultsView(tileSize: $tileSize, showFolders: $showFolders)
                     } else {
-                        ResultsView(tileSize: $tileSize)
+                        ResultsView(tileSize: $tileSize, showFolders: $showFolders)
                         Divider()
                         PreviewPane(fullScreen: $fullScreenPreview)
                             .frame(width: previewWidth(geo.size.width))
@@ -40,6 +41,13 @@ struct ContentView: View {
         .animation(.easeInOut(duration: 0.2), value: previewOnLeft)
         .animation(.easeInOut(duration: 0.2), value: fullScreenPreview)
         .sheet(isPresented: $showFolders) { FoldersIndexView() }
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .background: model.enteredBackground()
+            case .active: model.becameActive()
+            default: break
+            }
+        }
         .onAppear {
             if UserDefaults.standard.bool(forKey: "demoShowFolders") { showFolders = true }
         }

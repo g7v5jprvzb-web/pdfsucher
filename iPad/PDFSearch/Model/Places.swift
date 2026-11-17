@@ -42,19 +42,27 @@ final class PlaceRuntime: Identifiable, @unchecked Sendable {
     }
 }
 
+/// Keys of the view settings kept between launches (the app's own defaults, not shared with the Mac app).
+enum SettingsKey {
+    static let showFolderTree = "showFolderTree"
+    static let previewOnLeft = "previewOnLeft"
+    static let tileSize = "tileSize"
+    static let tileSizeRange: ClosedRange<Double> = 40...120
+}
+
 /// Persists the shared places (bookmarks) in the app's own defaults.
 enum PlaceStorage {
     private static let key = "sharedPlaces.v1"
 
-    static func load() -> [SharedPlace] {
-        guard let data = UserDefaults.standard.data(forKey: key),
+    static func load(from defaults: UserDefaults = .standard) -> [SharedPlace] {
+        guard let data = defaults.data(forKey: key),
               let places = try? JSONDecoder().decode([SharedPlace].self, from: data) else { return [] }
         return places
     }
 
-    static func save(_ places: [SharedPlace]) {
+    static func save(_ places: [SharedPlace], to defaults: UserDefaults = .standard) {
         if let data = try? JSONEncoder().encode(places.filter { $0.bookmark != nil }) {
-            UserDefaults.standard.set(data, forKey: key)
+            defaults.set(data, forKey: key)
         }
     }
 

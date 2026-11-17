@@ -5,6 +5,7 @@ import SwiftUI
 struct ResultsView: View {
     @Environment(AppModel.self) private var model
     @Binding var tileSize: Double
+    @Binding var showFolders: Bool
 
     /// Tiles per file are capped so a long document does not fill the screen.
     static let maxTilesPerFile = 48
@@ -13,18 +14,30 @@ struct ResultsView: View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
                 Text(summary).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                    .accessibilityIdentifier("resultsSummary")
                 Spacer()
                 Image(systemName: "square.grid.3x3").font(.caption).foregroundStyle(.secondary)
-                Slider(value: $tileSize, in: 40...120, step: 4)
+                Slider(value: $tileSize, in: SettingsKey.tileSizeRange, step: 4)
                     .frame(width: 160)
                     .accessibilityLabel("Kachelgröße")
+                    .accessibilityIdentifier("tileSizeSlider")
                 Image(systemName: "square.grid.2x2").font(.body).foregroundStyle(.secondary)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
             Divider()
 
-            if model.parsedQuery.isEmpty {
+            if model.documentCount == 0 && !model.isIndexing {
+                ContentUnavailableView {
+                    Label("Noch keine Dateien im Index", systemImage: "folder.badge.questionmark")
+                } description: {
+                    Text("Gib PDF Search einen Ordner frei oder lege PDFs und JPEGs in der Dateien-App unter „Auf meinem iPad › PDF Search“ ab.")
+                } actions: {
+                    Button("Ordner freigeben …") { showFolders = true }
+                        .buttonStyle(.borderedProminent)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if model.parsedQuery.isEmpty {
                 placeholder("Suchbegriff eingeben", detail: "Durchsucht wird \(model.selectionTitle).", symbol: "magnifyingglass")
             } else if model.hits.isEmpty && !model.isSearching {
                 placeholder("Keine Treffer", detail: "in \(model.selectionTitle)", symbol: "doc.text.magnifyingglass")
@@ -37,8 +50,11 @@ struct ResultsView: View {
                     }
                     .padding(12)
                 }
+                .accessibilityIdentifier("resultsScroll")
             }
         }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("resultsPane")
     }
 
     private var summary: String {
@@ -143,6 +159,7 @@ private struct PageTile: View {
         .accessibilityElement()
         .accessibilityLabel("\(hit.displayName), Seite \(page + 1), \(count) Treffer")
         .accessibilityAddTraits(.isButton)
+        .accessibilityIdentifier("tile-\(hit.displayName)-\(page + 1)")
         .task(id: "\(hit.url.path)#\(page)#\(Int(size))") {
             let pixel = Int((size * 1.3 * scale).rounded(.up) / 64 + 1) * 64
             image = await Thumbnails.shared.image(url: hit.url, page: page, isImage: hit.kind == .image, pixel: pixel)

@@ -17,6 +17,7 @@ struct HeaderBar: View {
                         .symbolVariant(showTree ? .fill : .none)
                 }
                 .accessibilityLabel(showTree ? "Ordnerbaum ausblenden" : "Ordnerbaum einblenden")
+                .accessibilityIdentifier("toggleTree")
 
                 Text("PDF Search")
                     .font(.title2.bold())
@@ -29,12 +30,14 @@ struct HeaderBar: View {
                 }
                 .toggleStyle(.button)
                 .fixedSize()
+                .accessibilityIdentifier("wholeIPad")
 
                 Picker("Typ", selection: $model.kindFilter) {
                     ForEach(KindFilter.allCases) { Text($0.title).tag($0) }
                 }
                 .pickerStyle(.segmented)
                 .fixedSize()
+                .accessibilityIdentifier("kindFilter")
 
                 Menu {
                     Picker("Sortierung", selection: $model.sort) {
@@ -44,19 +47,23 @@ struct HeaderBar: View {
                     Label(model.sort.title, systemImage: "arrow.up.arrow.down")
                         .fixedSize()
                 }
+                .accessibilityIdentifier("sortMenu")
 
                 Button { previewOnLeft.toggle() } label: {
                     Image(systemName: "rectangle.2.swap").font(.title3)
                 }
                 .accessibilityLabel(previewOnLeft ? "Vorschau nach rechts" : "Vorschau nach links")
+                .accessibilityIdentifier("swapPreview")
 
                 Button { showFolders = true } label: {
                     Image(systemName: "folder.badge.gearshape").font(.title3)
                 }
                 .accessibilityLabel("Ordner und Index")
+                .accessibilityIdentifier("openFolders")
             }
             if let message = speech.message {
                 Text(message).font(.footnote).foregroundStyle(.red)
+                    .accessibilityIdentifier("speechMessage")
             }
         }
         .padding(.horizontal, 16)
@@ -72,6 +79,7 @@ struct HeaderBar: View {
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .submitLabel(.search)
+                .accessibilityIdentifier("searchField")
             if !model.query.isEmpty {
                 Button { model.query = "" } label: {
                     Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
@@ -86,6 +94,7 @@ struct HeaderBar: View {
                     .symbolEffect(.pulse, isActive: speech.isListening)
             }
             .accessibilityLabel(speech.isListening ? "Sprachsuche beenden" : "Sprachsuche")
+            .accessibilityIdentifier("micButton")
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
