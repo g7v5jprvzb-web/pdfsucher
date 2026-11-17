@@ -69,8 +69,8 @@ struct PageScreen: View {
     }
 
     private func subtitle(_ document: DocumentHit) -> String {
-        var text = "S. \(currentPage) von \(document.pageCount)"
-        if !hits.isEmpty { text += " · Treffer \(hitIndex + 1) von \(hits.count)" }
+        var text = "S. \(currentPage)/\(document.pageCount)"
+        if !hits.isEmpty { text += " · Treffer \(hitIndex + 1)/\(hits.count)" }
         return text
     }
 

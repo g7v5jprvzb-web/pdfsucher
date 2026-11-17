@@ -116,7 +116,7 @@ struct PhotoScreen: View {
         ToolbarItem(placement: .principal) {
             VStack(spacing: 0) {
                 Text(document.name).font(.subheadline.weight(.semibold)).lineLimit(1).truncationMode(.middle)
-                Text("\(model.folderName(document.folderID)) · \(document.totalHits) Treffer · Text per Texterkennung")
+                Text("\(model.folderName(document.folderID)) · \(document.totalHits) Treffer")
                     .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
             }
         }

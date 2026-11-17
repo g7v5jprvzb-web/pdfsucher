@@ -37,7 +37,16 @@ cd iOS/PDFSearch
 scripts/test.sh            # Tests des Kerns
 scripts/build.sh           # App für den iOS-Simulator bauen
 scripts/run-simulator.sh   # im Simulator starten
+scripts/screenshots.sh "iPhone 18 Pro"   # alle fünf Bildschirme mit Beispieldateien fotografieren
 ```
+
+Debug-Builds kennen Startargumente für Beispieldaten: `-demoData YES -demoQuery Vertrag -demoScreen search`
+(`library`, `search`, `page`, `photo`, `selection`). Die Beispieldateien landen im Dokumente-Ordner der App,
+der in „Dateien“ unter „Auf meinem iPhone > PDF Search“ erscheint.
+
+| Bibliothek | Suche | Seite | Foto | Auswahl |
+|---|---|---|---|---|
+| ![](docs/screenshots/01-bibliothek.png) | ![](docs/screenshots/02-suche.png) | ![](docs/screenshots/03-seite.png) | ![](docs/screenshots/04-foto.png) | ![](docs/screenshots/05-auswahl.png) |
 
 Auf ein echtes iPhone kommt die App über Xcode mit einer Apple-ID (Signing & Capabilities > Team);
 mit einer kostenlosen Apple-ID läuft sie dann 7 Tage, mit einem Entwickler-Account über TestFlight.

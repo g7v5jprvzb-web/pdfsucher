@@ -40,6 +40,8 @@ struct RootView: View {
             }
             .badge(model.selection.count)
         }
+        // Platz sparen: die Tab-Leiste wird beim Scrollen nach unten kleiner.
+        .tabBarMinimizeBehavior(.onScrollDown)
         .alert("Hinweis", isPresented: Binding(
             get: { model.alertMessage != nil },
             set: { if !$0 { model.alertMessage = nil } }
