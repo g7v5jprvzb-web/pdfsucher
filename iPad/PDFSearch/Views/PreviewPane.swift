@@ -126,9 +126,13 @@ struct PDFPreview: UIViewRepresentable {
                 matchCount = count
                 matchIndex = first ?? 0
             }
-            c.shown = nil
-            if first == nil, let page = view.document?.page(at: target.page) { view.go(to: page) }
-            if first != nil { c.show(first!) }
+            c.shown = first
+            // A freshly set document is not laid out yet and ignores `go(to:)`: navigate after layout.
+            let page = target.page
+            DispatchQueue.main.async {
+                view.layoutIfNeeded()
+                if let first { c.show(first) } else if let pdfPage = view.document?.page(at: page) { view.go(to: pdfPage) }
+            }
             return
         }
         if c.shown != matchIndex, matchIndex < c.matches.count { c.show(matchIndex) }
