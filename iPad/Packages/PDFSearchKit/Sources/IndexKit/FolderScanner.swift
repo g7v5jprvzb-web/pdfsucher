@@ -38,25 +38,32 @@ public struct FolderScanner: Sendable {
     private let maxDepth: Int
     private let includeImages: Bool
     private let includeOffice: Bool
+    /// iPad: only these image extensions (lowercase); nil = every `SupportedSourceTypes.imageExtensions`.
+    private let imageExtensions: Set<String>?
 
     /// `includeImages` is off by default so callers from before 1.2 keep listing PDFs only.
     /// `includeOffice` (Word/PowerPoint, spec 1.3) is off by default for the same reason.
-    public init(maxDepth: Int = 10, includeImages: Bool = false, includeOffice: Bool = false) {
+    /// `imageExtensions` (iPad) narrows the images listed, e.g. to JPEG only.
+    public init(maxDepth: Int = 10, includeImages: Bool = false, includeOffice: Bool = false, imageExtensions: Set<String>? = nil) {
         self.maxDepth = maxDepth
         self.includeImages = includeImages
         self.includeOffice = includeOffice
+        self.imageExtensions = imageExtensions
     }
 
     /// The same scanner for a folder `depth` levels below the root of a full scan, so it reaches exactly as deep
     /// (1.4.0 P3: scans of the changed subfolders only); nil when the folder is already at the depth limit.
     public func scoped(depth: Int) -> FolderScanner? {
         guard maxDepth - depth >= 0 else { return nil }
-        return FolderScanner(maxDepth: maxDepth - depth, includeImages: includeImages, includeOffice: includeOffice)
+        return FolderScanner(maxDepth: maxDepth - depth, includeImages: includeImages, includeOffice: includeOffice,
+                      imageExtensions: imageExtensions)
     }
 
     private func isIndexed(_ name: String) -> Bool {
         // Office lock files (`~$name.docx`) are never documents (`SupportedSourceTypes`).
-        SupportedSourceTypes.accepts(fileName: name, includeImages: includeImages, includeOffice: includeOffice)
+        guard SupportedSourceTypes.accepts(fileName: name, includeImages: includeImages, includeOffice: includeOffice) else { return false }
+        guard let imageExtensions, SupportedSourceTypes.kind(forExtension: (name as NSString).pathExtension) == .image else { return true }
+        return imageExtensions.contains((name as NSString).pathExtension.lowercased())
     }
 
     private static let keys: Set<URLResourceKey> = [

@@ -11,7 +11,9 @@ import UniformTypeIdentifiers
 public enum SupportedSourceTypes {
     public static let pdfExtensions: Set<String> = ["pdf"]
     /// Image files searched with text recognition (spec 1.2 §2), lowercase.
-    public static let imageExtensions: Set<String> = ["jpg", "jpeg"]  // iPad: nur JPEG
+    public static let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "heic", "dng"]
+    /// iPad (PDF Search): the images it lists and offers (JPEG only).
+    public static let iPadImageExtensions: Set<String> = ["jpg", "jpeg"]
     /// Word files (spec 1.3), lowercase. `.doc` is the legacy binary format.
     public static let wordExtensions: Set<String> = ["docx", "docm", "dotx", "doc"]
     /// PowerPoint files (spec 1.3), lowercase. `.ppt` and `.potx` are not supported.

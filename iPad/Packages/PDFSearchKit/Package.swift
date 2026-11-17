@@ -18,6 +18,11 @@ let package = Package(
         .target(name: "SearchKit", dependencies: ["IndexKit"]),
         .target(name: "OCRKit", dependencies: ["IndexKit"]),
         .target(name: "MediaKit", dependencies: ["IndexKit"]),
+        .target(name: "TestSupport"),
+        .testTarget(name: "IndexKitTests", dependencies: ["TestSupport", "IndexKit"]),
+        .testTarget(name: "SearchKitTests", dependencies: ["TestSupport", "SearchKit", "IndexKit"]),
+        .testTarget(name: "OCRKitTests", dependencies: ["TestSupport", "OCRKit", "IndexKit", "SearchKit"]),
+        .testTarget(name: "MediaKitTests", dependencies: ["TestSupport", "MediaKit", "IndexKit"]),
     ],
     swiftLanguageModes: [.v6]
 )
