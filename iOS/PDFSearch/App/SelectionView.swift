@@ -81,12 +81,12 @@ struct SelectionView: View {
                 Button {
                     Task { if let url = await makePDF() { Printing.print(url) } }
                 } label: {
-                    Label("Drucken", systemImage: "printer").frame(maxWidth: .infinity).frame(height: 30)
+                    Label("Drucken", systemImage: "printer").lineLimit(1).minimumScaleFactor(0.75).frame(maxWidth: .infinity).frame(height: 30)
                 }
                 Button {
                     Task { if let url = await makePDF() { fileToSave = url } }
                 } label: {
-                    Label("In „Dateien“ sichern", systemImage: "folder").frame(maxWidth: .infinity).frame(height: 30)
+                    Label("In „Dateien“ sichern", systemImage: "folder").lineLimit(1).minimumScaleFactor(0.75).frame(maxWidth: .infinity).frame(height: 30)
                 }
             }
             .buttonStyle(.bordered)

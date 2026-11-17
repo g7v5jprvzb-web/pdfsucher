@@ -131,12 +131,16 @@ struct PageScreen: View {
                 Text(model.hitsOnly ? "\(pages.count) Trefferseiten" : "Alle \(pages.count) Seiten")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
                     .frame(maxWidth: .infinity)
                 Button {
                     model.toggleSelection(document, page: currentPage)
                 } label: {
                     Label(selected ? "Ausgewählt" : "Auswählen", systemImage: "checkmark")
                         .font(.subheadline.weight(.semibold))
+                        .lineLimit(1)
+                        .fixedSize()
                         .frame(height: 38)
                 }
                 .buttonStyle(.borderedProminent)
