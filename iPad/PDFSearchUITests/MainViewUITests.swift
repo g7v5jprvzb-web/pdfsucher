@@ -11,6 +11,9 @@ final class MainViewUITests: XCTestCase {
     }
 
     override func tearDown() async throws {
+        if let app, let path = ProcessInfo.processInfo.environment["UITEST_DUMP_DIR"] {
+            try? app.debugDescription.write(toFile: path + "/" + name.replacingOccurrences(of: " ", with: "_") + ".txt", atomically: true, encoding: .utf8)
+        }
         app?.terminate()
     }
 
@@ -20,7 +23,7 @@ final class MainViewUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchArguments = ["-uiTestDemoFiles", "YES", "-demoQuery", query] + extra
         if !keepSettings {
-            app.launchArguments += ["-showFolderTree", "YES", "-previewOnLeft", "NO", "-tileSize", "80"]
+            app.launchArguments += ["-uiTestResetSettings", "YES"]
         }
         app.launch()
         self.app = app

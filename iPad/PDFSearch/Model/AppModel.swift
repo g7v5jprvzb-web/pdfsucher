@@ -89,7 +89,14 @@ final class AppModel {
     /// The index run was stopped because the app went to the background; it continues on return.
     private(set) var interrupted = false
 
-    init() {}
+    init() {
+        // UI tests: start from the default view settings (before any view reads them).
+        if UserDefaults.standard.bool(forKey: "uiTestResetSettings") {
+            for key in [SettingsKey.showFolderTree, SettingsKey.previewOnLeft, SettingsKey.tileSize] {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+        }
+    }
 
     // MARK: Start
 
