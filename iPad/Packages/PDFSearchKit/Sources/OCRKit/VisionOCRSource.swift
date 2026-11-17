@@ -20,7 +20,13 @@ public enum VisionOCRSourceError: Error, Equatable {
 
 public struct VisionOCRSource: OCRSource {
     public static let scanDPI: CGFloat = 300
+    #if os(iOS)
+    /// iPad: smaller limit to keep memory low (two recognitions run at once; 4000² RGBA ≈ 64 MB each).
+    /// A4 at 300 dpi (2480 × 3508) and 12-MP photos (4032 × 3024) still fit (almost) unscaled.
+    public static let maxPixel = 4000
+    #else
     public static let maxPixel = 6000
+    #endif
 
     private let recognizer: OCRRecognizer
 
