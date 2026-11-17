@@ -118,7 +118,7 @@ struct SearchView: View {
 
                 Menu {
                     Picker("Sortierung", selection: $model.sort) {
-                        ForEach(SortOrder.allCases, id: \.self) { Text($0.title).tag($0) }
+                        ForEach(PDFSearchCore.SortOrder.allCases, id: \.self) { Text($0.title).tag($0) }
                     }
                 } label: {
                     Image(systemName: "arrow.up.arrow.down")

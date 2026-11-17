@@ -77,7 +77,7 @@ final class AppModel {
     var query = ""
     var scope: SearchScope = .everywhere
     var kindFilter: KindFilter = .all
-    var sort: SortOrder = .hits
+    var sort: PDFSearchCore.SortOrder = .hits
     /// true: only pages with hits (tiles, preview, page strip); false: all pages.
     var hitsOnly = true
     var previewOnTop: Bool {
