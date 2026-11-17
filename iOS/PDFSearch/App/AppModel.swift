@@ -242,6 +242,13 @@ final class AppModel {
 
     var isIndexingAnything: Bool { folders.contains { $0.isIndexing } }
 
+    /// Waits until every running index pass has finished.
+    func waitForIndexing() async {
+        while let task = indexTasks.values.first {
+            await task.value
+        }
+    }
+
     func folderName(_ id: Int64) -> String {
         folders.first { $0.id == id }?.name ?? ""
     }

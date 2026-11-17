@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Startet die zuletzt gebaute App im ersten verfügbaren iPhone-Simulator (vorher scripts/build.sh).
+# Zusätzliche Argumente gehen an die App, z. B. -demoData YES -demoQuery Vertrag -demoScreen search
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/env.sh
@@ -10,4 +11,4 @@ DEVICE=$(xcrun simctl list devices available | grep -m1 -E '^\s+iPhone' | sed -E
 xcrun simctl boot "$DEVICE" 2>/dev/null || true
 open -a Simulator 2>/dev/null || echo "Simulator.app nicht gefunden – App läuft trotzdem im Hintergrund-Simulator $DEVICE"
 xcrun simctl install "$DEVICE" "$APP"
-xcrun simctl launch "$DEVICE" local.pdfsearch
+xcrun simctl launch "$DEVICE" local.pdfsearch "$@"

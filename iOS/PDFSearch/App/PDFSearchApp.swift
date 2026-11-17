@@ -9,7 +9,12 @@ struct PDFSearchApp: App {
         WindowGroup {
             RootView()
                 .environment(model)
-                .task { await model.load() }
+                .task {
+                    await model.load()
+                    #if DEBUG
+                    await model.runDemoIfRequested()
+                    #endif
+                }
                 .onChange(of: scenePhase) { _, phase in
                     // Coming back to the app: pick up files added or changed in the meantime.
                     if phase == .active { model.refreshAllIfLoaded() }
