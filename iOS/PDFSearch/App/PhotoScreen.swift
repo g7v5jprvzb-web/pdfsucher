@@ -129,7 +129,6 @@ struct PhotoScreen: View {
                 ShareLink(item: url) { Image(systemName: "square.and.arrow.up") }
                     .accessibilityLabel("Teilen")
             }
-            GlobalSearchButton()
         }
     }
 

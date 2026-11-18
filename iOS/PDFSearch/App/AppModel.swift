@@ -49,6 +49,13 @@ enum KindFilter: String, CaseIterable, Hashable {
     }
 }
 
+/// A folder taken out of the library, kept briefly so the removal can be undone.
+struct RemovedFolder: Identifiable, Equatable {
+    let id = UUID()
+    let name: String
+    let bookmark: Data
+}
+
 /// Destinations inside the search tab.
 enum SearchRoute: Hashable {
     case page(fileID: Int64, page: Int)
@@ -61,7 +68,8 @@ final class AppModel {
     enum TabID: Hashable { case library, search, selection }
 
     // MARK: Navigation
-    var tab: TabID = .library
+    /// The app starts in the search tab, which lists every file.
+    var tab: TabID = .search
     var searchPath: [SearchRoute] = []
     /// Incremented to ask the search field to take focus.
     var focusRequest = 0
@@ -71,6 +79,8 @@ final class AppModel {
     // MARK: Library
     private(set) var folders: [FolderItem] = []
     private(set) var isLoaded = false
+    /// The folder removed last, while "Rückgängig" is offered.
+    private(set) var removedFolder: RemovedFolder?
     var alertMessage: String?
 
     // MARK: Search
@@ -185,14 +195,35 @@ final class AppModel {
     func removeFolder(_ id: Int64) async {
         indexTasks[id]?.cancel()
         indexTasks[id] = nil
-        if let url = folders.first(where: { $0.id == id })?.url {
-            url.stopAccessingSecurityScopedResource()
+        if let folder = folders.first(where: { $0.id == id }) {
+            folder.url?.stopAccessingSecurityScopedResource()
+            removedFolder = RemovedFolder(name: folder.name, bookmark: folder.record.bookmark)
         }
         try? await store.removeFolder(id: id)
         folders.removeAll { $0.id == id }
         selection.removeAll { $0.folderID == id }
         if scope == .folder(id) { scope = .everywhere }
         runSearch()
+    }
+
+    /// Puts the folder removed last back into the library and reads it again.
+    func undoRemoveFolder() async {
+        guard let removed = removedFolder else { return }
+        removedFolder = nil
+        do {
+            let (url, refreshed) = try FolderAccess.resolve(removed.bookmark)
+            let record = try await store.addFolder(name: removed.name, bookmark: refreshed ?? removed.bookmark)
+            folders.append(FolderItem(record: record, url: url))
+            folders.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+            reindex(record.id)
+        } catch {
+            alertMessage = "„\(removed.name)“ lässt sich nicht wiederherstellen. Bitte den Ordner neu hinzufügen."
+        }
+    }
+
+    /// Hides "Rückgängig" once its time is up (only if no newer removal replaced it).
+    func dismissUndo(_ id: UUID) {
+        if removedFolder?.id == id { removedFolder = nil }
     }
 
     /// Starts downloading the cloud placeholders of a folder; they are indexed on the next refresh.
@@ -293,6 +324,16 @@ final class AppModel {
         UserDefaults.standard.set(recentSearches, forKey: Keys.recent)
     }
 
+    func removeRecentSearch(_ text: String) {
+        recentSearches.removeAll { $0 == text }
+        UserDefaults.standard.set(recentSearches, forKey: Keys.recent)
+    }
+
+    func clearRecentSearches() {
+        recentSearches.removeAll()
+        UserDefaults.standard.set(recentSearches, forKey: Keys.recent)
+    }
+
     func search(for text: String, scope: SearchScope = .everywhere) {
         query = text
         self.scope = scope
@@ -365,6 +406,14 @@ final class AppModel {
         let pages = visiblePages(of: document)
         guard let start = pages.firstIndex(of: previewPage) ?? pages.indices.first else { return [] }
         return Array(pages[start..<min(start + 2, pages.count)])
+    }
+
+    /// Where the preview pages sit in the document, as fractions of its length (for the thin bar).
+    var previewPosition: (start: Double, length: Double) {
+        guard let document = previewDocument, document.pageCount > 0,
+              let first = previewPages.first, let last = previewPages.last else { return (0, 0) }
+        let count = Double(document.pageCount)
+        return (Double(first - 1) / count, Double(last - first + 1) / count)
     }
 
     func showInPreview(_ fileID: Int64, page: Int) {

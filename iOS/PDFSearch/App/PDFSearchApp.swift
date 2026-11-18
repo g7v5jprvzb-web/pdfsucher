@@ -27,21 +27,23 @@ struct RootView: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        @Bindable var model = model
-        TabView(selection: $model.tab) {
-            Tab("Bibliothek", systemImage: "folder", value: AppModel.TabID.library) {
-                LibraryView()
+        GeometryReader { proxy in
+            // The bar reaches into the home-indicator area, so it takes as little height as possible.
+            let overlap = max(0, min(16, proxy.safeAreaInsets.bottom - 18))
+            VStack(spacing: 0) {
+                ZStack {
+                    tab(.library) { LibraryView() }
+                    tab(.search) { SearchView() }
+                    tab(.selection) { SelectionView() }
+                }
+                // Page and photo screens use the whole height; back is at the top left.
+                if !(model.tab == .search && !model.searchPath.isEmpty) {
+                    CompactTabBar()
+                        .padding(.bottom, -overlap)
+                }
             }
-            Tab("Suche", systemImage: "magnifyingglass", value: AppModel.TabID.search) {
-                SearchView()
-            }
-            Tab("Auswahl", systemImage: "checklist", value: AppModel.TabID.selection) {
-                SelectionView()
-            }
-            .badge(model.selection.count)
         }
-        // Platz sparen: die Tab-Leiste wird beim Scrollen nach unten kleiner.
-        .tabBarMinimizeBehavior(.onScrollDown)
+        .ignoresSafeArea(.keyboard, edges: .bottom)
         .alert("Hinweis", isPresented: Binding(
             get: { model.alertMessage != nil },
             set: { if !$0 { model.alertMessage = nil } }
@@ -51,23 +53,62 @@ struct RootView: View {
             Text(model.alertMessage ?? "")
         }
     }
+
+    /// Keeps every tab alive (scroll position, open page) and shows only the selected one.
+    private func tab<Content: View>(_ id: AppModel.TabID, @ViewBuilder content: () -> Content) -> some View {
+        let selected = model.tab == id
+        return content()
+            .opacity(selected ? 1 : 0)
+            .allowsHitTesting(selected)
+            .accessibilityHidden(!selected)
+    }
 }
 
-/// The blue magnifier at the top right of every screen: searches all folders.
-struct GlobalSearchButton: View {
+/// Flat bar at the bottom: icon and word side by side, about half as tall as the system tab bar.
+struct CompactTabBar: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        Button {
-            model.startGlobalSearch()
+        HStack(spacing: 0) {
+            item(.library, title: "Bibliothek", icon: "folder")
+            item(.search, title: "Suche", icon: "magnifyingglass")
+            item(.selection, title: "Auswahl", icon: "checklist", badge: model.selection.count)
+        }
+        .frame(height: 36)
+        .frame(maxWidth: .infinity)
+        .background(.bar, ignoresSafeAreaEdges: .bottom)
+        .overlay(alignment: .top) { Divider() }
+    }
+
+    private func item(_ id: AppModel.TabID, title: String, icon: String, badge: Int = 0) -> some View {
+        let selected = model.tab == id
+        return Button {
+            if selected, id == .search {
+                // Tapping "Suche" again goes back to the list.
+                model.searchPath.removeAll()
+            }
+            model.tab = id
         } label: {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(.white)
-                .frame(width: 32, height: 32)
-                .background(Circle().fill(Color.accentColor))
+            HStack(spacing: 5) {
+                Image(systemName: icon)
+                    .font(.system(size: 15, weight: selected ? .semibold : .regular))
+                Text(title)
+                    .font(.system(size: 12, weight: selected ? .semibold : .medium))
+                if badge > 0 {
+                    Text("\(badge)")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 5)
+                        .frame(minWidth: 16, minHeight: 16)
+                        .background(Capsule().fill(Color.red))
+                }
+            }
+            .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Ganzes iPhone durchsuchen")
+        .accessibilityLabel(badge > 0 ? "\(title), \(badge)" : title)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }

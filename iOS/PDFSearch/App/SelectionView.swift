@@ -9,48 +9,44 @@ struct SelectionView: View {
     @State private var shareItem: ShareItem?
     @State private var fileToSave: URL?
     @State private var errorMessage: String?
+    @State private var editMode: EditMode = .inactive
 
     var body: some View {
         @Bindable var model = model
         NavigationStack {
-            Group {
-                if model.selection.isEmpty {
-                    ContentUnavailableView {
-                        Label("Noch nichts ausgewählt", systemImage: "checklist")
-                    } description: {
-                        Text("Tippe in einer Seite oder einem Foto auf „Auswählen“ oder halte eine Kachel gedrückt. Die gesammelten Seiten kannst du hier als ein PDF teilen, drucken oder sichern.")
-                    }
-                } else {
-                    List {
-                        Section {
-                            ForEach(model.selection) { item in
-                                SelectionRow(item: item)
-                            }
-                            .onMove { model.selection.move(fromOffsets: $0, toOffset: $1) }
-                            .onDelete { model.selection.remove(atOffsets: $0) }
-                        } footer: {
-                            Text("Reihenfolge per Ziehen ändern (Bearbeiten). Fotos werden als eigene Seite eingefügt.")
+            VStack(spacing: 0) {
+                header
+                Group {
+                    if model.selection.isEmpty {
+                        ContentUnavailableView {
+                            Label("Noch nichts ausgewählt", systemImage: "checklist")
+                        } description: {
+                            Text("Tippe in einer Seite oder einem Foto auf „Auswählen“ oder halte eine Kachel gedrückt. Die gesammelten Seiten kannst du hier als ein PDF teilen, drucken oder sichern.")
                         }
+                    } else {
+                        List {
+                            Section {
+                                ForEach(model.selection) { item in
+                                    SelectionRow(item: item)
+                                }
+                                .onMove { model.selection.move(fromOffsets: $0, toOffset: $1) }
+                                .onDelete { model.selection.remove(atOffsets: $0) }
+                            } footer: {
+                                Text("Reihenfolge per Ziehen ändern (Bearbeiten). Fotos werden als eigene Seite eingefügt.")
+                            }
+                        }
+                        .listStyle(.insetGrouped)
+                        .environment(\.defaultMinListRowHeight, 44)
+                        .environment(\.editMode, $editMode)
+                        .contentMargins(.top, 0, for: .scrollContent)
+                        .safeAreaInset(edge: .bottom) { actions }
                     }
-                    .listStyle(.insetGrouped)
-                    .environment(\.defaultMinListRowHeight, 44)
-                    .safeAreaInset(edge: .bottom) { actions }
                 }
+                .frame(maxHeight: .infinity)
             }
-            .navigationTitle("Auswahl")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    if !model.selection.isEmpty {
-                        Button("Leeren", role: .destructive) { model.selection.removeAll() }
-                            .tint(.red)
-                    }
-                }
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    if !model.selection.isEmpty { EditButton() }
-                    GlobalSearchButton()
-                }
-            }
+            .background(Color(.systemGroupedBackground))
+            .toolbar(.hidden, for: .navigationBar)
+            .onChange(of: model.selection.isEmpty) { _, empty in if empty { editMode = .inactive } }
             .sheet(item: $shareItem) { item in
                 ActivityView(items: [item.url])
                     .presentationDetents([.medium, .large])
@@ -65,6 +61,37 @@ struct SelectionView: View {
                 Text(errorMessage ?? "")
             }
         }
+    }
+
+    /// One flat line instead of a navigation bar: title, count, Leeren, Bearbeiten.
+    private var header: some View {
+        HStack(spacing: 8) {
+            Text("Auswahl").font(.headline)
+            if !model.selection.isEmpty {
+                Text(countText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 4)
+            if !model.selection.isEmpty {
+                Button("Leeren", role: .destructive) { model.selection.removeAll() }
+                    .tint(.red)
+                Button(editMode.isEditing ? "Fertig" : "Bearbeiten") {
+                    withAnimation { editMode = editMode.isEditing ? .inactive : .active }
+                }
+                .fontWeight(.semibold)
+            }
+        }
+        .font(.subheadline)
+        .padding(.horizontal, 16)
+        .frame(height: 36)
+    }
+
+    private var countText: String {
+        let pages = model.selection.count
+        let files = Set(model.selection.map(\.fileID)).count
+        return "\(pages == 1 ? "1 Seite" : "\(pages) Seiten") aus \(files == 1 ? "1 Datei" : "\(files) Dateien")"
     }
 
     private var actions: some View {

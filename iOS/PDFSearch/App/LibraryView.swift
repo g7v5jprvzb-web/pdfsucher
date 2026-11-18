@@ -2,112 +2,103 @@ import PDFSearchCore
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// Screen 1: picked folders, their index state, recent searches.
+/// Library: picked folders, their index state, recent searches. No title bar: the bar at the
+/// bottom already says where you are.
 struct LibraryView: View {
     @Environment(AppModel.self) private var model
     @State private var showsFolderPicker = false
-    @State private var folderToRemove: FolderItem?
 
     var body: some View {
         NavigationStack {
             List {
                 Section {
-                    searchShortcut
-                }
-                .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 4))
-
-                Section("Ordner") {
                     ForEach(model.folders) { folder in
                         FolderRow(folder: folder)
-                            .swipeActions {
-                                Button("Entfernen", role: .destructive) { folderToRemove = folder }
-                            }
                     }
-                    Button {
-                        showsFolderPicker = true
-                    } label: {
-                        Label("Ordner aus „Dateien“ hinzufügen", systemImage: "plus")
-                            .font(.subheadline.weight(.medium))
+                } header: {
+                    HStack {
+                        Text("Ordner")
+                        Spacer()
+                        Button {
+                            showsFolderPicker = true
+                        } label: {
+                            Label("Hinzufügen", systemImage: "plus")
+                                .font(.subheadline.weight(.semibold))
+                                .textCase(nil)
+                        }
+                        .accessibilityLabel("Ordner aus „Dateien“ hinzufügen")
                     }
                 }
 
                 if !model.recentSearches.isEmpty {
-                    Section("Zuletzt gesucht") {
+                    Section {
                         RecentSearches()
-                            .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
+                            .listRowInsets(EdgeInsets(top: 8, leading: 10, bottom: 8, trailing: 10))
+                    } header: {
+                        HStack {
+                            Text("Zuletzt gesucht")
+                            Spacer()
+                            Button("Alle löschen", role: .destructive) { model.clearRecentSearches() }
+                                .font(.subheadline)
+                                .textCase(nil)
+                                .tint(.red)
+                        }
                     }
                 }
             }
             .listStyle(.insetGrouped)
             .listSectionSpacing(.compact)
             .environment(\.defaultMinListRowHeight, 40)
-            .contentMargins(.top, 4, for: .scrollContent)
+            .contentMargins(.top, 0, for: .scrollContent)
             .refreshable { model.refreshAll() }
             .overlay {
                 if model.isLoaded && model.folders.isEmpty {
                     EmptyLibrary { showsFolderPicker = true }
                 }
             }
-            .navigationTitle("Bibliothek")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        model.startGlobalSearch()
-                    } label: {
-                        Label("Überall", systemImage: "magnifyingglass")
-                            .labelStyle(.titleAndIcon)
-                            .font(.subheadline.weight(.semibold))
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .buttonBorderShape(.capsule)
-                    .controlSize(.small)
-                    .accessibilityLabel("Ganzes iPhone durchsuchen")
+            .safeAreaInset(edge: .bottom) {
+                if let removed = model.removedFolder {
+                    UndoBanner(removed: removed)
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 6)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
+            .animation(.snappy, value: model.removedFolder)
+            .toolbar(.hidden, for: .navigationBar)
             .fileImporter(isPresented: $showsFolderPicker, allowedContentTypes: [.folder]) { result in
                 if case .success(let url) = result {
                     Task { await model.addFolder(url) }
                 }
             }
-            .confirmationDialog(
-                "„\(folderToRemove?.name ?? "")“ aus der Bibliothek entfernen?",
-                isPresented: Binding(get: { folderToRemove != nil }, set: { if !$0 { folderToRemove = nil } }),
-                titleVisibility: .visible
-            ) {
-                Button("Entfernen", role: .destructive) {
-                    if let id = folderToRemove?.id { Task { await model.removeFolder(id) } }
-                    folderToRemove = nil
-                }
-            } message: {
-                Text("Die Dateien bleiben in „Dateien“ erhalten. Nur der Suchindex wird gelöscht.")
-            }
         }
     }
+}
 
-    private var searchShortcut: some View {
-        HStack(spacing: 6) {
-            Button {
-                model.startGlobalSearch()
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "magnifyingglass")
-                    Text("Ganzes iPhone durchsuchen")
-                    Spacer(minLength: 0)
-                }
-                .foregroundStyle(.secondary)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            Button {
-                model.startVoiceSearch()
-            } label: {
-                Image(systemName: "mic.fill")
-                    .frame(width: 40, height: 36)
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(Color.accentColor)
-            .accessibilityLabel("Per Sprache suchen")
+/// "„Downloads“ entfernt · Rückgängig", shown for a few seconds after the X.
+private struct UndoBanner: View {
+    @Environment(AppModel.self) private var model
+    let removed: RemovedFolder
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text("„\(removed.name)“ entfernt")
+                .font(.subheadline)
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 4)
+            Button("Rückgängig") { Task { await model.undoRemoveFolder() } }
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(Color(red: 0.55, green: 0.72, blue: 0.95))
+        }
+        .padding(.leading, 14)
+        .padding(.trailing, 10)
+        .frame(height: 42)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color(white: 0.17)))
+        .task(id: removed.id) {
+            try? await Task.sleep(for: .seconds(6))
+            model.dismissUndo(removed.id)
         }
     }
 }
@@ -145,6 +136,16 @@ private struct FolderRow: View {
             .buttonStyle(.plain)
             .foregroundStyle(Color.accentColor)
             .accessibilityLabel("Nur in \(folder.name) suchen")
+            Button {
+                Task { await model.removeFolder(folder.id) }
+            } label: {
+                Image(systemName: "xmark.circle")
+                    .font(.system(size: 18))
+                    .frame(width: 36, height: 36)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .accessibilityLabel("\(folder.name) aus der Suche entfernen")
         }
     }
 
@@ -192,11 +193,24 @@ private struct RecentSearches: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
                 ForEach(model.recentSearches, id: \.self) { text in
-                    Button(text) { model.search(for: text) }
-                        .buttonStyle(.bordered)
-                        .buttonBorderShape(.capsule)
-                        .controlSize(.small)
-                        .tint(Color.primary)
+                    HStack(spacing: 0) {
+                        Button(text) { model.search(for: text) }
+                            .buttonStyle(.plain)
+                            .font(.subheadline)
+                            .padding(.leading, 12)
+                            .frame(height: 32)
+                        Button {
+                            withAnimation(.snappy) { model.removeRecentSearch(text) }
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 10, weight: .bold))
+                                .frame(width: 30, height: 32)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("„\(text)“ aus Zuletzt gesucht löschen")
+                    }
+                    .background(Capsule().fill(Color(.tertiarySystemFill)))
                 }
             }
         }

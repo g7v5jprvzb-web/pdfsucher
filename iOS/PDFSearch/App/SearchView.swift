@@ -127,16 +127,10 @@ struct SearchView: View {
                 .accessibilityLabel("Sortierung: \(model.sort.title)")
             }
 
-            if !(model.isLoaded && model.folders.isEmpty) {
-                Text(summary)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
         }
-        .padding(.horizontal, 12)
-        .padding(.top, 4)
-        .padding(.bottom, 6)
+        .padding(.horizontal, 10)
+        .padding(.top, 2)
+        .padding(.bottom, 4)
     }
 
     private var summary: String {
@@ -193,6 +187,13 @@ struct SearchView: View {
                 if model.previewOnTop, model.previewDocument != nil { PreviewSpread() }
                 ScrollView {
                     LazyVStack(spacing: 5) {
+                        // The summary scrolls away with the list instead of taking a fixed line at the top.
+                        Text(summary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 12)
                         ForEach(model.result.pdfDocuments) { document in
                             DocumentRow(document: document)
                         }
@@ -272,14 +273,28 @@ private struct PreviewSpread: View {
                         Color.clear.frame(maxWidth: .infinity)
                     }
                 }
-                .frame(height: 246)
+                .frame(height: 240)
+                .contentShape(Rectangle())
+                // Swipe left or right to page through the document; the arrows below still work.
+                .highPriorityGesture(
+                    DragGesture(minimumDistance: 15)
+                        .onEnded { value in
+                            let dx = value.translation.width
+                            guard abs(dx) > 40, abs(dx) > abs(value.translation.height) else { return }
+                            withAnimation(.snappy) { model.stepPreview(by: dx < 0 ? 1 : -1) }
+                        }
+                )
+                .accessibilityAction(named: "Nächste Doppelseite") { model.stepPreview(by: 1) }
+                .accessibilityAction(named: "Vorherige Doppelseite") { model.stepPreview(by: -1) }
+
+                PreviewPosition(fraction: model.previewPosition)
 
                 HStack(spacing: 2) {
                     Button { model.stepPreview(by: -1) } label: {
                         Image(systemName: "chevron.left").frame(width: 36, height: 30)
                     }
                     .accessibilityLabel("Vorherige Doppelseite")
-                    Text("\(Text(document.name).bold()) · S. \(model.previewPages.map(String.init).joined(separator: " und "))")
+                    Text("\(Text(document.name).bold()) · S. \(model.previewPages.map(String.init).joined(separator: "–")) von \(document.pageCount)")
                         .font(.caption)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -303,6 +318,24 @@ private struct PreviewSpread: View {
             .padding(.vertical, 6)
             .background(Color(.secondarySystemFill))
         }
+    }
+}
+
+/// Thin bar under the preview: where the two pages sit in the document.
+private struct PreviewPosition: View {
+    let fraction: (start: Double, length: Double)
+
+    var body: some View {
+        GeometryReader { proxy in
+            Capsule().fill(Color(.separator))
+                .overlay(alignment: .leading) {
+                    Capsule().fill(Color.accentColor)
+                        .frame(width: max(6, proxy.size.width * fraction.length))
+                        .offset(x: proxy.size.width * fraction.start)
+                }
+        }
+        .frame(height: 3)
+        .accessibilityHidden(true)
     }
 }
 

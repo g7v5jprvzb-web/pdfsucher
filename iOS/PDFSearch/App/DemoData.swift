@@ -141,8 +141,10 @@ extension AppModel {
             }
             if let photo = result.photos.first { toggleSelection(photo, page: 1) }
             tab = .selection
-        default:
+        case "library":
             tab = .library
+        default:
+            break
         }
     }
 }
