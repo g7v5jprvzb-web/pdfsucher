@@ -72,9 +72,12 @@ struct PhotoScreen: View {
                     .foregroundStyle(.secondary)
                     .textCase(.uppercase)
                 if let analysis {
-                    let lines = hitLines(analysis)
+                    // Without a search term (list of all files) the first recognized lines are shown.
+                    let searching = !model.result.terms.isEmpty
+                    let lines = searching ? hitLines(analysis) : analysis.lines
                     if lines.isEmpty {
-                        Text("Der Begriff steht im Foto, ließ sich beim erneuten Lesen aber nicht genau verorten.")
+                        Text(searching ? "Der Begriff steht im Foto, ließ sich beim erneuten Lesen aber nicht genau verorten."
+                                       : "In diesem Foto wurde kein Text erkannt.")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
                     ForEach(Array(lines.prefix(4).enumerated()), id: \.offset) { _, line in
@@ -116,7 +119,8 @@ struct PhotoScreen: View {
         ToolbarItem(placement: .principal) {
             VStack(spacing: 0) {
                 Text(document.name).font(.subheadline.weight(.semibold)).lineLimit(1).truncationMode(.middle)
-                Text("\(model.folderName(document.folderID)) · \(document.totalHits) Treffer")
+                Text(document.totalHits > 0 ? "\(model.folderName(document.folderID)) · \(document.totalHits) Treffer"
+                                            : model.folderName(document.folderID))
                     .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
             }
         }

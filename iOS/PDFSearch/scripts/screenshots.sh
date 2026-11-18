@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bildschirmfotos aller fünf Bildschirme mit Beispieldateien (Debug-Build, vorher scripts/build.sh).
+# Bildschirmfotos aller Bildschirme mit Beispieldateien (Debug-Build, vorher scripts/build.sh).
 # Ablage: docs/screenshots/. Optional: Gerätename als erstes Argument, z. B. "iPhone 18 Pro".
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -28,3 +28,4 @@ shot 02-suche.png -demoQuery Vertrag -demoScreen search
 shot 03-seite.png -demoQuery Vertrag -demoScreen page
 shot 04-foto.png -demoQuery Vertrag -demoScreen photo
 shot 05-auswahl.png -demoQuery Vertrag -demoScreen selection
+shot 06-alle-dateien.png -demoScreen search

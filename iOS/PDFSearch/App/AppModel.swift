@@ -84,6 +84,8 @@ final class AppModel {
         didSet { UserDefaults.standard.set(previewOnTop, forKey: Keys.previewOnTop) }
     }
     private(set) var result: SearchResult = .empty
+    /// true while the search field is empty and the result lists every file.
+    private(set) var showsAllFiles = true
     private(set) var isSearching = false
     private(set) var recentSearches: [String]
 
@@ -146,6 +148,7 @@ final class AppModel {
         }
         folders = items
         isLoaded = true
+        runSearch()
         refreshAll()
     }
 
@@ -256,23 +259,25 @@ final class AppModel {
     // MARK: - Search
 
     /// Searches again with the current query and settings (debounced).
+    /// With an empty search field the result lists every file in the scope instead.
     func runSearch() {
         searchTask?.cancel()
         let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else {
-            result = .empty
-            isSearching = false
-            return
-        }
         let request = SearchRequest(text: text, scope: scope, kinds: kindFilter.kinds, sort: sort)
         let service = searchService
         isSearching = true
         searchTask = Task {
-            try? await Task.sleep(for: .milliseconds(180))
-            guard !Task.isCancelled else { return }
-            let found = (try? await service.search(request)) ?? .empty
+            let found: SearchResult
+            if text.isEmpty {
+                found = (try? await service.allFiles(scope: request.scope, kinds: request.kinds, sort: request.sort)) ?? .empty
+            } else {
+                try? await Task.sleep(for: .milliseconds(180))
+                guard !Task.isCancelled else { return }
+                found = (try? await service.search(request)) ?? .empty
+            }
             guard !Task.isCancelled else { return }
             self.result = found
+            self.showsAllFiles = text.isEmpty
             self.isSearching = false
             self.keepPreviewValid()
         }
@@ -333,8 +338,10 @@ final class AppModel {
     }
 
     /// Page numbers shown for a document: only hit pages or all pages.
+    /// A document without hits (list of all files) always shows all its pages.
     func visiblePages(of document: DocumentHit) -> [Int] {
-        guard !hitsOnly, document.kind == .pdf, document.pageCount > 0 else { return document.hitPageNumbers }
+        let showAll = !hitsOnly || document.pages.isEmpty
+        guard showAll, document.kind == .pdf, document.pageCount > 0 else { return document.hitPageNumbers }
         return Array(1...document.pageCount)
     }
 

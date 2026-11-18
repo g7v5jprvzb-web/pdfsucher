@@ -129,6 +129,22 @@ struct SearchTests {
                 == ["angebot.pdf", "IMG_2041.jpg", "vertrag_2024.pdf"])
     }
 
+    @Test func emptyFieldListsAllReadableFiles() async throws {
+        let (store, a, _) = try await makeIndex()
+        let service = SearchService(store: store)
+        let all = try await service.allFiles(sort: .name)
+        // kaputt.pdf could not be read and is left out.
+        #expect(all.documents.map(\.name) == ["angebot.pdf", "IMG_2041.jpg", "vertrag_2024.pdf"])
+        #expect(all.terms.isEmpty)
+        #expect(all.documents.allSatisfy { $0.pages.isEmpty })
+        #expect(all.documents.last?.pageCount == 3)
+        #expect(try await service.allFiles(sort: .hits).documents.map(\.name) == ["angebot.pdf", "IMG_2041.jpg", "vertrag_2024.pdf"])
+        #expect(try await service.allFiles(scope: .folder(a), kinds: [.pdf], sort: .modified).documents.map(\.name)
+                == ["angebot.pdf", "vertrag_2024.pdf"])
+        #expect(try await service.allFiles(kinds: [.jpeg]).documents.map(\.name) == ["IMG_2041.jpg"])
+        #expect(try await service.allFiles(kinds: []).documents.isEmpty)
+    }
+
     @Test func specialCharactersAreSafe() async throws {
         let (store, _, _) = try await makeIndex()
         let service = SearchService(store: store)

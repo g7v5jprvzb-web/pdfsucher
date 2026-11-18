@@ -127,7 +127,7 @@ struct SearchView: View {
                 .accessibilityLabel("Sortierung: \(model.sort.title)")
             }
 
-            if !model.query.trimmingCharacters(in: .whitespaces).isEmpty {
+            if !(model.isLoaded && model.folders.isEmpty) {
                 Text(summary)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -141,10 +141,18 @@ struct SearchView: View {
 
     private var summary: String {
         let result = model.result
-        if model.isSearching && result.documents.isEmpty { return "Suche …" }
-        var parts: [String] = [model.hitsOnly ? "Nur Trefferseiten" : "Alle Seiten"]
+        if model.isSearching && result.documents.isEmpty {
+            return model.query.trimmingCharacters(in: .whitespaces).isEmpty ? "Dateien werden geladen …" : "Suche …"
+        }
+        var parts: [String] = []
         let pdfs = result.pdfDocuments.count
-        if pdfs > 0 { parts.append("\(result.pdfHitPageCount) Seiten in \(pdfs) PDF") }
+        if model.showsAllFiles {
+            parts.append("Alle Dateien")
+            if pdfs > 0 { parts.append(pdfs == 1 ? "1 PDF" : "\(pdfs) PDFs") }
+        } else {
+            parts.append(model.hitsOnly ? "Nur Trefferseiten" : "Alle Seiten")
+            if pdfs > 0 { parts.append("\(result.pdfHitPageCount) Seiten in \(pdfs) PDF") }
+        }
         if !result.photos.isEmpty { parts.append(result.photos.count == 1 ? "1 Foto" : "\(result.photos.count) Fotos") }
         if model.isIndexingAnything { parts.append("Index wird aufgebaut") }
         return parts.joined(separator: " · ")
@@ -162,8 +170,14 @@ struct SearchView: View {
                 Button("Zur Bibliothek") { model.tab = .library }
                     .buttonStyle(.borderedProminent)
             }
-        } else if model.query.trimmingCharacters(in: .whitespaces).isEmpty {
-            StartHints()
+        } else if model.result.documents.isEmpty && !model.isSearching && model.showsAllFiles {
+            ContentUnavailableView {
+                Label(model.isIndexingAnything ? "Dateien werden gelesen" : "Keine Dateien", systemImage: "doc.on.doc")
+            } description: {
+                Text(model.isIndexingAnything
+                     ? "Sobald der Index fertig ist, stehen hier alle PDFs und Fotos."
+                     : "In \(model.scope == .everywhere ? "deinen Ordnern" : "„\(model.scopeTitle)“") liegen keine lesbaren PDFs oder JPEG-Fotos.")
+            }
         } else if model.result.documents.isEmpty && !model.isSearching {
             ContentUnavailableView {
                 Label("Keine Treffer", systemImage: "doc.text.magnifyingglass")
@@ -221,36 +235,11 @@ struct HitsOnlyToggle: View {
                 .background(RoundedRectangle(cornerRadius: 9).fill(model.hitsOnly ? Color.accentColor : Color(.tertiarySystemFill)))
         }
         .buttonStyle(.plain)
+        // Without a search term every page is shown anyway.
+        .disabled(model.showsAllFiles)
+        .opacity(model.showsAllFiles ? 0.35 : 1)
         .accessibilityLabel(model.hitsOnly ? "Nur Trefferseiten" : "Alle Seiten")
         .accessibilityHint("Wechselt zwischen nur Trefferseiten und allen Seiten")
-    }
-}
-
-private struct StartHints: View {
-    @Environment(AppModel.self) private var model
-
-    var body: some View {
-        List {
-            if !model.recentSearches.isEmpty {
-                Section("Zuletzt gesucht") {
-                    ForEach(model.recentSearches, id: \.self) { text in
-                        Button {
-                            model.query = text
-                        } label: {
-                            Label(text, systemImage: "clock.arrow.circlepath")
-                        }
-                        .tint(Color.primary)
-                    }
-                }
-            }
-            Section {
-                Text("Gesucht wird in allen PDFs und JPEG-Fotos deiner Ordner, auch nach Wortteilen. Groß- und Kleinschreibung und Akzente spielen keine Rolle.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .listStyle(.insetGrouped)
-        .listSectionSpacing(.compact)
     }
 }
 
@@ -334,7 +323,7 @@ private struct DocumentRow: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer(minLength: 4)
-                Text("\(folderLabel) · \(document.totalHits) Treffer")
+                Text(document.pages.isEmpty ? "\(folderLabel) · \(document.pageCount) S." : "\(folderLabel) · \(document.totalHits) Treffer")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -348,6 +337,7 @@ private struct DocumentRow: View {
                             url: url,
                             page: page,
                             isHit: hitPages.contains(page),
+                            dimsOtherPages: !document.pages.isEmpty,
                             isInPreview: model.previewDocument?.fileID == document.fileID && model.previewPages.contains(page),
                             isSelected: model.isSelected(fileID: document.fileID, page: page)
                         )
@@ -382,6 +372,8 @@ private struct PageTile: View {
     let url: URL?
     let page: Int
     let isHit: Bool
+    /// Search hits: pages without a hit are drawn paler. List of all files: no page is.
+    let dimsOtherPages: Bool
     let isInPreview: Bool
     let isSelected: Bool
 
@@ -389,7 +381,7 @@ private struct PageTile: View {
         ThumbnailImage(url: url, kind: .pdf, page: page, maxPixel: 160)
             .frame(width: 42, height: 57)
             .background(Color.white)
-            .opacity(isHit || isInPreview ? 1 : 0.5)
+            .opacity(isHit || isInPreview || !dimsOtherPages ? 1 : 0.5)
             .overlay(alignment: .top) {
                 if isHit { Rectangle().fill(Color.yellow).frame(height: 3) }
             }
@@ -431,7 +423,7 @@ private struct PhotoGrid: View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 6) {
                 KindBadge(kind: .jpeg)
-                Text("Fotos mit Treffer").font(.subheadline.weight(.semibold))
+                Text(model.showsAllFiles ? "Fotos" : "Fotos mit Treffer").font(.subheadline.weight(.semibold))
                 Spacer()
                 Text(photos.count == 1 ? "1 Foto" : "\(photos.count) Fotos").font(.caption).foregroundStyle(.secondary)
             }

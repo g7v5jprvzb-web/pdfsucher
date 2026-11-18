@@ -140,6 +140,25 @@ public actor IndexStore {
             """, [.int(id)]).first.flatMap(Self.storedFile)
     }
 
+    /// Every readable file in the scope, for the list shown while the search field is empty.
+    public func indexedFiles(scope: SearchScope, kinds: Set<FileKind>) throws -> [StoredFile] {
+        guard !kinds.isEmpty else { return [] }
+        var conditions = ["state = 'indexed'"]
+        var binds: [SQLValue] = []
+        if case .folder(let id) = scope {
+            conditions.append("folder_id = ?")
+            binds.append(.int(id))
+        }
+        if kinds.count < FileKind.allCases.count {
+            let list = kinds.map { "'\($0.rawValue)'" }.sorted().joined(separator: ",")
+            conditions.append("kind IN (\(list))")
+        }
+        return try db.query("""
+            SELECT id, folder_id, rel_path, kind, size, modified, page_count, state
+            FROM files WHERE \(conditions.joined(separator: " AND "))
+            """, binds).compactMap(Self.storedFile)
+    }
+
     private static func storedFile(_ row: Row) -> StoredFile? {
         guard let kind = FileKind(rawValue: row.text("kind")),
               let state = FileState(rawValue: row.text("state")) else { return nil }

@@ -128,7 +128,7 @@ struct PageScreen: View {
                 .buttonStyle(.bordered)
                 .disabled(hits.isEmpty)
                 .accessibilityLabel("Nächster Treffer")
-                Text(model.hitsOnly ? "\(pages.count) Trefferseiten" : "Alle \(pages.count) Seiten")
+                Text(model.hitsOnly && !document.pages.isEmpty ? "\(pages.count) Trefferseiten" : "Alle \(pages.count) Seiten")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)

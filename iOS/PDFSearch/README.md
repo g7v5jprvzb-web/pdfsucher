@@ -12,6 +12,7 @@ Umfang dieser ersten Version (bewusst ohne Word und PowerPoint):
 - **Texterkennung:** JPEG-Fotos und gescannte PDF-Seiten werden auf dem Gerät mit Vision gelesen.
 - **Suche:** Suchfeld mit Mikrofon (Spracheingabe, Deutsch), Bereich „Ganzes iPhone“ oder ein Ordner,
   Filter Alle/PDF/JPEG, Sortierung, Umschalter „nur Trefferseiten / alle Seiten“.
+  Solange das Suchfeld leer ist, stehen dort alle Dateien untereinander (mit Bereich, Filter und Sortierung).
 - **Treffer:** Doppelseiten-Vorschau (oben oder unten), eine Kachelreihe pro PDF, Raster für Fotos.
 - **Seite:** PDF-Seite mit markierten Treffern, Sprung von Treffer zu Treffer, Seitenleiste.
 - **Foto:** Fundstellen im Foto umrandet, erkannter Text darunter.
@@ -44,9 +45,9 @@ Debug-Builds kennen Startargumente für Beispieldaten: `-demoData YES -demoQuery
 (`library`, `search`, `page`, `photo`, `selection`). Die Beispieldateien landen im Dokumente-Ordner der App,
 der in „Dateien“ unter „Auf meinem iPhone > PDF Search“ erscheint.
 
-| Bibliothek | Suche | Seite | Foto | Auswahl |
-|---|---|---|---|---|
-| ![](docs/screenshots/01-bibliothek.png) | ![](docs/screenshots/02-suche.png) | ![](docs/screenshots/03-seite.png) | ![](docs/screenshots/04-foto.png) | ![](docs/screenshots/05-auswahl.png) |
+| Bibliothek | Alle Dateien | Suche | Seite | Foto | Auswahl |
+|---|---|---|---|---|---|
+| ![](docs/screenshots/01-bibliothek.png) | ![](docs/screenshots/06-alle-dateien.png) | ![](docs/screenshots/02-suche.png) | ![](docs/screenshots/03-seite.png) | ![](docs/screenshots/04-foto.png) | ![](docs/screenshots/05-auswahl.png) |
 
 Auf ein echtes iPhone kommt die App über Xcode mit einer Apple-ID (Signing & Capabilities > Team);
 mit einer kostenlosen Apple-ID läuft sie dann 7 Tage, mit einem Entwickler-Account über TestFlight.

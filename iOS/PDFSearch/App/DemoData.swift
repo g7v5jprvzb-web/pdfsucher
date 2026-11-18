@@ -7,7 +7,7 @@ import UIKit
 ///
 /// Launch arguments (Debug builds only):
 ///   -demoData YES                 create "Beispiele" in the app's Documents folder, add and index it
-///   -demoQuery Vertrag            search for this text
+///   -demoQuery Vertrag            search for this text (left out: list of all files)
 ///   -demoScreen library|search|page|photo|selection
 enum DemoData {
     static var isRequested: Bool { UserDefaults.standard.bool(forKey: "demoData") }
@@ -116,9 +116,11 @@ extension AppModel {
         }
         await waitForIndexing()
 
-        guard let text = DemoData.query else { return }
-        query = text
-        rememberQuery()
+        // Without -demoQuery the search screen shows the list of all files.
+        if let text = DemoData.query {
+            query = text
+            rememberQuery()
+        }
         runSearch()
         try? await Task.sleep(for: .milliseconds(600))
 

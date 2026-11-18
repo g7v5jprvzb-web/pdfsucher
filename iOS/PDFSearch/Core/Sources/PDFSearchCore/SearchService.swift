@@ -15,6 +15,18 @@ public struct SearchService: Sendable {
         return SearchResult(documents: Self.group(candidates, terms: terms, sort: request.sort), terms: terms)
     }
 
+    /// Every readable file without hits: the list shown while the search field is empty.
+    /// The result has no terms; each document has an empty `pages` list.
+    public func allFiles(scope: SearchScope = .everywhere, kinds: Set<FileKind> = Set(FileKind.allCases),
+                         sort: SortOrder = .name) async throws -> SearchResult {
+        let files = try await store.indexedFiles(scope: scope, kinds: kinds)
+        let documents = files.map { file in
+            DocumentHit(fileID: file.id, folderID: file.folderID, relativePath: file.relativePath, kind: file.kind,
+                        modified: file.modified, pageCount: file.pageCount, pages: [])
+        }
+        return SearchResult(documents: Self.sorted(documents, by: sort), terms: [])
+    }
+
     static func group(_ candidates: [CandidatePage], terms: [String], sort: SortOrder) -> [DocumentHit] {
         var pagesByFile: [Int64: [PageHit]] = [:]
         var firstByFile: [Int64: CandidatePage] = [:]
