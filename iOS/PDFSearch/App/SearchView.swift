@@ -294,7 +294,7 @@ private struct PreviewSpread: View {
                         Image(systemName: "chevron.left").frame(width: 36, height: 30)
                     }
                     .accessibilityLabel("Vorherige Doppelseite")
-                    Text("\(Text(document.name).bold()) · S. \(model.previewPages.map(String.init).joined(separator: "–")) von \(document.pageCount)")
+                    Text("\(Text(document.name).bold()) · S. \(pageLabel(model.previewPages)) von \(document.pageCount)")
                         .font(.caption)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -319,6 +319,12 @@ private struct PreviewSpread: View {
             .background(Color(.secondarySystemFill))
         }
     }
+}
+
+/// "1–2" for neighbouring pages, "1 und 3" for hit pages further apart.
+private func pageLabel(_ pages: [Int]) -> String {
+    guard pages.count == 2 else { return pages.map(String.init).joined() }
+    return pages[1] == pages[0] + 1 ? "\(pages[0])–\(pages[1])" : "\(pages[0]) und \(pages[1])"
 }
 
 /// Thin bar under the preview: where the two pages sit in the document.
