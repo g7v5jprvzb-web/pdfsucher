@@ -33,7 +33,8 @@ public struct SingleDocumentSearch: Sendable {
     /// for a PDF without text (unless its name matches), `CancellationError` when the surrounding Task is
     /// cancelled, and passes on errors of the text source (unreadable or locked file).
     /// - Parameter searchNames: the file name (without extension) counts too (spec 1.3.2 §1).
-    public func search(url: URL, query: ParsedQuery, searchNames: Bool = false) throws -> DocumentHit? {
+    /// - Parameter nameWithExtension: the file name search includes the extension.
+    public func search(url: URL, query: ParsedQuery, searchNames: Bool = false, nameWithExtension: Bool = false) throws -> DocumentHit? {
         guard !query.isEmpty else { return nil }
         // Not `url.resourceValues`: URL caches those, and a changed file would look unchanged.
         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
@@ -41,7 +42,8 @@ public struct SingleDocumentSearch: Sendable {
         let fileSize = (attributes?[.size] as? NSNumber)?.int64Value
         let pages = try cache.pages(for: url, modifiedAt: modifiedAt) { try source.pages(of: url) }
         let matcher = PageMatcher(query)
-        let nameMatch = searchNames && matcher.matchCount(in: DocumentHit.searchableName(of: url.lastPathComponent)) != nil
+        let nameMatch = searchNames
+            && matcher.matchCount(in: DocumentHit.searchableName(of: url.lastPathComponent, withExtension: nameWithExtension)) != nil
         if pages.allSatisfy({ $0.text.allSatisfy(\.isWhitespace) }) {
             guard nameMatch else { throw SingleDocumentSearchError.noText(url) }
             return hit(url, modifiedAt: modifiedAt, fileSize: fileSize, pageHits: [], pageCount: pages.count, nameMatch: true)
@@ -61,8 +63,9 @@ public struct SingleDocumentSearch: Sendable {
 
     /// Whether the file name (without extension) matches `query` (spec 1.3.2 §1). For a file whose text cannot be
     /// read: the caller shows it by its name and still handles the error `search` threw.
-    public static func nameMatches(_ url: URL, _ query: ParsedQuery) -> Bool {
-        !query.isEmpty && PageMatcher(query).matchCount(in: DocumentHit.searchableName(of: url.lastPathComponent)) != nil
+    public static func nameMatches(_ url: URL, _ query: ParsedQuery, withExtension: Bool = false) -> Bool {
+        !query.isEmpty
+            && PageMatcher(query).matchCount(in: DocumentHit.searchableName(of: url.lastPathComponent, withExtension: withExtension)) != nil
     }
 
     private func hit(_ url: URL, modifiedAt: Date?, fileSize: Int64?, pageHits: [PageHit], pageCount: Int, nameMatch: Bool) -> DocumentHit {

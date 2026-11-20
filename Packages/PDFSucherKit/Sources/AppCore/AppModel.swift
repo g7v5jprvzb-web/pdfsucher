@@ -362,6 +362,7 @@ import ViewerUI
     @ObservationIgnored private var lastSort: SortMode
     @ObservationIgnored private var lastPartialWords: Bool
     @ObservationIgnored private var lastSearchFileNames: Bool
+    @ObservationIgnored private var lastSearchFileNameExtensions: Bool
     @ObservationIgnored private var lastFileKinds: Set<DocumentKind>
     @ObservationIgnored private var lastOCR = OCRSettings.default
     @ObservationIgnored private var lastIncludeOffice = true
@@ -402,6 +403,7 @@ import ViewerUI
         lastSort = settings.sort
         lastPartialWords = settings.partialWords
         lastSearchFileNames = settings.searchFileNames
+        lastSearchFileNameExtensions = settings.searchFileNameExtensions
         lastFileKinds = settings.fileKinds
         lastOCR = OCRSettings(recognizeText: ocrPreferences.recognizeText, includeImages: ocrPreferences.includeImages)
         lastIncludeOffice = officePreferences.includeOffice
@@ -1765,7 +1767,7 @@ import ViewerUI
 
     /// Recognized pages become hits: search again (or refresh the browse list quietly).
     private func scheduleRefreshAfterRecognition() {
-        if QueryParser.parse(queryText, partialWords: settings.partialWords).isEmpty {
+        if QueryParser.parse(searchText, partialWords: settings.partialWords).isEmpty {
             if isBrowsing { scheduleSearch(debounced: false, background: true) }
         } else {
             scheduleSearch(debounced: false)
@@ -2005,7 +2007,7 @@ import ViewerUI
             guard let self, !Task.isCancelled else { return }
             self.browseRefreshTask = nil
             if self.browseRunning { self.browseRefreshWanted = true; return }
-            if self.isBrowsing, QueryParser.parse(self.queryText, partialWords: self.settings.partialWords).isEmpty {
+            if self.isBrowsing, QueryParser.parse(self.searchText, partialWords: self.settings.partialWords).isEmpty {
                 self.scheduleSearch(debounced: false, background: true)
             }
         }
@@ -2142,7 +2144,7 @@ import ViewerUI
         searchTask = nil
         isSearching = false
         browseRunning = false
-        let parsed = QueryParser.parse(queryText, partialWords: settings.partialWords)
+        let parsed = QueryParser.parse(searchText, partialWords: settings.partialWords)
         let targets: [SearchTarget] = sourceList.items.compactMap { source in
             let path = source.url.path
             if source.isFolder { return indexes[path].map { .folder(path, $0) } }
@@ -2155,6 +2157,7 @@ import ViewerUI
         }
         let sort = settings.sort
         let searchNames = settings.searchFileNames      // spec 1.3.2 §4
+        let nameWithExtension = settings.searchFileNameExtensions
         let delay = debounced ? typingDelay : .zero
         if parsed.isEmpty {
             browseRefreshTask?.cancel()
@@ -2208,7 +2211,7 @@ import ViewerUI
                 }
             }
             let outcome = await withTaskCancellationHandler {
-                await Self.run(parsed, sort: sort, searchNames: searchNames, over: targets, early: collector, metrics: metrics)
+                await Self.run(parsed, sort: sort, searchNames: searchNames, nameWithExtension: nameWithExtension, over: targets, early: collector, metrics: metrics)
             } onCancel: { early.cancel() }
             collector.finish()
             early.cancel()
@@ -2257,7 +2260,8 @@ import ViewerUI
 
     /// Runs the search over all targets in parallel, off the main actor; cancelling the caller cancels
     /// the work. A failing target does not drop the others' hits.
-    private nonisolated static func run(_ q: ParsedQuery, sort: SortMode, searchNames: Bool, over targets: [SearchTarget],
+    private nonisolated static func run(_ q: ParsedQuery, sort: SortMode, searchNames: Bool, nameWithExtension: Bool,
+                                        over targets: [SearchTarget],
                                         early: EarlyResults? = nil, metrics: IndexMetrics = .shared) async -> SearchOutcome {
         let work = Task.detached(priority: .userInitiated) { () -> SearchOutcome in
             await withTaskGroup(of: (String, Result<[DocumentHit], Error>, DocumentHit?).self) { group in
@@ -2268,11 +2272,13 @@ import ViewerUI
                             var report: (@Sendable ([DocumentHit]) -> Void)?
                             if let early { report = { hits in early.add(path, hits) } }
                             let onPartial = report
-                            return (path, Result { try index.search(q, sort: sort, searchNames: searchNames, onPartial: onPartial) }, nil)
+                            return (path, Result { try index.search(q, sort: sort, searchNames: searchNames, nameWithExtension: nameWithExtension,
+                                                                          onPartial: onPartial) }, nil)
                         case .file(let url, let single, let layout):
                             // A Word/PowerPoint file that changed since its layout throws `StaleFileLayout`.
                             let started = ContinuousClock.now
-                            let result = Result { try single.search(url: url, query: q, searchNames: searchNames).map { [$0] } ?? [] }
+                            let result = Result { try single.search(url: url, query: q, searchNames: searchNames,
+                                                                                   nameWithExtension: nameWithExtension).map { [$0] } ?? [] }
                             // 1.5.0: each single file's search (Word/PowerPoint are searched in their layout).
                             metrics.log("search_file", ["file": IndexMetrics.hash(url), "ext": url.pathExtension.lowercased(),
                                                         "layout": Self.layoutName(layout),
@@ -2280,7 +2286,7 @@ import ViewerUI
                             // Text not readable (locked, damaged, not laid out yet, changed): still found by its name,
                             // shown as when browsing (Chris, 2026-11-14); the error is handled as before.
                             guard case .failure(let error) = result, !(error is CancellationError), searchNames,
-                                  SingleDocumentSearch.nameMatches(url, q) else { return (url.path, result, nil) }
+                                  SingleDocumentSearch.nameMatches(url, q, withExtension: nameWithExtension) else { return (url.path, result, nil) }
                             let state: FileLayoutState? = error is StaleFileLayout ? .pending : layout
                             return (url.path, result, singleEntry(url, layout: state).withNameMatch())
                         }
@@ -2383,8 +2389,15 @@ import ViewerUI
 
     /// Every grid filter, ANDed.
     private func filtered(_ documents: [DocumentHit]) -> [DocumentHit] {
-        FileKindFilter(kinds: settings.fileKinds).apply(folderFiltered(documents))
+        FileKindFilter(kinds: shownKinds).apply(folderFiltered(documents))
     }
+
+    /// The kinds shown: those of a `typ:` shortcut in the search field (`KindQuery`) for this search,
+    /// else „Dateitypen“. The menu setting is left as it is.
+    private var shownKinds: Set<DocumentKind> { KindQuery.split(queryText).kinds ?? settings.fileKinds }
+
+    /// The search field text without its `typ:` shortcut: what is searched.
+    private var searchText: String { KindQuery.split(queryText).rest }
 
     /// Shows a new search or browse result (through the grid filters).
     private func show(_ newHits: [DocumentHit], for parsed: ParsedQuery, summary style: SummaryStyle, keepFocus: Bool = false) {
@@ -2409,9 +2422,11 @@ import ViewerUI
     /// documents. A focused page no longer shown loses the focus. The selection is never filtered.
     func publishFiltered(keepFocus: Bool = false) {
         let inFolders = folderFiltered(allHits)
-        let shown = FileKindFilter(kinds: settings.fileKinds).apply(inFolders)
+        let shown = FileKindFilter(kinds: shownKinds).apply(inFolders)
         hits = shown
-        hiddenByFilter = inFolders.count - shown.count
+        // Hidden by „Dateitypen“ only: a typed `typ:` asked for just those kinds (and its empty grid would
+        // offer the menu's „Alle Dateitypen zeigen“, which cannot undo the typed shortcut).
+        hiddenByFilter = KindQuery.split(queryText).kinds == nil ? inFolders.count - shown.count : 0
         switch summaryStyle {
         case .empty: summary = ""
         case .search:
@@ -2455,7 +2470,9 @@ import ViewerUI
 
     /// A text that is a real query (not empty, not only operators like „-“; review M3).
     private func isQuery(_ text: String) -> Bool {
-        !SearchHistory.clean(text).isEmpty && !QueryParser.parse(text, partialWords: settings.partialWords).isEmpty
+        let typed = KindQuery.split(text)
+        return !SearchHistory.clean(text).isEmpty
+            && (typed.kinds != nil || !QueryParser.parse(typed.rest, partialWords: settings.partialWords).isEmpty)
     }
 
     /// A term chosen from the history: searched at once (no typing delay) and moved to the top.
@@ -2488,6 +2505,7 @@ import ViewerUI
             _ = settings.sort
             _ = settings.partialWords
             _ = settings.searchFileNames
+            _ = settings.searchFileNameExtensions
             _ = settings.showAllPages
             _ = settings.fileKinds
             _ = ocrPreferences.recognizeText
@@ -2529,9 +2547,11 @@ import ViewerUI
         if let focused = focusedPage, !FocusNavigator.contains(focused, in: hits, showAllPages: settings.showAllPages) {
             setFocusByModel(FocusNavigator.nearestShown(to: focused, hits: hits, showAllPages: settings.showAllPages))
         }
-        if settings.partialWords != lastPartialWords || settings.searchFileNames != lastSearchFileNames {
+        if settings.partialWords != lastPartialWords || settings.searchFileNames != lastSearchFileNames
+            || settings.searchFileNameExtensions != lastSearchFileNameExtensions {
             lastPartialWords = settings.partialWords
             lastSearchFileNames = settings.searchFileNames
+        lastSearchFileNameExtensions = settings.searchFileNameExtensions
             lastSort = settings.sort
             scheduleSearch(debounced: false)
         } else if settings.sort != lastSort {

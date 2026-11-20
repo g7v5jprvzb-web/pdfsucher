@@ -68,4 +68,25 @@ struct FileNameSearchAppTests {
         await m.waitUntilIdle()
         #expect(m.hits.isEmpty)
     }
+
+    /// „Auch Dateiendung durchsuchen“: off by default, kept, and reaches the search (a change searches again).
+    @Test func extensionSettingReachesTheSearch() async throws {
+        let d = UserDefaults(suiteName: "FileNameExt-\(UUID().uuidString)")!
+        #expect(!GridSettings(defaults: d).searchFileNameExtensions)
+        GridSettings(defaults: d).searchFileNameExtensions = true
+        #expect(GridSettings(defaults: d).searchFileNameExtensions)
+
+        let index = FakeIndex()
+        let settings = makeSettings()
+        let m = makeModel(index: index, settings: settings)
+        await m.add([try PDFFixtures.tempDirectory()])
+        m.queryText = "pptx"
+        await m.waitUntilIdle()
+        #expect(index.nameExtensionsSeen.last == false)
+        let before = index.nameExtensionsSeen.count
+        settings.searchFileNameExtensions = true
+        await m.waitUntilIdle()
+        #expect(index.nameExtensionsSeen.count > before, "searched again")
+        #expect(index.nameExtensionsSeen.last == true)
+    }
 }

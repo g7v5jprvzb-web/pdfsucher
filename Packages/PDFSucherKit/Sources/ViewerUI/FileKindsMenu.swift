@@ -3,7 +3,8 @@ import IndexKit
 import SwiftUI
 
 /// The „Dateitypen“ menu in the view controls line: a tick per kind, any combination; the last ticked kind
-/// cannot be unticked. Font and control size come from `ToolbarArea` (`toolbarFontSize`), none of its own.
+/// cannot be unticked. Below: „Nur …“ per kind and „Alle Dateitypen zeigen“, each one click. Font and control
+/// size come from `ToolbarArea` (`toolbarFontSize`), none of its own.
 struct FileKindsMenu: View {
     @Bindable var settings: GridSettings
 
@@ -15,6 +16,13 @@ struct FileKindsMenu: View {
                     set: { _ in settings.toggleFileKind(kind) }))
                     .disabled(settings.fileKinds == [kind])
             }
+            Divider()
+            ForEach(GridSettings.allFileKinds, id: \.self) { kind in
+                Button(ViewerText.onlyFileKind(kind)) { settings.showOnlyFileKind(kind) }
+                    .disabled(settings.fileKinds == [kind])
+            }
+            Button(ViewerText.showAllFileKinds) { settings.showAllFileKinds() }
+                .disabled(settings.fileKinds.isSuperset(of: GridSettings.allFileKinds))
         }
         .fixedSize()
         .help(ViewerText.fileKindsHelp)

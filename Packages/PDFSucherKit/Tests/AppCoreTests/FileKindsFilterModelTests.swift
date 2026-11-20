@@ -223,4 +223,38 @@ struct FileKindsFilterModelTests {
         #expect(model.hits.isEmpty)
         #expect(await eventually { model.searchHistory.entries == ["Vertrag"] })
     }
+    // MARK: `typ:` in the search field
+
+    /// `typ:word Vertrag` searches „Vertrag“ and shows only Word, for this search; the menu stays as it is.
+    @Test func typedKindFiltersThisSearch() async {
+        let index = FakeIndex()
+        index.hits = mixed
+        let settings = makeSettings()
+        settings.fileKinds = [.pdf]
+        let model = makeModel(index: index, settings: settings)
+        await model.open(folder: folder)
+        model.queryText = "typ:word Vertrag"
+        await model.waitUntilIdle()
+        #expect(model.query == QueryParser.parse("Vertrag", partialWords: settings.partialWords))
+        #expect(model.hits.map(\.relativePath) == ["b.docx"], "the typed kind replaces the menu's")
+        #expect(model.hiddenByFilter == 0)
+        #expect(model.summary == "Gefunden in 1 Dokument, 1 Seite")
+        #expect(settings.fileKinds == [.pdf], "the menu is untouched")
+        model.queryText = "Vertrag"
+        await model.waitUntilIdle()
+        #expect(model.hits.map(\.relativePath) == ["a.pdf"], "without the shortcut the menu applies again")
+    }
+
+    /// `typ:pdf` alone browses the PDFs.
+    @Test func typedKindAloneBrowses() async {
+        let index = FakeIndex()
+        index.browseList = [hit("a.pdf", .pdf, pages: [], matches: 0, pageCount: 4),
+                            hit("b.docx", .word, pages: [], matches: 0, pageCount: 2)]
+        let model = makeModel(index: index)
+        await model.open(folder: folder)
+        model.queryText = "typ:pdf"
+        await model.waitUntilIdle()
+        #expect(model.isBrowsing)
+        #expect(model.hits.map(\.relativePath) == ["a.pdf"])
+    }
 }

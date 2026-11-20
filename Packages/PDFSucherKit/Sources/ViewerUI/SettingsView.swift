@@ -245,6 +245,10 @@ public struct SettingsView: View {
                 Toggle("Auch Dateinamen durchsuchen", isOn: $settings.searchFileNames)
                     .help("Findet Dateien auch über ihren Namen (ohne Endung), mit denselben Regeln wie den Text")
                     .accessibilityIdentifier("searchFileNamesToggle")
+                Toggle("Auch Dateiendung durchsuchen", isOn: $settings.searchFileNameExtensions)
+                    .help("Die Dateinamen-Suche sieht auch die Endung: „pptx“ findet jede .pptx-Datei")
+                    .disabled(!settings.searchFileNames)
+                    .accessibilityIdentifier("searchFileNameExtensionsToggle")
                 Picker("Wartezeit nach dem Tippen", selection: $settings.debounceMs) {
                     ForEach(GridSettings.debounceChoices, id: \.self) { ms in
                         Text(ms == GridSettings.debounceChoices[0] ? "\(ms) ms (Standard)" : "\(ms) ms").tag(ms)

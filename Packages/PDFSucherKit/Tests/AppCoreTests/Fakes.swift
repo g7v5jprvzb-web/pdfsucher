@@ -89,11 +89,15 @@ final class FakeIndex: FolderIndexing, @unchecked Sendable {
     }
 
     private var _searchNames: [Bool] = []
+    private var _nameExtensions: [Bool] = []
     /// `searchNames` of every search (1.3.2: file name search).
     var searchNamesSeen: [Bool] { lock.withLock { _searchNames } }
+    /// `nameWithExtension` of every search.
+    var nameExtensionsSeen: [Bool] { lock.withLock { _nameExtensions } }
 
-    func search(_ q: ParsedQuery, sort: SortMode, searchNames: Bool, onPartial: (@Sendable ([DocumentHit]) -> Void)?) throws -> [DocumentHit] {
-        lock.withLock { _searchNames.append(searchNames) }
+    func search(_ q: ParsedQuery, sort: SortMode, searchNames: Bool, nameWithExtension: Bool,
+                onPartial: (@Sendable ([DocumentHit]) -> Void)?) throws -> [DocumentHit] {
+        lock.withLock { _searchNames.append(searchNames); _nameExtensions.append(nameWithExtension) }
         return try search(q, sort: sort, onPartial: onPartial)
     }
 

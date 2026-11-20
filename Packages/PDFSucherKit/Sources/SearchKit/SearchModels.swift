@@ -64,9 +64,11 @@ public struct DocumentHit: Sendable, Equatable, Identifiable {
                     isSimplified: isSimplified, nameMatch: match, fileSize: fileSize)
     }
 
-    /// The name the file name search looks at: the file name without its extension (no folders).
-    public static func searchableName(of relativePath: String) -> String {
-        ((relativePath as NSString).lastPathComponent as NSString).deletingPathExtension
+    /// The name the file name search looks at: the file name without its extension (no folders); with
+    /// `withExtension` („Auch Dateiendung durchsuchen“) the whole file name, so `pptx` finds `Angebot.pptx`.
+    public static func searchableName(of relativePath: String, withExtension: Bool = false) -> String {
+        let name = (relativePath as NSString).lastPathComponent
+        return withExtension ? name : (name as NSString).deletingPathExtension
     }
 }
 
