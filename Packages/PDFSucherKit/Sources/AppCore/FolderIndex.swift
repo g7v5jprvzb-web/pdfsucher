@@ -14,8 +14,8 @@ public protocol FolderIndexing: AnyObject, Sendable {
     var wasRebuilt: Bool { get }
     /// `onPartial` (optional) receives the documents of the first batch early, once (spec 1.1 §5).
     func search(_ q: ParsedQuery, sort: SortMode, onPartial: (@Sendable ([DocumentHit]) -> Void)?) throws -> [DocumentHit]
-    /// With `searchNames` the file names count too (spec 1.3.2 §1).
-    func search(_ q: ParsedQuery, sort: SortMode, searchNames: Bool, onPartial: (@Sendable ([DocumentHit]) -> Void)?) throws -> [DocumentHit]
+    /// With `searchNames` the file names count too (spec 1.3.2 §1); `nameWithExtension`: with their extension.
+    func search(_ q: ParsedQuery, sort: SortMode, searchNames: Bool, nameWithExtension: Bool, onPartial: (@Sendable ([DocumentHit]) -> Void)?) throws -> [DocumentHit]
     func update(progress: @Sendable (IndexProgress) -> Void) async throws -> IndexReport
     func deleteIndex() throws
     /// Every document for browsing without a search term (spec 1.1 §12): the stored documents, or
@@ -79,7 +79,7 @@ extension FolderIndexing {
     public func hasLayouts(byRenderer renderer: String) throws -> Bool { false }
     public func search(_ q: ParsedQuery, sort: SortMode) throws -> [DocumentHit] { try search(q, sort: sort, onPartial: nil) }
     /// Indexes without file name search (older test doubles) search the content only.
-    public func search(_ q: ParsedQuery, sort: SortMode, searchNames: Bool,
+    public func search(_ q: ParsedQuery, sort: SortMode, searchNames: Bool, nameWithExtension: Bool,
                        onPartial: (@Sendable ([DocumentHit]) -> Void)?) throws -> [DocumentHit] {
         try search(q, sort: sort, onPartial: onPartial)
     }
@@ -277,9 +277,9 @@ public final class FolderIndex: FolderIndexing {
         try service.search(q, sort: sort, onPartial: onPartial)
     }
 
-    public func search(_ q: ParsedQuery, sort: SortMode, searchNames: Bool,
+    public func search(_ q: ParsedQuery, sort: SortMode, searchNames: Bool, nameWithExtension: Bool,
                        onPartial: (@Sendable ([DocumentHit]) -> Void)?) throws -> [DocumentHit] {
-        try service.search(q, sort: sort, searchNames: searchNames, onPartial: onPartial)
+        try service.search(q, sort: sort, searchNames: searchNames, nameWithExtension: nameWithExtension, onPartial: onPartial)
     }
 
     private let updating = Mutex(false)

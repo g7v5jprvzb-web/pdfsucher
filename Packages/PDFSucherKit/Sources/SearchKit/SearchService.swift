@@ -38,7 +38,8 @@ public struct SearchService: Sendable {
     ///   They are a subset of the final result, with the same page hits – except documents found by their name
     ///   alone so far (spec 1.3.2 §5: names go out with the first early rows), whose content hits may still follow.
     /// - Parameter searchNames: also the file names (spec 1.3.2 §1): a document matches by its name OR its content.
-    public func search(_ q: ParsedQuery, sort: SortMode, searchNames: Bool = false, batchSize: Int = SearchService.defaultBatchSize,
+    /// - Parameter nameWithExtension: the file name search includes the extension.
+    public func search(_ q: ParsedQuery, sort: SortMode, searchNames: Bool = false, nameWithExtension: Bool = false, batchSize: Int = SearchService.defaultBatchSize,
                        onPartial: (([DocumentHit]) -> Void)? = nil) throws -> [DocumentHit] {
         guard let plan = FTSQueryBuilder.plan(for: q) else { return [] }
         // 1.4.3: `search_source` in the measurement log (candidates = candidate pages read; db = reading them).
@@ -80,7 +81,7 @@ public struct SearchService: Sendable {
         let matcher = PageMatcher(q)
         // Names first: a few milliseconds for 10,000 files, so they are in the first early rows too.
         var names: Set<Int64> = []
-        if searchNames { Self.timed(&namesTime) { names = Self.nameMatches(stored, matcher: matcher) } }
+        if searchNames { Self.timed(&namesTime) { names = Self.nameMatches(stored, matcher: matcher, withExtension: nameWithExtension) } }
         let named = names.isEmpty ? [:] : Dictionary(stored.filter { names.contains($0.id) }.map { ($0.id, $0) }) { a, _ in a }
         let hits = { (checked: [(RawPageMatch, Int)]) in self.withNames(self.hits(from: checked, documents: documents), names, named) }
         var verified: [(RawPageMatch, Int)] = []
@@ -146,13 +147,13 @@ public struct SearchService: Sendable {
     }
 
     /// The ids of the documents whose file name (without extension) matches, checked on all cores.
-    static func nameMatches(_ documents: [StoredDocument], matcher: PageMatcher) -> Set<Int64> {
+    static func nameMatches(_ documents: [StoredDocument], matcher: PageMatcher, withExtension: Bool = false) -> Set<Int64> {
         let chunkSize = 256
         let chunks = (documents.count + chunkSize - 1) / chunkSize
         let found = Mutex<Set<Int64>>([])
         DispatchQueue.concurrentPerform(iterations: chunks) { c in
             let slice = documents[(c * chunkSize)..<min(documents.count, (c + 1) * chunkSize)]
-            let ids = slice.filter { matcher.matchCount(in: DocumentHit.searchableName(of: $0.relativePath)) != nil }.map(\.id)
+            let ids = slice.filter { matcher.matchCount(in: DocumentHit.searchableName(of: $0.relativePath, withExtension: withExtension)) != nil }.map(\.id)
             if !ids.isEmpty { found.withLock { $0.formUnion(ids) } }
         }
         return found.withLock { $0 }

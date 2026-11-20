@@ -28,6 +28,23 @@ struct FileNameSearchTests {
 
     private func paths(_ hits: [DocumentHit]) -> [String] { hits.map(\.relativePath) }
 
+    /// „Auch Dateiendung durchsuchen“: `pptx` finds the name and the extension; off, only the name.
+    @Test func extensionWhenAsked() throws {
+        let index = try TestIndex()
+        try index.add("Angebot.pptx", pages: ["Folie"])
+        try index.add("pptx_Notizen.pdf", pages: ["leer"])
+        try index.add("Bericht.pdf", pages: ["leer"])
+        let q = QueryParser.parse("pptx", partialWords: false)
+        let service = SearchService(index: index, root: root)
+        #expect(Set(paths(try service.search(q, sort: .fileName, searchNames: true, nameWithExtension: true)))
+                == ["Angebot.pptx", "pptx_Notizen.pdf"])
+        #expect(paths(try service.search(q, sort: .fileName, searchNames: true)) == ["pptx_Notizen.pdf"])
+        #expect(paths(try service.search(q, sort: .fileName, searchNames: false, nameWithExtension: true)).isEmpty,
+                "names off: the extension does not count either")
+        #expect(DocumentHit.searchableName(of: "a/Angebot.pptx", withExtension: true) == "Angebot.pptx")
+        #expect(DocumentHit.searchableName(of: "a/Angebot.pptx") == "Angebot")
+    }
+
     @Test func nameOnlyContentOnlyAndBoth() throws {
         let hits = try search("rechnung", in: index())
         #expect(Set(paths(hits)) == ["Rechnung März 2024.pdf", "Protokoll.pdf", "Rechnung-A_2023.pdf", "kaputt Rechnung.pdf"])

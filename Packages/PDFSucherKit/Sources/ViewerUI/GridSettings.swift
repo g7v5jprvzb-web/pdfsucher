@@ -34,6 +34,7 @@ public enum PreviewPosition: String, CaseIterable, Sendable {
         static let sort = "grid.sort"
         static let partialWords = "search.partialWords"
         static let searchFileNames = "search.fileNames"
+        static let searchFileNameExtensions = "search.fileNameExtensions"
         static let previewFollowsZoom = "preview.followsZoom"
         static let previewZoomBeyondWidth = "preview.zoomBeyondWidth"
         static let columnsMode = "grid.columnsMode"
@@ -236,6 +237,7 @@ public enum PreviewPosition: String, CaseIterable, Sendable {
     private var storedSort: SortMode
     private var storedPartialWords: Bool
     private var storedSearchFileNames: Bool
+    private var storedSearchFileNameExtensions: Bool
     private var storedPreviewFollowsZoom: Bool
     private var storedPreviewZoomBeyondWidth: Bool
     private var storedColumnsMode: ColumnsMode
@@ -306,6 +308,13 @@ public enum PreviewPosition: String, CaseIterable, Sendable {
         set { storedSearchFileNames = newValue; defaults.set(newValue, forKey: Key.searchFileNames) }
     }
 
+    /// „Auch Dateiendung durchsuchen“: the file name search includes the extension (`pptx` finds every
+    /// `….pptx`). Off by default: else a search for „pdf“ would list every PDF by its name.
+    public var searchFileNameExtensions: Bool {
+        get { storedSearchFileNameExtensions }
+        set { storedSearchFileNameExtensions = newValue; defaults.set(newValue, forKey: Key.searchFileNameExtensions) }
+    }
+
     public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         let has = { (key: String) in defaults.object(forKey: key) != nil }
@@ -314,6 +323,7 @@ public enum PreviewPosition: String, CaseIterable, Sendable {
         storedSort = defaults.string(forKey: Key.sort).flatMap(SortMode.init(rawValue:)) ?? .matchCount
         storedPartialWords = has(Key.partialWords) ? defaults.bool(forKey: Key.partialWords) : false
         storedSearchFileNames = has(Key.searchFileNames) ? defaults.bool(forKey: Key.searchFileNames) : true
+        storedSearchFileNameExtensions = defaults.bool(forKey: Key.searchFileNameExtensions)
         storedPreviewFollowsZoom = has(Key.previewFollowsZoom) ? defaults.bool(forKey: Key.previewFollowsZoom) : true
         storedPreviewZoomBeyondWidth = defaults.bool(forKey: Key.previewZoomBeyondWidth)
         storedColumnsMode = defaults.string(forKey: Key.columnsMode).flatMap(ColumnsMode.init(rawValue:)) ?? .fixed
