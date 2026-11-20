@@ -1,0 +1,74 @@
+name: PDFSearch
+options:
+  bundleIdPrefix: local.pdfsearch
+  developmentLanguage: de
+  deploymentTarget:
+    iOS: "26.0"
+packages:
+  PDFSearchKit:
+    path: Packages/PDFSearchKit
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    IPHONEOS_DEPLOYMENT_TARGET: "26.0"
+    CODE_SIGNING_ALLOWED: NO
+    CODE_SIGN_STYLE: Manual
+targets:
+  PDFSearch:
+    type: application
+    platform: iOS
+    sources: [PDFSearch]
+    dependencies:
+      - package: PDFSearchKit
+        product: IndexKit
+      - package: PDFSearchKit
+        product: SearchKit
+      - package: PDFSearchKit
+        product: OCRKit
+      - package: PDFSearchKit
+        product: MediaKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.pdfsearch.ipad
+        PRODUCT_NAME: PDFSearch
+        TARGETED_DEVICE_FAMILY: "2"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: PDF Search
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_UIRequiresFullScreen: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_UIFileSharingEnabled: YES
+        INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace: YES
+        INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: "PDF Search wandelt deine gesprochene Suche in Text für das Suchfeld um."
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: "PDF Search braucht das Mikrofon für die Sprachsuche."
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+    scheme:
+      testTargets: [PDFSearchTests, PDFSearchUITests]
+  PDFSearchTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [PDFSearchTests]
+    dependencies:
+      - target: PDFSearch
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.pdfsearch.ipad.tests
+        GENERATE_INFOPLIST_FILE: YES
+        TARGETED_DEVICE_FAMILY: "2"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/PDFSearch.app/PDFSearch"
+  PDFSearchUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [PDFSearchUITests]
+    dependencies:
+      - target: PDFSearch
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.pdfsearch.ipad.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        TARGETED_DEVICE_FAMILY: "2"
+        TEST_TARGET_NAME: PDFSearch
