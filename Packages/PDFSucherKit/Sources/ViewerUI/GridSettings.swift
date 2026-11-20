@@ -83,6 +83,9 @@ public enum PreviewPosition: String, CaseIterable, Sendable {
     /// „Alle Dateitypen zeigen“: every kind ticked again.
     public func showAllFileKinds() { fileKinds = Set(Self.allFileKinds) }
 
+    /// „Nur Word“ (…): only this kind ticked, in one click.
+    public func showOnlyFileKind(_ kind: DocumentKind) { fileKinds = [kind] }
+
     /// Stored raw values; empty or unknown values → every kind.
     static func validFileKinds(_ stored: [String]?) -> Set<DocumentKind> {
         let kinds = Set((stored ?? []).compactMap(DocumentKind.init(rawValue:)))

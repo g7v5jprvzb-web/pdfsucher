@@ -224,11 +224,13 @@ public enum ViewerText {
         "Der Filter „\(fileKindsMenu)“ zeigt nur: \(fileKindsTitle(kinds))."
     }
     static let showAllFileKinds = "Alle Dateitypen zeigen"
+    /// „Nur Word“ in the „Dateitypen“ menu.
+    static func onlyFileKind(_ kind: DocumentKind) -> String { "Nur \(fileKindLabel(kind))" }
     /// A summary with the count of documents the file type filter hides („… · 2 ausgeblendet“).
     public static func withHidden(_ summary: String, hidden: Int) -> String {
         hidden > 0 ? "\(summary) · \(number(hidden)) ausgeblendet" : summary
     }
-    static let fileKindsHelp = "Nur Dateien dieser Typen zeigen (Suche und Durchblättern); mindestens ein Typ bleibt an"
+    static let fileKindsHelp = "Nur Dateien dieser Typen zeigen (Suche und Durchblättern); mindestens ein Typ bleibt an. Im Suchfeld geht auch „typ:word“ (pdf, word, ppt, bild)"
     /// Hint next to the header of a document found by its file name only (spec 1.3.2 §2).
     static let nameHit = "Treffer im Dateinamen"
     static let nameHitHelp = "Der Suchbegriff steht im Dateinamen, nicht im Text. Die Reihe zeigt die Seiten wie beim Durchblättern."

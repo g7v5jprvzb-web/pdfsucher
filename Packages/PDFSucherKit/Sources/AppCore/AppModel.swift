@@ -1765,7 +1765,7 @@ import ViewerUI
 
     /// Recognized pages become hits: search again (or refresh the browse list quietly).
     private func scheduleRefreshAfterRecognition() {
-        if QueryParser.parse(queryText, partialWords: settings.partialWords).isEmpty {
+        if QueryParser.parse(searchText, partialWords: settings.partialWords).isEmpty {
             if isBrowsing { scheduleSearch(debounced: false, background: true) }
         } else {
             scheduleSearch(debounced: false)
@@ -2005,7 +2005,7 @@ import ViewerUI
             guard let self, !Task.isCancelled else { return }
             self.browseRefreshTask = nil
             if self.browseRunning { self.browseRefreshWanted = true; return }
-            if self.isBrowsing, QueryParser.parse(self.queryText, partialWords: self.settings.partialWords).isEmpty {
+            if self.isBrowsing, QueryParser.parse(self.searchText, partialWords: self.settings.partialWords).isEmpty {
                 self.scheduleSearch(debounced: false, background: true)
             }
         }
@@ -2142,7 +2142,7 @@ import ViewerUI
         searchTask = nil
         isSearching = false
         browseRunning = false
-        let parsed = QueryParser.parse(queryText, partialWords: settings.partialWords)
+        let parsed = QueryParser.parse(searchText, partialWords: settings.partialWords)
         let targets: [SearchTarget] = sourceList.items.compactMap { source in
             let path = source.url.path
             if source.isFolder { return indexes[path].map { .folder(path, $0) } }
@@ -2383,8 +2383,15 @@ import ViewerUI
 
     /// Every grid filter, ANDed.
     private func filtered(_ documents: [DocumentHit]) -> [DocumentHit] {
-        FileKindFilter(kinds: settings.fileKinds).apply(folderFiltered(documents))
+        FileKindFilter(kinds: shownKinds).apply(folderFiltered(documents))
     }
+
+    /// The kinds shown: those of a `typ:` shortcut in the search field (`KindQuery`) for this search,
+    /// else „Dateitypen“. The menu setting is left as it is.
+    private var shownKinds: Set<DocumentKind> { KindQuery.split(queryText).kinds ?? settings.fileKinds }
+
+    /// The search field text without its `typ:` shortcut: what is searched.
+    private var searchText: String { KindQuery.split(queryText).rest }
 
     /// Shows a new search or browse result (through the grid filters).
     private func show(_ newHits: [DocumentHit], for parsed: ParsedQuery, summary style: SummaryStyle, keepFocus: Bool = false) {
@@ -2409,9 +2416,11 @@ import ViewerUI
     /// documents. A focused page no longer shown loses the focus. The selection is never filtered.
     func publishFiltered(keepFocus: Bool = false) {
         let inFolders = folderFiltered(allHits)
-        let shown = FileKindFilter(kinds: settings.fileKinds).apply(inFolders)
+        let shown = FileKindFilter(kinds: shownKinds).apply(inFolders)
         hits = shown
-        hiddenByFilter = inFolders.count - shown.count
+        // Hidden by „Dateitypen“ only: a typed `typ:` asked for just those kinds (and its empty grid would
+        // offer the menu's „Alle Dateitypen zeigen“, which cannot undo the typed shortcut).
+        hiddenByFilter = KindQuery.split(queryText).kinds == nil ? inFolders.count - shown.count : 0
         switch summaryStyle {
         case .empty: summary = ""
         case .search:
@@ -2455,7 +2464,9 @@ import ViewerUI
 
     /// A text that is a real query (not empty, not only operators like „-“; review M3).
     private func isQuery(_ text: String) -> Bool {
-        !SearchHistory.clean(text).isEmpty && !QueryParser.parse(text, partialWords: settings.partialWords).isEmpty
+        let typed = KindQuery.split(text)
+        return !SearchHistory.clean(text).isEmpty
+            && (typed.kinds != nil || !QueryParser.parse(typed.rest, partialWords: settings.partialWords).isEmpty)
     }
 
     /// A term chosen from the history: searched at once (no typing delay) and moved to the top.

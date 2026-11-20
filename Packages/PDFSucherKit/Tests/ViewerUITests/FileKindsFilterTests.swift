@@ -160,4 +160,43 @@ struct FileKindsFilterTests {
         let view = HiddenByFilterView(count: 2, browsing: false, settings: settings)
         #expect(width(view) > 0)
     }
+
+    // MARK: „Nur …“ and the search field shortcut `typ:`
+
+    @Test func showOnlyTicksOneKind() {
+        let s = GridSettings(defaults: defaults())
+        s.showOnlyFileKind(.word)
+        #expect(s.fileKinds == [.word])
+        s.showOnlyFileKind(.image)
+        #expect(s.fileKinds == [.image])
+        #expect(ViewerText.onlyFileKind(.word) == "Nur Word")
+        #expect(ViewerText.onlyFileKind(.image) == "Nur Bilder")
+    }
+
+    /// `KindQuery.split` as „kinds|rest“ (kinds in menu order, „-“: no shortcut).
+    func kq(_ text: String) -> String {
+        let r = KindQuery.split(text)
+        let kinds = r.kinds.map { k in GridSettings.allFileKinds.filter(k.contains).map(\.rawValue).joined(separator: ",") }
+        return (kinds ?? "-") + "|" + r.rest
+    }
+
+    @Test func kindQueryNamesAndExtensions() {
+        #expect(kq("typ:word Vertrag") == "word|Vertrag")
+        #expect(kq("Vertrag TYPE:PDF") == "pdf|Vertrag")
+        #expect(kq("ext:docx Angebot 2024") == "word|Angebot 2024")
+        #expect(kq("typ:ppt") == "powerpoint|")
+        #expect(kq("typ:bild typ:pdf x") == "pdf,image|x")
+        #expect(kq("typ:word,powerpoint x") == "word,powerpoint|x")
+        #expect(kq("typ:bilder") == "image|")
+        #expect(kq("ext:jpg") == "image|")
+    }
+
+    @Test func kindQueryLeavesOtherTextAlone() {
+        #expect(kq("Vertrag Angebot") == "-|Vertrag Angebot")
+        #expect(kq("typ:xyz Vertrag") == "-|typ:xyz Vertrag", "unknown kind: search text")
+        #expect(kq("typ:word,xyz") == "-|typ:word,xyz")
+        #expect(kq("typ:") == "-|typ:")
+        #expect(kq("Prototyp:word") == "-|Prototyp:word")
+        #expect(kq("") == "-|")
+    }
 }
