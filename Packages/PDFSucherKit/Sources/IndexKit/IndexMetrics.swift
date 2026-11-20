@@ -13,12 +13,20 @@ import Synchronization
 /// 32 KB or after 1 s), so no caller waits for the disk.
 public final class IndexMetrics: Sendable {
     public static let shared = IndexMetrics(directory: defaultDirectory)
-    /// `defaults write local.pdfsucher indexMetricsEnabled -bool YES` (read at launch).
+    /// `defaults write local.pdfsucher indexMetricsEnabled -bool NO` (read at launch).
     public static let defaultsKey = "indexMetricsEnabled"
+    /// 1.4.3: on unless the user switched it off.
+    public static func isEnabledSetting(_ defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: defaultsKey) as? Bool ?? true
+    }
     /// 1.4.2: diagnosis log of the result rows (`ui-rows-<date>.jsonl`, `RowDiagnostics`), off by default.
     public static let rows = IndexMetrics(directory: defaultDirectory, prefix: "ui-rows")
     /// `defaults write local.pdfsucher rowDiagnosticsEnabled -bool YES` (read at launch).
     public static let rowsDefaultsKey = "rowDiagnosticsEnabled"
+    /// 1.4.3: the `sample` files of long hangs (`hang-<date>_<time>.txt`, `MainHangWatch`); only listed and deleted here.
+    public static let hangs = IndexMetrics(directory: defaultDirectory, prefix: "hang")
+    /// Every protocol of the app (export, deleting, cleanup at launch).
+    public static let all = [shared, rows, hangs]
     public static var defaultDirectory: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/PDFSucher", isDirectory: true)
     }
@@ -87,10 +95,10 @@ public final class IndexMetrics: Sendable {
         if !fresh { log("reindexed_file", ["phase": phase, "file": file, "ext": ext, "key": key, "ms": ms]) }
     }
 
-    /// The protocol files in `directory` (`<prefix>-*.jsonl`), oldest first.
+    /// The protocol files in `directory` (`<prefix>-*.jsonl`, or `.txt` for samples), oldest first.
     public func logFiles() -> [URL] {
         let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
-        return names.filter { $0.hasPrefix(prefix + "-") && $0.hasSuffix(".jsonl") }.sorted()
+        return names.filter { $0.hasPrefix(prefix + "-") && ($0.hasSuffix(".jsonl") || $0.hasSuffix(".txt")) }.sorted()
             .map { directory.appendingPathComponent($0, isDirectory: false) }
     }
 
@@ -106,6 +114,35 @@ public final class IndexMetrics: Sendable {
             }
             for url in logFiles() { try? FileManager.default.removeItem(at: url) }
         }
+    }
+
+    /// 1.4.3, at launch: deletes the protocol files whose date (in the name) is more than `days` days before `now`
+    /// (local date), off the caller's thread.
+    public func deleteLogs(olderThan days: Int, now: Date = Date()) {
+        guard let limit = Calendar.current.date(byAdding: .day, value: -days, to: now) else { return }
+        let oldest = "\(prefix)-\(limit.formatted(Self.timestamp).prefix(10)).jsonl"
+        queue.async { [self] in
+            for url in logFiles() where url.lastPathComponent < oldest { try? FileManager.default.removeItem(at: url) }
+        }
+    }
+
+    /// 1.4.3, Settings „Mess-Protokolle exportieren …“: writes what is buffered, then packs every protocol file of
+    /// `logs` into the ZIP `zip` (a folder named like the ZIP inside; replaced if it exists).
+    public static func export(_ logs: [IndexMetrics] = all, to zip: URL) throws {
+        logs.forEach { $0.flush() }
+        let fm = FileManager.default
+        let temp = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let folder = temp.appendingPathComponent(zip.deletingPathExtension().lastPathComponent, isDirectory: true)
+        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: temp) }
+        for url in logs.flatMap({ $0.logFiles() }) { try fm.copyItem(at: url, to: folder.appendingPathComponent(url.lastPathComponent)) }
+        try? fm.removeItem(at: zip)
+        let ditto = Process()
+        ditto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        ditto.arguments = ["-c", "-k", "--keepParent", folder.path, zip.path]
+        try ditto.run()
+        ditto.waitUntilExit()
+        guard ditto.terminationStatus == 0 else { throw CocoaError(.fileWriteUnknown) }
     }
 
     /// Writes the buffer now and waits for it (tests, switching off).

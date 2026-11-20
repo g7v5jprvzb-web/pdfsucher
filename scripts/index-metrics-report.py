@@ -179,6 +179,77 @@ def analyse(events):
     }
 
 
+def median(values):
+    v = sorted(values)
+    return None if not v else (v[len(v) // 2] if len(v) % 2 else (v[len(v) // 2 - 1] + v[len(v) // 2]) / 2)
+
+
+def analyse_ui(events):
+    """1.4.3: searches, main-thread hangs, launch phases, storage of the sources."""
+    searches = [e for e in events if e.get("event") == "search" and not e.get("cancelled")]
+    during = [e for e in searches if e.get("indexing", "none") != "none"]
+    hangs = [e for e in events if e.get("event") == "main_hang"]
+    hang_phase = Counter(e.get("phase", "?") for e in hangs)
+    return {
+        "search": {
+            "count": len(searches), "cancelled": sum(1 for e in events if e.get("event") == "search" and e.get("cancelled")),
+            "total_ms_median": median([e.get("total_ms", 0) for e in searches]),
+            "total_ms_max": max((e.get("total_ms", 0) for e in searches), default=None),
+            "first_rows_ms_median": median([e.get("first_rows_ms", 0) for e in searches]),
+            "first_rows_ms_max": max((e.get("first_rows_ms", 0) for e in searches), default=None),
+            "during_indexing_pct": round(100 * len(during) / len(searches), 1) if searches else None,
+            "during_indexing_total_ms_median": median([e.get("total_ms", 0) for e in during]),
+            "slowest_sources": sorted(({k: e.get(k) for k in ("ts", "source", "candidates", "db_ms", "check_ms", "names_ms",
+                                                               "hits", "total_ms")}
+                                       for e in events if e.get("event") == "search_source"),
+                                      key=lambda e: e.get("total_ms") or 0, reverse=True)[:5],
+        },
+        "main_hang": {
+            "count": len(hangs), "sum_ms": round(sum(e.get("ms", 0) for e in hangs), 1),
+            "max_ms": max((e.get("ms", 0) for e in hangs), default=None), "by_phase": dict(hang_phase.most_common()),
+            "longest": sorted(({k: e.get(k) for k in ("ts", "ms", "since_launch_ms", "phase", "last_launch_phase", "sample")}
+                               for e in hangs), key=lambda e: e["ms"] or 0, reverse=True)[:5],
+        },
+        "launch_phases": [{k: e.get(k) for k in ("ts", "name", "ms", "source", "open_ms")}
+                          for e in events if e.get("event") == "launch_phase"],
+        "source_storage": {e.get("source"): {k: e.get(k) for k in ("volume_local", "volume_internal", "volume_type", "ubiquitous")}
+                           for e in events if e.get("event") == "source_storage"},
+        "not_local": {e.get("source"): e.get("not_local") for e in events if e.get("event") == "scan" and "not_local" in e},
+    }
+
+
+def print_ui(u):
+    s = u["search"]
+    print(f'\nSuche: {s["count"]} fertig, {s["cancelled"]} abgebrochen')
+    if s["count"]:
+        print(f'  gesamt ms Median {fmt(s["total_ms_median"], 1)}, Max {fmt(s["total_ms_max"], 1)}; '
+              f'erste Zeilen ms Median {fmt(s["first_rows_ms_median"], 1)}, Max {fmt(s["first_rows_ms_max"], 1)}')
+        print(f'  während Indizierung: {fmt(s["during_indexing_pct"], 1)} % (Median gesamt {fmt(s["during_indexing_total_ms_median"], 1)} ms)')
+        for e in s["slowest_sources"]:
+            print(f'  Quelle {e["source"]}: {fmt(e["total_ms"], 1)} ms (DB {fmt(e["db_ms"], 1)}, Prüfen {fmt(e["check_ms"], 1)}, '
+                  f'Namen {fmt(e["names_ms"], 1)}), {e["candidates"]} Kandidatenseiten, {e["hits"]} Treffer')
+    h = u["main_hang"]
+    print(f'\nHänger Hauptthread: {h["count"]}, zusammen {fmt(h["sum_ms"] / 1000)} s, längster {fmt(h["max_ms"], 1)} ms')
+    for k, v in h["by_phase"].items():
+        print(f"  Phase {k:<12} {v}")
+    for e in h["longest"]:
+        print(f'  {e["ts"]}  {fmt(e["ms"], 1):>9} ms  ab Start {fmt(e["since_launch_ms"], 1)} ms  Phase {e["phase"]}  '
+              f'nach {e["last_launch_phase"] or "—"}' + (f'  Sample {e["sample"]}' if e.get("sample") else ""))
+    print("\nStartphasen (ms seit Prozessstart):")
+    if not u["launch_phases"]:
+        print("  keine")
+    for e in u["launch_phases"]:
+        extra = f'  Quelle {e["source"]} geöffnet in {fmt(e["open_ms"], 1)} ms' if e.get("source") else ""
+        print(f'  {e["ts"]}  {e["name"]:<18} {fmt(e["ms"], 1):>10}{extra}')
+    print("\nSpeicherort der Quellen:")
+    if not u["source_storage"]:
+        print("  keine")
+    for src, v in u["source_storage"].items():
+        nl = u["not_local"].get(src)
+        print(f'  {src}: {v["volume_type"]}, lokal {v["volume_local"]}, intern {v["volume_internal"]}, iCloud {v["ubiquitous"]}'
+              + (f', nicht geladen {nl}' if nl is not None else ""))
+
+
 def fmt(v, digits=2):
     if v is None:
         return "—"
@@ -243,13 +314,16 @@ def main():
     files = args.files or sorted(glob.glob(os.path.join(DEFAULT_DIR, "index-metrics-*.jsonl")))
     if not files:
         sys.exit(f"Keine Protokolldateien gefunden in {DEFAULT_DIR}")
-    report = analyse(load(files))
+    events = load(files)
+    report = analyse(events)
     report["files"] = files
+    report.update(analyse_ui(events))
     if args.json:
         json.dump(report, sys.stdout, ensure_ascii=False, indent=2)
         print()
     else:
         print_report(report)
+        print_ui(report)
 
 
 if __name__ == "__main__":

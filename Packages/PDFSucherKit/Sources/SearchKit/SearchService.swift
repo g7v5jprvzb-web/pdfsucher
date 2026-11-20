@@ -21,10 +21,12 @@ public struct SearchService: Sendable {
 
     private let index: any IndexReading
     private let root: URL
+    private let metrics: IndexMetrics
 
-    public init(index: any IndexReading, root: URL) {
+    public init(index: any IndexReading, root: URL, metrics: IndexMetrics = .shared) {
         self.index = index
         self.root = root
+        self.metrics = metrics
     }
 
     /// Candidate pages read before the first early result (spec 1.1 §5): a few thousand pages take some
@@ -39,7 +41,23 @@ public struct SearchService: Sendable {
     public func search(_ q: ParsedQuery, sort: SortMode, searchNames: Bool = false, batchSize: Int = SearchService.defaultBatchSize,
                        onPartial: (([DocumentHit]) -> Void)? = nil) throws -> [DocumentHit] {
         guard let plan = FTSQueryBuilder.plan(for: q) else { return [] }
-        let stored = try index.documents()
+        // 1.4.3: `search_source` in the measurement log (candidates = candidate pages read; db = reading them).
+        let started = ContinuousClock.now
+        var candidates = 0, checkTime = Duration.zero, consumeTime = Duration.zero, namesTime = Duration.zero
+        var readTime = Duration.zero, firstPartialMs: Double?, hitCount: Int?
+        defer {
+            if metrics.isEnabled {
+                var fields: [String: Any] = [
+                    "source": IndexMetrics.hash(root), "candidates": candidates, "db_ms": IndexMetrics.ms(readTime - consumeTime),
+                    "check_ms": IndexMetrics.ms(checkTime), "names_ms": IndexMetrics.ms(namesTime),
+                    "total_ms": IndexMetrics.ms(since: started), "cancelled": hitCount == nil]
+                if let hitCount { fields["hits"] = hitCount }
+                if let firstPartialMs { fields["first_partial_ms"] = firstPartialMs }
+                metrics.log("search_source", fields)
+            }
+        }
+        var stored: [StoredDocument] = []
+        try Self.timed(&readTime) { stored = try index.documents() }
         // Content only of readable documents; names of every document (Chris, 2026-11-14: unreadable, locked and
         // not yet read ones too, shown like when browsing).
         var documents: [Int64: StoredDocument] = [:]
@@ -48,7 +66,8 @@ public struct SearchService: Sendable {
         }
         let matcher = PageMatcher(q)
         // Names first: a few milliseconds for 10,000 files, so they are in the first early rows too.
-        let names = searchNames ? Self.nameMatches(stored, matcher: matcher) : []
+        var names: Set<Int64> = []
+        if searchNames { Self.timed(&namesTime) { names = Self.nameMatches(stored, matcher: matcher) } }
         let named = names.isEmpty ? [:] : Dictionary(stored.filter { names.contains($0.id) }.map { ($0.id, $0) }) { a, _ in a }
         let hits = { (checked: [(RawPageMatch, Int)]) in self.withNames(self.hits(from: checked, documents: documents), names, named) }
         var verified: [(RawPageMatch, Int)] = []
@@ -60,20 +79,24 @@ public struct SearchService: Sendable {
         // depend on the rest of its document, so no candidate text outlives its batch (audit 2026-11-15:
         // `pending` used to collect every later batch, i.e. nearly the whole index for `*ab*` or `ver*`).
         let consume = { (batch: [RawPageMatch]) -> Bool in
+            let consumeStart = ContinuousClock.now
+            defer { consumeTime += ContinuousClock.now - consumeStart }
+            candidates += batch.count
             pending += batch.filter { documents[$0.docId] != nil }
             if !reported, let onPartial {
                 if batch.count == batchSize, let lastDoc = batch.last?.docId {
                     let complete = pending.filter { $0.docId != lastDoc }
                     pending.removeAll { $0.docId != lastDoc }
-                    verified += Self.check(complete, with: matcher)
+                    Self.timed(&checkTime) { verified += Self.check(complete, with: matcher) }
                     let early = hits(verified)
                     if !early.isEmpty {
                         reported = true
+                        firstPartialMs = IndexMetrics.ms(since: started)
                         onPartial(sortHits(early, by: sort))
                     }
                 }
             } else {
-                verified += Self.check(pending, with: matcher)
+                Self.timed(&checkTime) { verified += Self.check(pending, with: matcher) }
                 pending.removeAll(keepingCapacity: true)
             }
             return !Task.isCancelled
@@ -81,21 +104,30 @@ public struct SearchService: Sendable {
         switch plan {
         case .fts(let query, let table):
             do {
-                try index.matchBatches(query, in: table, batchSize: batchSize, consume)
+                try Self.timed(&readTime) { try index.matchBatches(query, in: table, batchSize: batchSize, consume) }
             } catch is SQLiteError {
                 // FTSQueryBuilder only emits quoted terms, so this should never happen. If the
                 // index still rejects the query, a full scan gives the same (verified) result.
                 Self.log.error("FTS query rejected, scanning all pages: \(query, privacy: .private)")
                 verified = []
                 pending = []
-                try index.allPagesBatches(batchSize: batchSize, consume)
+                try Self.timed(&readTime) { try index.allPagesBatches(batchSize: batchSize, consume) }
             }
         case .scanAll:
-            try index.allPagesBatches(batchSize: batchSize, consume)
+            try Self.timed(&readTime) { try index.allPagesBatches(batchSize: batchSize, consume) }
         }
         if Task.isCancelled { throw CancellationError() }
-        verified += Self.check(pending, with: matcher)
-        return sortHits(hits(verified), by: sort)
+        Self.timed(&checkTime) { verified += Self.check(pending, with: matcher) }
+        let result = sortHits(hits(verified), by: sort)
+        hitCount = result.count
+        return result
+    }
+
+    /// Runs `work`, adding its time to `duration`.
+    private static func timed(_ duration: inout Duration, _ work: () throws -> Void) rethrows {
+        let start = ContinuousClock.now
+        defer { duration += ContinuousClock.now - start }
+        try work()
     }
 
     /// The ids of the documents whose file name (without extension) matches, checked on all cores.

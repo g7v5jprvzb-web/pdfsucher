@@ -307,10 +307,18 @@ public actor Indexer {
         }
         let scan = try self.scan(scopes: scopes)
         if metrics.isEnabled {
+            let scanMs = IndexMetrics.ms(since: phaseStart)
             var kinds: [String: Int] = [:]
             for file in scan.files { kinds[file.kind.rawValue, default: 0] += 1 }
-            metrics.log("scan", ["source": source, "ms": IndexMetrics.ms(since: phaseStart), "files": scan.files.count,
-                                 "kinds": kinds, "unreachable": scan.unreachablePaths.count, "scopes": scopes?.count ?? 0])
+            var fields: [String: Any] = ["source": source, "ms": scanMs, "files": scan.files.count,
+                                         "kinds": kinds, "unreachable": scan.unreachablePaths.count, "scopes": scopes?.count ?? 0]
+            // 1.4.3: in iCloud Drive, the files not downloaded (only then asked per file).
+            if (try? root.resourceValues(forKeys: [.isUbiquitousItemKey]))?.isUbiquitousItem == true {
+                fields["not_local"] = scan.files.count {
+                    (try? $0.url.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey]))?.ubiquitousItemDownloadingStatus != .current
+                }
+            }
+            metrics.log("scan", fields)
         }
         let diffStart = ContinuousClock.now
         let inScope = { (path: String) in scopes.map { $0.contains { path.hasPrefix($0 + "/") } } ?? true }

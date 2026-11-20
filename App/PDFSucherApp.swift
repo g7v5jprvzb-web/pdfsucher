@@ -53,14 +53,17 @@ struct PDFSucherApp: App {
             model.folderWatcher = FSEventsFolderWatcher()
             _model = State(initialValue: model)
         } else {
-            // Measurement log of the indexing (1.3.9), off by default; written at most 1 s late, flushed at quit.
-            IndexMetrics.shared.setEnabled(UserDefaults.standard.bool(forKey: IndexMetrics.defaultsKey), atLaunch: true)
+            // Measurement log of the indexing (1.3.9), on by default since 1.4.3; written at most 1 s late, flushed at quit.
+            IndexMetrics.shared.setEnabled(IndexMetrics.isEnabledSetting(), atLaunch: true)
             // 1.4.2: diagnosis log of the result rows, off by default.
             IndexMetrics.rows.setEnabled(UserDefaults.standard.bool(forKey: IndexMetrics.rowsDefaultsKey), atLaunch: true)
             NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { _ in
                 IndexMetrics.shared.flush()
                 IndexMetrics.rows.flush()
             }
+            // 1.4.3: protocols kept 7 days; blocked main thread logged while the log is on.
+            IndexMetrics.all.forEach { $0.deleteLogs(olderThan: 7) }
+            MainHangWatch.shared.start()
             let model = AppModel(settings: GridSettings(), environment: SystemEnvironment())
             tileDisk = .standard
             model.tileDisk = tileDisk           // tiles of changed or gone PDFs are cleaned (1.2.4 §3)
@@ -75,6 +78,7 @@ struct PDFSucherApp: App {
         Window("PDFSucher", id: "main") {
             ContentShell(model: model, highlighter: Highlighter.make, tileDisk: tileDisk)
                 .task {
+                    MainHangWatch.shared.launchPhase("first_window")
                     model.startMaintenance()        // slide cache and Quick Look leftovers (1.3), before any layout
                     if !uiTestFolders.isEmpty {
                         await model.add(uiTestFolders)

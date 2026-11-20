@@ -258,6 +258,11 @@ import ViewerUI
     @ObservationIgnored private var metricsRunStart = ContinuousClock.now
     /// The measurement log (tests use their own).
     @ObservationIgnored var metrics: IndexMetrics = .shared
+    /// 1.4.3: `launch_phase` and the phase named by `main_hang` (tests use their own).
+    @ObservationIgnored var hangWatch: MainHangWatch = .shared
+    /// 1.4.3: when the running search showed its first early rows; `first_search_done` written.
+    @ObservationIgnored private var searchFirstRows: ContinuousClock.Instant?
+    @ObservationIgnored private var firstSearchLogged = false
     /// Paths with a check queued or running (`checkOfficeFile`); further reports meanwhile are dropped.
     @ObservationIgnored private var checksQueued: Set<String> = []
     /// The last of those checks; each waits for the one before.
@@ -285,7 +290,7 @@ import ViewerUI
     @ObservationIgnored private var queueRunning = false
     @ObservationIgnored private var pending: [String] = []
     /// Folder being indexed right now and the detached work doing it (cancelled when it is removed).
-    @ObservationIgnored private var currentFolder: String?
+    @ObservationIgnored private var currentFolder: String? { didSet { hangWatch.setPhase(metricsPhase) } }
     @ObservationIgnored private var currentWork: Task<Result<IndexReport, Error>, Never>?
     /// Outcome of each folder's last finished run.
     @ObservationIgnored private var reports: [String: IndexReport] = [:]
@@ -318,7 +323,7 @@ import ViewerUI
     @ObservationIgnored private var layoutBumpTask: Task<Void, Never>?
     @ObservationIgnored private var lastLayoutBump = ContinuousClock.now - .seconds(1)
     private enum Phase { case text, layout, ocr, wordParts }
-    @ObservationIgnored private var currentPhase = Phase.text
+    @ObservationIgnored private var currentPhase = Phase.text { didSet { hangWatch.setPhase(metricsPhase) } }
     /// „Texterkennung anhalten“ until a new source, „neu ausführen“ or the next start.
     public private(set) var isRecognitionStopped = false
     private var recognitionStopped: Bool {
@@ -639,6 +644,7 @@ import ViewerUI
             return
         }
         let urls = paths.map { URL(fileURLWithPath: $0) }
+        hangWatch.launchPhase("restore_begin", ["sources": urls.count])
         let token = generation
         let missing = await Task.detached(priority: .userInitiated) {
             urls.filter { !FileManager.default.fileExists(atPath: $0.path) }
@@ -655,11 +661,16 @@ import ViewerUI
         // 1.3.1: tiles of PDFs outside the sources go without asking those PDFs (no macOS access prompt for folders
         // that are no source); an unplugged disk that is remembered keeps its tiles.
         tileDisk?.dropTiles(notUnder: sourceList.items.map(\.url) + rememberedMissing.map { URL(fileURLWithPath: $0) })
+        hangWatch.launchPhase("restore_end", ["missing": missing.count, "failed": failed.count])
     }
 
     private func openFolderIndex(_ root: URL) async -> (any FolderIndexing)? {
         let opener = openIndex
+        let start = ContinuousClock.now
         let opened = await Task.detached(priority: .userInitiated) { Result { try opener(root) } }.value
+        if addTrigger == "launch_restore" {
+            hangWatch.launchPhase("index_open", ["source": IndexMetrics.hash(root), "open_ms": IndexMetrics.ms(since: start)])
+        }
         do {
             return try opened.get()
         } catch {
@@ -687,6 +698,7 @@ import ViewerUI
             metrics.log("source_added", ["source": IndexMetrics.hash(path: path), "depth": source.url.pathComponents.count - 1,
                                                      "folder": source.isFolder, "ext": source.isFolder ? "" : source.url.pathExtension.lowercased(),
                                                      "trigger": trigger, "replaces": result.replaced.count])
+            logSourceStorage(source.url)
         }
         if let index {
             index.configure(currentOCRSettings, includeOffice: officePreferences.includeOffice)
@@ -1795,6 +1807,28 @@ import ViewerUI
         }
     }
 
+    /// 1.4.3: where a source lies (local/internal disk, file system, iCloud Drive), asked off the main actor.
+    private func logSourceStorage(_ url: URL) {
+        let metrics = metrics
+        Task.detached(priority: .utility) {
+            let values = try? url.resourceValues(forKeys: [.volumeIsLocalKey, .volumeIsInternalKey, .volumeTypeNameKey, .isUbiquitousItemKey])
+            metrics.log("source_storage", ["source": IndexMetrics.hash(url), "volume_local": values?.volumeIsLocal ?? false,
+                                           "volume_internal": values?.volumeIsInternal ?? false,
+                                           "volume_type": values?.volumeTypeName ?? "?", "ubiquitous": values?.isUbiquitousItem ?? false])
+        }
+    }
+
+    /// The indexing phase running now, for the measurement log.
+    private var metricsPhase: String {
+        guard currentFolder != nil else { return "none" }
+        return switch currentPhase {
+        case .text: "text"
+        case .ocr: "ocr"
+        case .layout: "layout"
+        case .wordParts: "wordparts"
+        }
+    }
+
     private func finishIndexing(_ result: Result<IndexReport, Error>, path: String, sawChange: Bool = false) {
         if case .failure(let error) = result, error is CancellationError {
             if sawChange { changedOnDisk.insert(path) }
@@ -2111,11 +2145,13 @@ import ViewerUI
         }
         searchToken += 1
         let token = searchToken
+        searchFirstRows = nil
         searchTask = Task { [weak self] in
             if delay > .zero {
                 do { try await Task.sleep(for: delay) } catch { return }
             }
             guard !Task.isCancelled else { return }
+            let started = ContinuousClock.now, phase = self?.metricsPhase ?? "none"
             self?.isSearching = true
             // Spec 1.1 §5: a search still running after `earlyDelay` shows the documents its sources have
             // already checked; the final list replaces them once.
@@ -2135,9 +2171,13 @@ import ViewerUI
             } onCancel: { early.cancel() }
             collector.finish()
             early.cancel()
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled else {
+                self?.logSearch(parsed, sources: targets.count, started: started, debounce: delay, phase: phase, outcome: nil)
+                return
+            }
             self?.isSearching = false
             self?.apply(outcome, for: parsed)
+            self?.logSearch(parsed, sources: targets.count, started: started, debounce: delay, phase: phase, outcome: outcome)
         }
     }
 
@@ -2153,6 +2193,25 @@ import ViewerUI
         guard !filtered(early).isEmpty else { return }     // hidden early rows: keep the shown list (no empty flash)
         isBrowsing = false
         show(sortHits(early, by: settings.sort), for: parsed, summary: .search, keepFocus: true)
+        searchFirstRows = .now
+    }
+
+    /// 1.4.3: `search` in the measurement log (nil outcome = cancelled by a newer search); the first finished one
+    /// also writes `launch_phase` `first_search_done`.
+    private func logSearch(_ parsed: ParsedQuery, sources: Int, started: ContinuousClock.Instant, debounce: Duration,
+                           phase: String, outcome: SearchOutcome?) {
+        guard metrics.isEnabled else { return }
+        var fields: [String: Any] = ["terms": parsed.terms.count, "sources": sources, "total_ms": IndexMetrics.ms(since: started),
+                                     "cancelled": outcome == nil, "indexing": phase, "debounce_ms": IndexMetrics.ms(debounce)]
+        if let outcome {
+            fields["hits"] = outcome.sorted.count
+            fields["first_rows_ms"] = IndexMetrics.ms((searchFirstRows ?? .now) - started)
+        }
+        metrics.log("search", fields)
+        if outcome != nil, !firstSearchLogged {
+            firstSearchLogged = true
+            hangWatch.launchPhase("first_search_done")
+        }
     }
 
     /// Runs the search over all targets in parallel, off the main actor; cancelling the caller cancels

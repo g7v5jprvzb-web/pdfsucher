@@ -1,4 +1,5 @@
 // StorageTab.swift — settings tab „Speicher“: indexes, caches and protocols on disk, each with its size
+import AppKit
 import IndexKit
 import SwiftUI
 
@@ -40,8 +41,8 @@ struct StorageTab: View {
     @State private var sizes = Sizes()
     @State private var confirm: Item?
     @State private var running: Set<Item> = []
-    /// 1.3.9: measurement log of the indexing (`IndexMetrics`), off by default.
-    @AppStorage(IndexMetrics.defaultsKey) private var metricsEnabled = false
+    /// 1.3.9: measurement log of the indexing (`IndexMetrics`), on by default since 1.4.3.
+    @AppStorage(IndexMetrics.defaultsKey) private var metricsEnabled = true
     /// 1.4.2: diagnosis log of the result rows (`RowDiagnostics`), off by default.
     @AppStorage(IndexMetrics.rowsDefaultsKey) private var rowDiagnosticsEnabled = false
 
@@ -121,10 +122,12 @@ struct StorageTab: View {
                 Toggle("Diagnose-Protokoll für Ergebniszeilen schreiben", isOn: $rowDiagnosticsEnabled)
                     .onChange(of: rowDiagnosticsEnabled) { _, on in IndexMetrics.rows.setEnabled(on) }
                     .accessibilityIdentifier("rowDiagnosticsToggle")
+                Button("Mess-Protokolle exportieren …") { exportLogs() }
+                    .disabled((sizes.logs?.count ?? 0) == 0)
             } header: {
                 Text("Messung")
             } footer: {
-                Text("Dauer je Datei und Phase bzw. Aufbau der Ergebniszeilen, ohne Dateiinhalte und ohne Dateinamen: ~/Library/Logs/PDFSucher")
+                Text("Dauer je Datei und Phase bzw. Aufbau der Ergebniszeilen, ohne Dateiinhalte und ohne Dateinamen: ~/Library/Logs/PDFSucher. Protokolle älter als 7 Tage werden beim Start gelöscht.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -212,13 +215,26 @@ struct StorageTab: View {
                 sizes.tiles = nil
                 await tileCache?.removeAll()
             case .logs: await Task.detached(priority: .userInitiated) {
-                IndexMetrics.shared.deleteLogs()
-                IndexMetrics.rows.deleteLogs()
+                IndexMetrics.all.forEach { $0.deleteLogs() }
             }.value
             }
             running.remove(item)
             await measureSlow()
             await measureFast()
+        }
+    }
+
+    /// 1.4.3: every protocol as one ZIP, by default on the desktop.
+    private func exportLogs() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "PDFSucher-Protokolle-\(Date().formatted(Date.ISO8601FormatStyle(timeZone: .current).year().month().day())).zip"
+        panel.directoryURL = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
+        panel.allowedContentTypes = [.zip]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task.detached(priority: .userInitiated) {
+            do { try IndexMetrics.export(to: url) } catch {
+                await MainActor.run { _ = NSAlert(error: error).runModal() }
+            }
         }
     }
 
@@ -234,7 +250,7 @@ struct StorageTab: View {
             sizes.ocr = (pages, images)
         }
         sizes.logs = await Task.detached(priority: .utility) {
-            let files = IndexMetrics.shared.logFiles() + IndexMetrics.rows.logFiles()
+            let files = IndexMetrics.all.flatMap { $0.logFiles() }
             return (files.count, Self.bytes(of: files))
         }.value
     }

@@ -1613,3 +1613,23 @@ Grundlage: interne Messnotiz, Ergebnis in docs/performance.md „office-speed“
   `row_hidden`, `row_stuck` (Wächter alle 0,5 s, nur bei eingeschaltetem Protokoll und sichtbaren Zeilen; sichtbar und > 2 s
   Platzhalter). Aus: eine atomare Abfrage je Aufruf. Auswertung `scripts/ui-rows-report.py`. Tests `RowDiagnosticsTests`
   (mit dem 1.4.1-Verhalten meldet der Ablaufstest `row_stuck`).
+
+## 2026-11-20 — 1.4.3: erweitertes Mess-Protokoll (Branch `mess-protokoll-erweitert` ab main 1.4.2)
+
+- **Anlass:** auf einem anderen Mac langsame Indizierung, langsame Suche und ein Hänger von ca. 30 s beim Start; dort soll
+  nichts im Terminal nötig sein.
+- **Standard an:** `IndexMetrics.isEnabledSetting` (`indexMetricsEnabled` fehlt = an; ein explizites Aus bleibt). Das
+  Zeilen-Protokoll bleibt aus.
+- **Neue Ereignisse:** `search_source` (SearchService je Quelle: Kandidatenseiten, db/check/names/total ms,
+  `first_partial_ms`), `search` (AppModel je Suchlauf: Begriffe, Quellen, `first_rows_ms`, `total_ms`, Treffer, abgebrochen,
+  laufende Phase, Debounce), `launch_phase` (ms seit Prozessstart laut Kernel: `restore_begin`, `index_open` je Quelle,
+  `restore_end`, `first_window`, `first_search_done`), `source_storage` (Volume lokal/intern/Typ, iCloud), `scan.not_local`
+  (nur bei iCloud-Wurzel: Dateien nicht geladen). Nie Suchtext, Namen oder Pfade.
+- **Hänger-Wächter** (`MainHangWatch`, IndexKit): Timer alle 100 ms pingt die Main-Queue (einer zugleich), Antwort > 250 ms →
+  `main_hang` (ms, seit Start, Phase, letzte Startphase). Dauert er > 1 s, einmal `/usr/bin/sample <pid> 3` nach
+  `hang-<Datum>_<Zeit>.txt` (höchstens 3 je Sitzung, nie zwei zugleich), Feld `sample`. Nur bei eingeschaltetem Protokoll.
+- **Aufbewahrung/Export:** beim Start werden `index-metrics-*`, `ui-rows-*` und `hang-*` älter als 7 Tage (Datum im Namen)
+  gelöscht. Einstellungen → Speicher → Messung „Mess-Protokolle exportieren …“ packt alle per `ditto -c -k` in eine ZIP.
+- **Auswertung:** `scripts/index-metrics-report.py` hat Abschnitte Suche, Hänger, Startphasen, Speicherort.
+- Tests: `MeasurementLog143Tests` (Default, 7 Tage, Export, Hänger mit echtem `sample`), `SearchMetricsTests`,
+  `IndexMetricsAppTests.searchesAndStorageAreLogged`.

@@ -43,4 +43,44 @@ struct IndexMetricsAppTests {
         #expect(named("source_added").first?["trigger"] as? String == "added")
         #expect(named("source_removed").first?["reason"] as? String == "user")
     }
+
+    /// 1.4.3: one `search` per search run (counts, no query text) and `source_storage` per added source.
+    @Test func searchesAndStorageAreLogged() async throws {
+        let base = try PDFFixtures.tempDirectory().resolvingSymlinksInPath()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let akten = base.appendingPathComponent("Akten", isDirectory: true)
+        try FileManager.default.createDirectory(at: akten, withIntermediateDirectories: true)
+        let logs = base.appendingPathComponent("Logs", isDirectory: true)
+        let metrics = IndexMetrics(directory: logs)
+        metrics.setEnabled(true)
+        let m = AppModel(settings: makeSettings(), defaults: UserDefaults(suiteName: "Metrics-\(UUID().uuidString)")!,
+                         environment: FakeEnvironment(), debounce: .zero, openIndex: { _ in FakeIndex() })
+        m.metrics = metrics
+        m.hangWatch = MainHangWatch(metrics: metrics)
+        await m.add([akten])
+        await m.waitUntilIdle()
+        m.queryText = "geheimwort zwei"
+        var events: [[String: Any]] = []
+        for _ in 0..<200 {
+            try await Task.sleep(for: .milliseconds(10))
+            metrics.flush()
+            let files = (try? FileManager.default.contentsOfDirectory(at: logs, includingPropertiesForKeys: nil)) ?? []
+            let raw = try files.map { try String(contentsOf: $0, encoding: .utf8) }.joined()
+            #expect(!raw.contains("geheimwort"))
+            events = raw.split(separator: "\n").compactMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }
+            if events.contains(where: { $0["event"] as? String == "search" }), events.contains(where: { $0["event"] as? String == "source_storage" }) { break }
+        }
+        let search = try #require(events.first { $0["event"] as? String == "search" && $0["cancelled"] as? Bool == false })
+        #expect(search["terms"] as? Int == 2)
+        #expect(search["sources"] as? Int == 1)
+        #expect(search["hits"] is Int)
+        #expect(search["indexing"] is String)
+        for key in ["total_ms", "first_rows_ms", "debounce_ms"] { #expect(search[key] as? NSNumber != nil, "\(key)") }
+        #expect(events.contains { $0["event"] as? String == "launch_phase" && $0["name"] as? String == "first_search_done" })
+        let storage = try #require(events.first { $0["event"] as? String == "source_storage" })
+        #expect(storage["source"] as? String == IndexMetrics.hash(akten))
+        #expect(storage["volume_local"] as? Bool == true)
+        #expect(storage["ubiquitous"] as? Bool == false)
+        #expect(storage["volume_type"] as? String == "apfs")
+    }
 }
