@@ -547,22 +547,27 @@ public actor Indexer {
 
     // MARK: Phase 2 — text recognition (spec 1.2 §3)
 
-    /// At most this many recognitions at once (spec 1.2 §3), each on a utility thread: 1.5.0 one per performance core,
-    /// 2 to 8. Measured on an M3 Max (12 performance cores), same text in every case, no main-thread hang at any level:
-    /// 300 real images 2 → 12.5, 3 → 12.9, 4 → 13.5, 8 → 13.6, 12 → 13.7 images/s; 96 scan pages 2 → 5.3, 3 → 6.2,
-    /// 4 → 6.6, 8 → 6.8, 12 → 6.8 pages/s. Vision levels off at about 8; an M2 Pro (6 or 8 performance cores) gets 6 or 8
-    /// instead of 2 or 3 before (1.4.0 P7: a quarter of all cores, 2 to 4).
-    public static let ocrParallelism = parallelism(performanceCores: performanceCores)
+    /// At most this many recognitions at once (spec 1.2 §3), each on a utility thread, by chip (1.5.1):
+    /// - Max/Ultra: 4. M3 Max, 300 real images (images/s, median ms per image): 3 → 10.3/127, 4 → 10.7/259, 6 → 12.7/392,
+    ///   8 → 11.5/634; 96 scan pages: 3 → 5.4/528, 4 → 5.8/620, 6 → 2.5/1132, 8 → 4.9/1420 (earlier runs: 4 ≈ 8). More
+    ///   than 4 makes each page slower and gains nothing reliable.
+    /// - Everything else (Pro, base chips, unknown, Intel): a quarter of the cores, 2 to 4 (1.4.0 P7). The M2 Pro of the
+    ///   other Mac: 3 → about 3.4 images/s; 8 (1.5.0) → 1.9, with a median of 2.6 s per image instead of 0.8 s.
+    public static let ocrParallelism = parallelism(chip: chipName, cores: ProcessInfo.processInfo.activeProcessorCount)
 
-    static func parallelism(performanceCores: Int) -> Int { max(2, min(8, performanceCores)) }
+    static func parallelism(chip: String, cores: Int) -> Int {
+        let tier = chip.split(separator: " ").last.map(String.init) ?? ""
+        if chip.hasPrefix("Apple M"), ["Max", "Ultra"].contains(tier) { return 4 }
+        return max(2, min(4, cores / 4))
+    }
 
-    /// `hw.perflevel0.physicalcpu` (the performance cores); half of the active cores if the Mac does not report it.
-    static var performanceCores: Int {
-        var count: Int32 = 0, size = MemoryLayout<Int32>.size
-        guard sysctlbyname("hw.perflevel0.physicalcpu", &count, &size, nil, 0) == 0, count > 0 else {
-            return ProcessInfo.processInfo.activeProcessorCount / 2
-        }
-        return Int(count)
+    /// `machdep.cpu.brand_string`, e.g. „Apple M2 Pro“; empty if unknown.
+    public static var chipName: String {
+        var size = 0
+        guard sysctlbyname("machdep.cpu.brand_string", nil, &size, nil, 0) == 0, size > 0 else { return "" }
+        var bytes = [CChar](repeating: 0, count: size)
+        guard sysctlbyname("machdep.cpu.brand_string", &bytes, &size, nil, 0) == 0 else { return "" }
+        return String(cString: bytes)
     }
 
     private enum OCROutcome: Sendable {

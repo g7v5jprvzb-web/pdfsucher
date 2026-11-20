@@ -1672,3 +1672,21 @@ Grundlage: interne Messnotiz, Ergebnis in docs/performance.md „office-speed“
   Herkunft memory/disk/render/none); `resource` alle 30 s (CPU % eines Kerns, `memory_mb`, Temperatur, Phase,
   Warteschlangen); `settings` nach dem Wiederherstellen. Tagesgrenze 100 MB, danach nur `keptWhenFull`.
 - Nicht gebaut (nur Idee): Bilder vor der Erkennung verkleinern, Bilder ohne Text vorab verwerfen.
+
+## 2026-11-20 — 1.5.1 (Build 26) nach dem Protokoll des anderen Macs (M2 Pro) (Branch `release-1.5.1` ab main 1.5.0)
+
+- **OCR-Parallelität nach Chip** (`machdep.cpu.brand_string`): Max/Ultra 4, sonst die Formel von 1.4.0 (Kerne/4, 2–4).
+  M2 Pro mit 8 (1.5.0): Median 2,6 s je Bild statt 0,8 s, ~1,9 statt ~3,4 Bilder/s. M3 Max neu gemessen (Durchsatz/Median):
+  Bilder 3 → 10,3/127 ms, 4 → 10,7/259, 6 → 12,7/392, 8 → 11,5/634; Scan-Seiten 3 → 5,4/528, 4 → 5,8/620, 6 → 2,5/1132,
+  8 → 4,9/1420 (Messungen schwanken stark; mehr als 4 bringt nichts Verlässliches und macht jede Seite langsamer).
+  `app_start` und `settings` nennen `chip` und `ocr_parallel`.
+- **Schwierige PDF:** 1.5.0 schrieb die Seite mit `dataRepresentation` neu (bis 52 s im Hintergrund, 15-mal geöffnet).
+  Jetzt eine Kopie der Seite (`PDFPage.copy`) in einem neuen Dokument; die einmal durchsuchte Datei wird behalten (letzte
+  langsame Datei, nach Version), ein Öffnen je Datei zur Zeit (`openLocks`). Der Tracker bleibt beim behaltenen Dokument:
+  PDFKit hält den Delegate nicht und fragt ihn für jede neue Seite (sonst Absturz in `pageAtIndex`).
+- **TextKit-Sperre:** neue Art `.load` für Anzeige-Pfade, die ein Dokument erst setzen; sie geht der Indizierung vor, setzt
+  aber in Abschnitten und lässt wartende Zeichnungen (`.display`) dazwischen. Protokoll 1.5.0: 125 Word-Kacheln warteten
+  in 5 s zusammen 31 s (bis 2,1 s), während eine Word-Vorschau 1,8 s lang gesetzt wurde. Der Kachel-Plattenspeicher war schon
+  für Word aktiv; die vielen Neuzeichnungen kommen von neuen Markierungen je Suchbegriff.
+- **Bedienungshilfen-Hänger** (Fenster-Werkzeug fragt die Oberfläche ab, SwiftUI läuft alle Kacheln durch): nicht
+  geändert (Chris), weiter messen.

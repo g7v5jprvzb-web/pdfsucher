@@ -42,10 +42,11 @@ struct OCRParallelismBenchmark {
     }
 
     /// Like the Indexer: each recognition on its own utility thread, at most `parallel` at once.
-    static func run(_ pages: [(URL, Int)], parallel: Int, kind: DocumentKind = .pdf) async -> (s: Double, texts: [String]) {
+    static func run(_ pages: [(URL, Int)], parallel: Int, kind: DocumentKind = .pdf) async -> (s: Double, texts: [String], medianMs: Double) {
         let ocr = VisionOCRSource()
         let start = ContinuousClock.now
         let texts = Mutex([String](repeating: "", count: pages.count))
+        let times = Mutex([Double]())
         await withTaskGroup(of: Void.self) { group in
             var next = 0
             func add() {
@@ -55,8 +56,10 @@ struct OCRParallelismBenchmark {
                 group.addTask {
                     await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
                         let thread = Thread {
+                            let one = ContinuousClock.now
                             let text = (try? ocr.recognize(pageIndex: pages[i].1, of: pages[i].0, kind: kind).text) ?? "<fehler>"
                             texts.withLock { $0[i] = text }
+                            times.withLock { $0.append(seconds(.now - one) * 1000) }
                             c.resume()
                         }
                         thread.qualityOfService = .utility
@@ -67,7 +70,8 @@ struct OCRParallelismBenchmark {
             for _ in 0..<parallel { add() }
             while await group.next() != nil { add() }
         }
-        return (seconds(.now - start), texts.withLock { $0 })
+        let sorted = times.withLock { $0 }.sorted()
+        return (seconds(.now - start), texts.withLock { $0 }, sorted.isEmpty ? 0 : sorted[sorted.count / 2])
     }
 
     @Test(.enabled(if: env["PDFSUCHER_OCR_BENCH"] == "1"), .timeLimit(.minutes(60)))
@@ -86,7 +90,7 @@ struct OCRParallelismBenchmark {
             metrics.setEnabled(true)
             let watch = MainHangWatch(metrics: metrics, maxSamples: 0)
             watch.start()
-            let (s, texts) = await Self.run(pages, parallel: parallel, kind: kind)
+            let (s, texts, medianMs) = await Self.run(pages, parallel: parallel, kind: kind)
             watch.stop()
             metrics.flush()
             let hangs = ((try? String(contentsOf: logs.appendingPathComponent(metrics.logFiles().first?.lastPathComponent ?? "-"), encoding: .utf8)) ?? "")
@@ -94,8 +98,8 @@ struct OCRParallelismBenchmark {
             try? FileManager.default.removeItem(at: logs)
             let same = reference.map { $0 == texts } ?? true
             if reference == nil { reference = texts }
-            print(String(format: "OCRBENCH parallel=%d wall=%.2fs per_s=%.2f chars=%d same_text=%@ main_hangs=%d", parallel, s,
-                         Double(pages.count) / s, texts.reduce(0) { $0 + $1.count }, same ? "yes" : "NO", hangs))
+            print(String(format: "OCRBENCH parallel=%d wall=%.2fs per_s=%.2f median_ms=%.0f chars=%d same_text=%@ main_hangs=%d", parallel, s,
+                         Double(pages.count) / s, medianMs, texts.reduce(0) { $0 + $1.count }, same ? "yes" : "NO", hangs))
             #expect(same, "parallelism must not change any recognized text")
         }
     }

@@ -41,11 +41,17 @@ public final class TextKitWordDocument: @unchecked Sendable {
     static let textKit = NSLock()
     /// Display paths (tiles, preview, output) waiting for or about to take `textKit` (office-speed).
     private static let displaysWaiting = Atomic<Int>(0)
+    /// 1.5.1: of those, the draws and page reads of documents already laid out (`.display`, a few ms each).
+    private static let drawsWaiting = Atomic<Int>(0)
 
     /// Who takes `textKit`: display paths go first; layout work steps aside while one waits.
     enum Turn {
-        /// Tiles, preview, output, page counts.
+        /// Draws and page reads of a laid-out document (tiles, preview, output).
         case display
+        /// 1.5.1: a display path laying out a document it needs (tile or preview of a document not cached): goes before
+        /// the index layout, but paginates in chunks and steps aside for draws (`.display`) waiting meanwhile. Before,
+        /// a 1.8 s layout for the preview made the tiles of other documents wait up to 2 s (log of 2026-11-20).
+        case load
         /// The index layout: waits while a display path waits, and paginates in chunks (`yieldsToDisplay`).
         case layout
     }
@@ -56,10 +62,12 @@ public final class TextKitWordDocument: @unchecked Sendable {
     static func withTextKit<T>(_ turn: Turn, _ body: () throws -> T) rethrows -> T {
         let asked = ContinuousClock.now
         switch turn {
-        case .display:
+        case .display, .load:
             displaysWaiting.add(1, ordering: .sequentiallyConsistent)
+            if turn == .display { drawsWaiting.add(1, ordering: .sequentiallyConsistent) }
             textKit.lock()
             displaysWaiting.subtract(1, ordering: .sequentiallyConsistent)
+            if turn == .display { drawsWaiting.subtract(1, ordering: .sequentiallyConsistent) }
         case .layout:
             while true {
                 while yieldsToDisplay { usleep(200) }
@@ -73,7 +81,7 @@ public final class TextKitWordDocument: @unchecked Sendable {
         let acquired = ContinuousClock.now
         defer {
             textKit.unlock()
-            MetricsTally.shared.add("textkit_lock", key: ["turn": turn == .display ? "display" : "layout"],
+            MetricsTally.shared.add("textkit_lock", key: ["turn": "\(turn)"],
                                     ms: ["wait": IndexMetrics.ms(acquired - asked), "hold": IndexMetrics.ms(since: acquired)])
         }
         return try body()
@@ -81,6 +89,15 @@ public final class TextKitWordDocument: @unchecked Sendable {
 
     /// Whether a display path waits for `textKit` (layout work holding it should let go soon).
     static var yieldsToDisplay: Bool { displaysWaiting.load(ordering: .sequentiallyConsistent) > 0 }
+
+    /// Whether pagination in `turn` lets go of `textKit` after this chunk.
+    static func yields(_ turn: Turn) -> Bool {
+        switch turn {
+        case .display: false
+        case .load: drawsWaiting.load(ordering: .sequentiallyConsistent) > 0
+        case .layout: yieldsToDisplay
+        }
+    }
     private let storage: NSTextStorage
     private let layoutManager: NSLayoutManager
     private let containers: [NSTextContainer]
@@ -115,7 +132,7 @@ public final class TextKitWordDocument: @unchecked Sendable {
         // One Word TextKit job at a time in the process (`textKit`), font gate inside it.
         // Office-speed: the layout (`fonts: .start`) yields `textKit` to display paths between chunks of pages; the
         // import itself is one step.
-        let turn: Turn = fonts == .start ? .layout : .display
+        let turn: Turn = fonts == .start ? .layout : .load
         let (storage, layoutManager, setup) = try Self.withTextKit(turn) { try FontResolver.withStableFonts {
             () throws -> (NSTextStorage, NSLayoutManager, WordPageSetup) in
             // A layout cancelled or timed out while it waited for `textKit` runs no import.
@@ -166,7 +183,7 @@ public final class TextKitWordDocument: @unchecked Sendable {
                         paginated = true
                         break
                     }
-                } while !(turn == .layout && Self.yieldsToDisplay)
+                } while !Self.yields(turn)
             } }
         }
         let overflowLocation = Self.withTextKit(turn) { FontResolver.withStableFonts { () -> Int? in

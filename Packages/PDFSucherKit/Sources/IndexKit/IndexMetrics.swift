@@ -70,7 +70,8 @@ public final class IndexMetrics: Sendable {
             log(atLaunch ? "app_start" : "logging_on",
                 ["version": info["CFBundleShortVersionString"] as? String ?? "?", "build": info["CFBundleVersion"] as? String ?? "?",
                  "cores": process.processorCount, "active_cores": process.activeProcessorCount,
-                 "memory_gb": Int(process.physicalMemory >> 30), "macos": process.operatingSystemVersionString])
+                 "memory_gb": Int(process.physicalMemory >> 30), "macos": process.operatingSystemVersionString,
+                 "chip": Indexer.chipName, "ocr_parallel": Indexer.ocrParallelism])
         }
         if !on, was { flush() }
     }
@@ -104,7 +105,8 @@ public final class IndexMetrics: Sendable {
         }
         if justFull { log("log_full", ["limit_mb": dailyLimit >> 20]) }
         guard write else { return }
-        queue.async { [self] in append(data, day: day) }
+        let payload = data
+        queue.async { [self] in append(payload, day: day) }
     }
 
     /// Records that `phase` finished this file version (`key`: hash, size, date, page …) in this app session; a repeat

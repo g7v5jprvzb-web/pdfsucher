@@ -40,13 +40,15 @@ struct PreferredOrderTests {
 
 @Suite("OCR-Parallelität nach Kernen")
 struct OCRParallelismTests {
-    /// 1.5.0: one per performance core, 2 to 8 (M2 Pro: 6 or 8).
-    @Test func onePerPerformanceCoreTwoToEight() {
-        #expect(Indexer.parallelism(performanceCores: 1) == 2)
-        #expect(Indexer.parallelism(performanceCores: 4) == 4)
-        #expect(Indexer.parallelism(performanceCores: 6) == 6)
-        #expect(Indexer.parallelism(performanceCores: 8) == 8)
-        #expect(Indexer.parallelism(performanceCores: 12) == 8)
-        #expect(Indexer.performanceCores > 0)
+    /// 1.5.1: by chip — Max/Ultra 4, everything else a quarter of the cores, 2 to 4 (M2 Pro: 3).
+    @Test func byChip() {
+        #expect(Indexer.parallelism(chip: "Apple M3 Max", cores: 16) == 4)
+        #expect(Indexer.parallelism(chip: "Apple M1 Ultra", cores: 20) == 4)
+        #expect(Indexer.parallelism(chip: "Apple M2 Pro", cores: 12) == 3)
+        #expect(Indexer.parallelism(chip: "Apple M2 Pro", cores: 10) == 2)
+        #expect(Indexer.parallelism(chip: "Apple M2", cores: 8) == 2)
+        #expect(Indexer.parallelism(chip: "Intel(R) Core(TM) i9", cores: 16) == 4)
+        #expect(Indexer.parallelism(chip: "", cores: 4) == 2)
+        #expect(Indexer.chipName.hasPrefix("Apple M"))
     }
 }

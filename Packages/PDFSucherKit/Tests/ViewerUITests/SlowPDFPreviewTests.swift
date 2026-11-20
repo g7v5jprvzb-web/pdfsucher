@@ -60,6 +60,9 @@ struct SlowPDFPreviewTests {
         #expect(opens.first?["file"] as? String == IndexMetrics.hash(url))
         #expect(opens.first?["pages"] as? Int == 2_000)
         #expect(opens.first?["way"] as? String == "single_page")
+        // 1.5.1: the next page comes from the document searched before (kept), not from opening the file again.
+        #expect(opens.last?["way"] as? String == "single_page_kept")
+        #expect((opens.last?["ms"] as? Double ?? 1_000) < 100)
     }
 
     @Test func normalPDFStaysWhole() async throws {

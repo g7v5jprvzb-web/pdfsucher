@@ -5,6 +5,7 @@ import OutputKit
 import PDFKit
 import SearchKit
 import SwiftUI
+import Synchronization
 
 /// The focused page, large, with matches highlighted; ‹ › step through all hit pages in grid order.
 struct PageDetailView: View {
@@ -346,7 +347,8 @@ struct DetailDocument: Equatable {
             guard let pdf = built.document else { return .unavailable }
             return .ready(DetailDocument(url: url, modifiedAt: probe.modifiedAt, pdf: pdf))
         }
-        let opened = await Task.detached { openPDF(ref, slowPages: slowPages, metrics: metrics) }.value
+        let modifiedAt = probe.modifiedAt
+        let opened = await Task.detached { openPDF(ref, modifiedAt: modifiedAt, slowPages: slowPages, metrics: metrics) }.value
         guard let opened else { return .unavailable }
         return .ready(DetailDocument(url: url, modifiedAt: probe.modifiedAt, pdf: opened.document.document!,
                                      singlePage: opened.singlePage ? ref.pageIndex : nil, tracker: opened.tracker))
@@ -360,28 +362,63 @@ struct DetailDocument: Equatable {
 
     /// Reads and opens the PDF off the main actor. A slow one becomes a one-page document of `ref`'s page.
     /// Writes `preview_open` (hash, pages, way, ms) to the measurement log.
-    private nonisolated static func openPDF(_ ref: PageRef, slowPages: Duration, metrics: IndexMetrics) -> OpenedPDF? {
+    private nonisolated static func openPDF(_ ref: PageRef, modifiedAt: Date?, slowPages: Duration, metrics: IndexMetrics) -> OpenedPDF? {
         let start = ContinuousClock.now
-        guard let data = try? Data(contentsOf: ref.url, options: .mappedIfSafe), let pdf = PDFDocument(data: data),
-              !pdf.isLocked else { return nil }
-        // Before any page is read: the pages become `TrackedPage`s (1.3.4).
-        let tracker = PreviewDrawTracker()
-        pdf.delegate = tracker
-        let probeStart = ContinuousClock.now
-        let page = pdf.page(at: ref.pageIndex)
-        _ = pdf.page(at: pdf.pageCount - 1)
-        let probe = ContinuousClock.now - probeStart
-        var opened = OpenedPDF(document: DocumentBox(pdf), tracker: tracker, singlePage: false)
-        if probe > slowPages, let one = page?.dataRepresentation.flatMap(PDFDocument.init(data:)), one.pageCount == 1 {
-            let oneTracker = PreviewDrawTracker()
-            one.delegate = oneTracker
-            opened = OpenedPDF(document: DocumentBox(one), tracker: oneTracker, singlePage: true)
+        // 1.5.1: one open of a file at a time (the preview and its buffer ask for neighbouring pages together); a slow
+        // file found before is kept, so its next pages come from the document already searched.
+        let lock = openLocks.withLock { locks in
+            if let lock = locks[ref.url] { return lock }
+            let lock = NSLock()
+            locks[ref.url] = lock
+            return lock
         }
+        lock.lock()
+        defer { lock.unlock() }
+        var probe = Duration.zero
+        let pdf: PDFDocument, page: PDFPage?, kept: Bool
+        if let slow = slowPDF.withLock({ $0 }), slow.url == ref.url, slow.modifiedAt == modifiedAt {
+            pdf = slow.document.document!
+            page = pdf.page(at: ref.pageIndex)
+            kept = true
+        } else {
+            guard let data = try? Data(contentsOf: ref.url, options: .mappedIfSafe), let opened = PDFDocument(data: data),
+                  !opened.isLocked else { return nil }
+            // Before any page is read: the pages become `TrackedPage`s (1.3.4).
+            let tracker = PreviewDrawTracker()
+            opened.delegate = tracker
+            let probeStart = ContinuousClock.now
+            page = opened.page(at: ref.pageIndex)
+            _ = opened.page(at: opened.pageCount - 1)
+            probe = ContinuousClock.now - probeStart
+            guard probe > slowPages else {
+                metrics.log("preview_open", ["file": IndexMetrics.hash(ref.url), "ext": "pdf", "page": ref.pageIndex,
+                                             "pages": opened.pageCount, "way": "normal", "probe_ms": IndexMetrics.ms(probe),
+                                             "ms": IndexMetrics.ms(since: start)])
+                return OpenedPDF(document: DocumentBox(opened), tracker: tracker, singlePage: false)
+            }
+            // The tracker stays with the kept document: a document's delegate is not retained, and PDFKit asks it for the
+            // class of every page it creates later.
+            slowPDF.withLock { $0 = (ref.url, modifiedAt, DocumentBox(opened), tracker) }
+            pdf = opened
+            kept = false
+        }
+        // The shown page alone, in a document of its own: a copy of the page (no re-encoding; 1.5.0 wrote it anew
+        // with `dataRepresentation`, which took up to 50 s for a page of scans).
+        guard let page, let copy = page.copy() as? PDFPage else { return nil }
+        let one = PDFDocument()
+        let tracker = PreviewDrawTracker()
+        one.delegate = tracker
+        one.insert(copy, at: 0)
         metrics.log("preview_open", ["file": IndexMetrics.hash(ref.url), "ext": "pdf", "page": ref.pageIndex, "pages": pdf.pageCount,
-                                                 "way": opened.singlePage ? "single_page" : "normal",
-                                                 "probe_ms": IndexMetrics.ms(probe), "ms": IndexMetrics.ms(since: start)])
-        return opened
+                                     "way": kept ? "single_page_kept" : "single_page", "probe_ms": IndexMetrics.ms(probe),
+                                     "ms": IndexMetrics.ms(since: start)])
+        return OpenedPDF(document: DocumentBox(one), tracker: tracker, singlePage: true)
     }
+
+    /// One lock per file opened for the preview (`openPDF`).
+    private nonisolated static let openLocks = Mutex<[URL: NSLock]>([:])
+    /// The last slow PDF (whole document, its pages already searched once), by file version.
+    private nonisolated static let slowPDF = Mutex<(url: URL, modifiedAt: Date?, document: DocumentBox, tracker: PreviewDrawTracker)?>(nil)
 }
 
 /// PDFView showing one page of a loaded document with highlighted selections.

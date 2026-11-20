@@ -672,7 +672,8 @@ import ViewerUI
         let fields: [String: Any] = [
             "ocr": ocrPreferences.recognizeText, "images": ocrPreferences.includeImages, "office": officePreferences.includeOffice,
             "partial_words": settings.partialWords, "file_names": settings.searchFileNames, "debounce_ms": settings.debounceMs,
-            "sources": sourceList.items.count, "folders": folders.count, "ocr_parallel": Indexer.ocrParallelism]
+            "sources": sourceList.items.count, "folders": folders.count, "ocr_parallel": Indexer.ocrParallelism,
+            "chip": Indexer.chipName]
         Task.detached(priority: .utility) {
             var kinds: [String: Int] = [:]
             for index in folders { for hit in (try? index.browse()) ?? [] { kinds[hit.kind.rawValue, default: 0] += 1 } }
