@@ -54,6 +54,7 @@ public final class TextKitWordDocument: @unchecked Sendable {
     /// path that comes during `body` waits for it (one import, one chunk of pages or one page), not for the whole
     /// layout. Same lock order as before: gate → `textKit` → `withStableFonts`.
     static func withTextKit<T>(_ turn: Turn, _ body: () throws -> T) rethrows -> T {
+        let asked = ContinuousClock.now
         switch turn {
         case .display:
             displaysWaiting.add(1, ordering: .sequentiallyConsistent)
@@ -68,7 +69,13 @@ public final class TextKitWordDocument: @unchecked Sendable {
                 textKit.unlock()
             }
         }
-        defer { textKit.unlock() }
+        // 1.5.0: wait and hold time per turn, summed every 5 s in the measurement log (`textkit_lock`).
+        let acquired = ContinuousClock.now
+        defer {
+            textKit.unlock()
+            MetricsTally.shared.add("textkit_lock", key: ["turn": turn == .display ? "display" : "layout"],
+                                    ms: ["wait": IndexMetrics.ms(acquired - asked), "hold": IndexMetrics.ms(since: acquired)])
+        }
         return try body()
     }
 

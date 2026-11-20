@@ -75,8 +75,9 @@ struct IndexerOCRTests {
                                      image: try OCRFixtures.textImage(["Scan"], size: CGSize(width: 200, height: 100), fontSize: 20).image)
     }
 
+    /// Each name its own picture (1.5.0: identical files are recognized once).
     func addImage(_ env: Env, _ name: String) throws {
-        try OCRFixtures.write(try OCRFixtures.textImage(["Bild"], size: CGSize(width: 200, height: 100), fontSize: 20).image,
+        try OCRFixtures.write(try OCRFixtures.textImage(["Bild " + name], size: CGSize(width: 200, height: 100), fontSize: 20).image,
                               to: env.url(name), type: .png)
     }
 
@@ -191,20 +192,25 @@ struct IndexerOCRTests {
         #expect(try env.store.match("Fassung", in: .words).count == 1)
     }
 
-    /// 1.4.0 P7: at most `ocrParallelism` (2 to 4 by cores; it was 2 before) at once.
+    /// 1.4.0 P7: at most `ocrParallelism` (1.5.0: one per performance core, 2 to 8) at once. Different images (copies
+    /// are recognized once).
     @Test func atMostOCRParallelismAtOnce() async throws {
         let env = try makeEnv(); defer { env.cleanup() }
-        for i in 0..<8 { try addImage(env, "bild\(i).png") }
+        for i in 0..<12 {
+            try OCRFixtures.write(try OCRFixtures.textImage(["Bild \(i)"], size: CGSize(width: 200, height: 100), fontSize: 20).image,
+                                  to: env.url("bild\(i).png"), type: .png)
+        }
         let stub = StubOCR(delay: 0.05)
         let report = try await Indexer(root: env.root, store: env.store, ocr: stub).update { _ in }
-        #expect(stub.calls.count == 8 && report.ocr.recognized == 8)
+        #expect(stub.calls.count == 12 && report.ocr.recognized == 12)
         #expect(stub.maxRunning == Indexer.ocrParallelism)
     }
 
     @Test(.timeLimit(.minutes(1)))
     func cancelDuringOCRKeepsFinishedPages() async throws {
         let env = try makeEnv(); defer { env.cleanup() }
-        for i in 0..<6 { try addImage(env, "bild\(i).png") }
+        let count = Indexer.ocrParallelism + 6        // more than run at once (1.5.0: up to 8)
+        for i in 0..<count { try addImage(env, "bild\(i).png") }
         let gate = DispatchSemaphore(value: 0)
         // Others take 0.1 s each, so the later ones are still queued when the cancel lands.
         let stub = StubOCR(delay: 0.1) { url, _ in url.lastPathComponent == "bild2.png" ? .wait(gate, "spät") : .text("fertig") }
@@ -217,7 +223,7 @@ struct IndexerOCRTests {
         let pending = Set(try env.store.pendingOCRJobs().map(\.relativePath))
         let finished = Set(stub.calls.map { String($0.dropLast(2)) })
         #expect(pending.isDisjoint(with: finished)) // every started page was stored
-        #expect(pending.count + finished.count == 6)
+        #expect(pending.count + finished.count == count)
         #expect(!pending.isEmpty)
         // The next run continues with exactly the rest.
         let next = StubOCR()
@@ -326,8 +332,8 @@ struct IndexerOCRTests {
     @Test(.timeLimit(.minutes(1)))
     func wipeDuringOCRStopsAndStartsOver() async throws {
         let env = try makeEnv(); defer { env.cleanup() }
-        // 12 images (1.4.0: up to 4 recognitions at once): pass 1 must stop well before all of them.
-        for i in 0..<12 { try addImage(env, "bild\(i).png") }
+        // 24 images (1.5.0: up to 8 recognitions at once): pass 1 must stop well before all of them.
+        for i in 0..<24 { try addImage(env, "bild\(i).png") }
         let store = env.store
         let wiped = Mutex(false)
         let stub = StubOCR(delay: 0.05) { url, _ in
@@ -338,9 +344,9 @@ struct IndexerOCRTests {
         }
         let report = try await Indexer(root: env.root, store: env.store, ocr: stub).update { _ in }
         // Pass 1 stops starting new pages after the wipe; pass 2 indexes and recognizes everything.
-        #expect(stub.calls.count < 24, "\(stub.calls)")
+        #expect(stub.calls.count < 48, "\(stub.calls)")
         #expect(try env.store.pendingOCRJobs().isEmpty)
-        #expect(try env.store.documents().count == 12)
-        #expect(report.ocr.recognized == 12)
+        #expect(try env.store.documents().count == 24)
+        #expect(report.ocr.recognized == 24)
     }
 }

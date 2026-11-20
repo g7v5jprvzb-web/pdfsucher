@@ -40,11 +40,13 @@ struct PreferredOrderTests {
 
 @Suite("OCR-Parallelität nach Kernen")
 struct OCRParallelismTests {
-    @Test func aQuarterOfTheCoresTwoToFour() {
-        #expect(Indexer.parallelism(cores: 4) == 2)
-        #expect(Indexer.parallelism(cores: 8) == 2)
-        #expect(Indexer.parallelism(cores: 12) == 3)
-        #expect(Indexer.parallelism(cores: 16) == 4)
-        #expect(Indexer.parallelism(cores: 32) == 4)
+    /// 1.5.0: one per performance core, 2 to 8 (M2 Pro: 6 or 8).
+    @Test func onePerPerformanceCoreTwoToEight() {
+        #expect(Indexer.parallelism(performanceCores: 1) == 2)
+        #expect(Indexer.parallelism(performanceCores: 4) == 4)
+        #expect(Indexer.parallelism(performanceCores: 6) == 6)
+        #expect(Indexer.parallelism(performanceCores: 8) == 8)
+        #expect(Indexer.parallelism(performanceCores: 12) == 8)
+        #expect(Indexer.performanceCores > 0)
     }
 }

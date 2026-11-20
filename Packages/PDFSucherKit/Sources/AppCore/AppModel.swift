@@ -662,6 +662,46 @@ import ViewerUI
         // that are no source); an unplugged disk that is remembered keeps its tiles.
         tileDisk?.dropTiles(notUnder: sourceList.items.map(\.url) + rememberedMissing.map { URL(fileURLWithPath: $0) })
         hangWatch.launchPhase("restore_end", ["missing": missing.count, "failed": failed.count])
+        logSettings()
+    }
+
+    /// 1.5.0, at launch: the settings that change the work (numbers and switches only) and the files per type.
+    private func logSettings() {
+        guard metrics.isEnabled else { return }
+        let metrics = metrics, folders = Array(indexes.values)
+        let fields: [String: Any] = [
+            "ocr": ocrPreferences.recognizeText, "images": ocrPreferences.includeImages, "office": officePreferences.includeOffice,
+            "partial_words": settings.partialWords, "file_names": settings.searchFileNames, "debounce_ms": settings.debounceMs,
+            "sources": sourceList.items.count, "folders": folders.count, "ocr_parallel": Indexer.ocrParallelism]
+        Task.detached(priority: .utility) {
+            var kinds: [String: Int] = [:]
+            for index in folders { for hit in (try? index.browse()) ?? [] { kinds[hit.kind.rawValue, default: 0] += 1 } }
+            metrics.log("settings", fields.merging(["files_by_kind": kinds]) { a, _ in a })
+        }
+    }
+
+    /// 1.5.0: every 30 s while the log is on, `resource`: CPU of this process (percent of one core), memory, thermal
+    /// state, the running phase and the queue lengths.
+    public func startResourceLog(every interval: Duration = .seconds(30)) {
+        Task { [weak self] in
+            var lastCPU = ResourceUsage.cpuTime(), lastWall = ContinuousClock.now
+            while !Task.isCancelled {
+                try? await Task.sleep(for: interval)
+                guard let self else { return }
+                let cpu = ResourceUsage.cpuTime(), wall = ContinuousClock.now
+                if self.metrics.isEnabled {
+                    var fields: [String: Any] = [
+                        "cpu_pct": (100 * IndexMetrics.ms(cpu - lastCPU) / max(IndexMetrics.ms(wall - lastWall), 1)).rounded(),
+                        "thermal": ResourceUsage.thermalState, "phase": self.metricsPhase, "pending_text": self.pending.count,
+                        "pending_ocr": self.recognitionPending.count, "pending_layout": self.layoutPending.count,
+                        "searching": self.isSearching]
+                    if let mb = ResourceUsage.footprintMB() { fields["memory_mb"] = mb }
+                    self.metrics.log("resource", fields)
+                }
+                lastCPU = cpu
+                lastWall = wall
+            }
+        }
     }
 
     private func openFolderIndex(_ root: URL) async -> (any FolderIndexing)? {
@@ -2146,6 +2186,7 @@ import ViewerUI
         searchToken += 1
         let token = searchToken
         searchFirstRows = nil
+        let metrics = metrics
         searchTask = Task { [weak self] in
             if delay > .zero {
                 do { try await Task.sleep(for: delay) } catch { return }
@@ -2167,7 +2208,7 @@ import ViewerUI
                 }
             }
             let outcome = await withTaskCancellationHandler {
-                await Self.run(parsed, sort: sort, searchNames: searchNames, over: targets, early: collector)
+                await Self.run(parsed, sort: sort, searchNames: searchNames, over: targets, early: collector, metrics: metrics)
             } onCancel: { early.cancel() }
             collector.finish()
             early.cancel()
@@ -2217,7 +2258,7 @@ import ViewerUI
     /// Runs the search over all targets in parallel, off the main actor; cancelling the caller cancels
     /// the work. A failing target does not drop the others' hits.
     private nonisolated static func run(_ q: ParsedQuery, sort: SortMode, searchNames: Bool, over targets: [SearchTarget],
-                                        early: EarlyResults? = nil) async -> SearchOutcome {
+                                        early: EarlyResults? = nil, metrics: IndexMetrics = .shared) async -> SearchOutcome {
         let work = Task.detached(priority: .userInitiated) { () -> SearchOutcome in
             await withTaskGroup(of: (String, Result<[DocumentHit], Error>, DocumentHit?).self) { group in
                 for target in targets {
@@ -2230,7 +2271,12 @@ import ViewerUI
                             return (path, Result { try index.search(q, sort: sort, searchNames: searchNames, onPartial: onPartial) }, nil)
                         case .file(let url, let single, let layout):
                             // A Word/PowerPoint file that changed since its layout throws `StaleFileLayout`.
+                            let started = ContinuousClock.now
                             let result = Result { try single.search(url: url, query: q, searchNames: searchNames).map { [$0] } ?? [] }
+                            // 1.5.0: each single file's search (Word/PowerPoint are searched in their layout).
+                            metrics.log("search_file", ["file": IndexMetrics.hash(url), "ext": url.pathExtension.lowercased(),
+                                                        "layout": Self.layoutName(layout),
+                                                        "ms": IndexMetrics.ms(since: started), "outcome": Self.outcome(result)])
                             // Text not readable (locked, damaged, not laid out yet, changed): still found by its name,
                             // shown as when browsing (Chris, 2026-11-14); the error is handled as before.
                             guard case .failure(let error) = result, !(error is CancellationError), searchNames,
@@ -2257,6 +2303,26 @@ import ViewerUI
             }
         }
         return await withTaskCancellationHandler { await work.value } onCancel: { work.cancel() }
+    }
+
+    /// `search_file`: the layout state of a Word/PowerPoint single file ("none" for PDFs and images).
+    private nonisolated static func layoutName(_ state: FileLayoutState?) -> String {
+        switch state {
+        case nil: "none"
+        case .pending: "pending"
+        case .laidOut: "laid_out"
+        case .failed: "failed"
+        }
+    }
+
+    /// `search_file`: what one single file's search gave.
+    private nonisolated static func outcome(_ result: Result<[DocumentHit], Error>) -> String {
+        switch result {
+        case .success(let hits): hits.isEmpty ? "no_hit" : "hit"
+        case .failure(let error) where error is StaleFileLayout: "stale_layout"
+        case .failure(let error) where error is CancellationError: "cancelled"
+        case .failure(let error): String(describing: type(of: error))
+        }
     }
 
     private func apply(_ outcome: SearchOutcome, for parsed: ParsedQuery) {

@@ -14,6 +14,9 @@ public enum IndexStoreError: Error, Equatable {
 
 /// The SQLite index of one PDF folder (schema: spec §4.1, extended by spec 1.2 §4).
 ///
+/// - Schema 6 (1.5.0): `documents.content_hash` (SHA-256 hex of the file, set before text recognition) so a copy takes
+///   over the recognized text of an identical file instead of recognizing it again. Indexes of schema 6 live in their
+///   own folder (`Indexes-v6`), so an installed 1.4.x keeps its index; schema 3–5 files there are migrated in place.
 /// - Schema 5 (1.4.0 P4): `documents.file_id` („<volume UUID>/<file id>“) to recognize moved and renamed files;
 ///   schema 3 and 4 are migrated in place (the column starts empty and is filled by the next scans).
 /// - Schema 4 (1.3.12, Wortteil-Index im Hintergrund): pages inserted by phase 1 (`source = 'text'`) go into
@@ -41,15 +44,16 @@ public enum IndexStoreError: Error, Equatable {
 ///   is thrown and the file is left alone. `wasRebuilt` reports whether a rebuild happened.
 /// - `modified_at` is seconds since 1970.
 public final class IndexStore: IndexReading, @unchecked Sendable {
-    public static let schemaVersion = 5
+    public static let schemaVersion = 6
 
-    /// `~/Library/Application Support/PDFSucher/Indexes/<sha256 hex of standardized folder path>.sqlite`
+    /// `~/Library/Application Support/PDFSucher/Indexes-v6/<sha256 hex of standardized folder path>.sqlite` (1.5.0: its own
+    /// folder; 1.4.x and older use `Indexes`, which this version never touches).
     public static func location(forFolder root: URL) -> URL {
         let digest = SHA256.hash(data: Data(root.standardizedFileURL.path.utf8))
         let hex = digest.map { String(format: "%02x", $0) }.joined()
         return URL.applicationSupportDirectory
             .appendingPathComponent("PDFSucher", isDirectory: true)
-            .appendingPathComponent("Indexes", isDirectory: true)
+            .appendingPathComponent("Indexes-v6", isDirectory: true)
             .appendingPathComponent("\(hex).sqlite", isDirectory: false)
     }
 
@@ -93,7 +97,7 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
 
     // MARK: Opening and recovery
 
-    private enum Health { case fresh, current, schema3, schema4, mismatch }
+    private enum Health { case fresh, current, schema3, schema4, schema5, mismatch }
 
     private static func open(fileURL: URL, root: URL) throws -> (SQLiteConnection, Bool) {
         do {
@@ -107,9 +111,14 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
             case .schema3:
                 try migrateFrom3(db)
                 try migrateFrom4(db)
+                try migrateFrom5(db)
                 return (db, false)
             case .schema4:
                 try migrateFrom4(db)
+                try migrateFrom5(db)
+                return (db, false)
+            case .schema5:
+                try migrateFrom5(db)
                 return (db, false)
             case .mismatch:
                 log.notice("Index schema mismatch, rebuilding \(fileURL.path, privacy: .public)")
@@ -205,6 +214,7 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
         guard rows.count == 1 else { return .mismatch }
         if rows[0]["value"] == .text("3") { return .schema3 }
         if rows[0]["value"] == .text("4") { return .schema4 }
+        if rows[0]["value"] == .text("5") { return .schema5 }
         guard rows[0]["value"] == .text(String(schemaVersion)) else { return .mismatch }
         return .current
     }
@@ -229,8 +239,10 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
           renderer TEXT,
           layout_version INTEGER,
           needs_layout INTEGER NOT NULL DEFAULT 0,
-          file_id TEXT
+          file_id TEXT,
+          content_hash TEXT
         );
+        CREATE INDEX documents_content_hash ON documents(content_hash) WHERE content_hash IS NOT NULL;
         CREATE INDEX documents_needs_layout ON documents(needs_layout) WHERE needs_layout = 1;
         CREATE TABLE page_text(
           id INTEGER PRIMARY KEY,
@@ -307,6 +319,21 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
         try db.transaction {
             let columns = try db.query("PRAGMA table_info(documents)", []).compactMap { $0["name"] }
             if !columns.contains(.text("file_id")) { try db.execute("ALTER TABLE documents ADD COLUMN file_id TEXT") }
+            try db.run("UPDATE meta SET value = '5' WHERE key = 'schema_version'", [])
+        }
+        log.notice("Index migrated to schema 5")
+    }
+
+    /// Schema 5 → 6: the content hash column (empty; filled before the next text recognitions).
+    private static func migrateFrom5(_ db: SQLiteConnection) throws {
+        try db.transaction {
+            let columns = try db.query("PRAGMA table_info(documents)", []).compactMap { $0["name"] }
+            if !columns.contains(.text("content_hash")) {
+                try db.execute("""
+                    ALTER TABLE documents ADD COLUMN content_hash TEXT;
+                    CREATE INDEX documents_content_hash ON documents(content_hash) WHERE content_hash IS NOT NULL;
+                    """)
+            }
             try db.run("UPDATE meta SET value = ? WHERE key = 'schema_version'", [.text(String(schemaVersion))])
         }
         log.notice("Index migrated to schema \(schemaVersion)")
@@ -409,7 +436,7 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
             lap(\.deleteOldMs)
             try db.run("""
                 UPDATE documents SET file_size = ?, modified_at = ?, page_count = ?, status = ?, kind = ?,
-                  needs_layout = ?, file_id = ?, renderer = NULL, layout_version = NULL
+                  needs_layout = ?, file_id = ?, renderer = NULL, layout_version = NULL, content_hash = NULL
                 WHERE id = ?
                 """, meta + [.int(id)])
         } else {
@@ -500,6 +527,50 @@ public final class IndexStore: IndexReading, @unchecked Sendable {
                            [.text(DocumentStatus.error.rawValue), .int(job.docId)])
                 return true
             }
+        }
+    }
+
+    // MARK: Content hashes (1.5.0)
+
+    /// Stores the content hash of documents by id; a document whose size or date changed meanwhile (rewritten by a
+    /// newer phase 1) keeps none.
+    public func setContentHashes(_ hashes: [(docId: Int64, fileSize: Int64, modifiedAt: Date, hash: String)]) throws {
+        guard !hashes.isEmpty else { return }
+        try using(.writer) { db in
+            try db.transaction {
+                for h in hashes {
+                    try db.run("UPDATE documents SET content_hash = ? WHERE id = ? AND file_size = ? AND abs(modified_at - ?) < 0.001",
+                               [.text(h.hash), .int(h.docId), .int(h.fileSize), .double(h.modifiedAt.timeIntervalSince1970)])
+                }
+            }
+        }
+    }
+
+    /// The finished recognition of pages of documents with these contents: text and word boxes, keyed "<hash>|<page>".
+    /// Only pages OCR ran on and finished (not waiting again), of readable documents.
+    public func recognizedPages(for keys: Set<String>) throws -> [String: (text: String, words: [OCRWord])] {
+        guard !keys.isEmpty else { return [:] }
+        return try using(.reader) { db in
+            let rows = try db.query("""
+                SELECT d.content_hash AS h, p.page_index AS pi, p.id AS pid
+                FROM page_text p JOIN documents d ON d.id = p.doc_id
+                WHERE d.content_hash IS NOT NULL AND p.source = 'ocr' AND p.needs_ocr = 0 AND d.status <> 'error'
+                """, [])
+            var found: [String: (text: String, words: [OCRWord])] = [:]
+            for row in rows {
+                let key = "\(row.text("h"))|\(row.int("pi"))"
+                guard keys.contains(key), found[key] == nil else { continue }
+                let pid = row.int("pid")
+                let text = try db.query("SELECT text FROM page_text WHERE id = ?", [.int(pid)]).first?.text("text") ?? ""
+                let words = try db.query("""
+                    SELECT start_utf16 AS s, length_utf16 AS l, x, y, w, h FROM ocr_words WHERE page_text_id = ? ORDER BY rowid
+                    """, [.int(pid)]).map {
+                        OCRWord(range: NSRange(location: Int($0.int("s")), length: Int($0.int("l"))),
+                                box: CGRect(x: $0.double("x"), y: $0.double("y"), width: $0.double("w"), height: $0.double("h")))
+                    }
+                found[key] = (text, words)
+            }
+            return found
         }
     }
 

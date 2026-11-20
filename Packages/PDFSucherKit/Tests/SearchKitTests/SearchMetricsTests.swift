@@ -30,6 +30,10 @@ struct SearchMetricsTests {
         #expect(event["candidates"] as? Int == 10)
         #expect(event["hits"] as? Int == 10)
         #expect(event["cancelled"] as? Bool == false)
+        #expect((event["hits_by_kind"] as? [String: Int]) == ["pdf": 10])
+        #expect((event["candidates_by_kind"] as? [String: Int]) == ["pdf": 10])
+        #expect(event["documents"] as? Int == 10)
+        #expect(event["office_pending"] as? Int == 0)
         for key in ["db_ms", "check_ms", "names_ms", "total_ms", "first_partial_ms"] { #expect(event[key] as? NSNumber != nil, "\(key)") }
     }
 }

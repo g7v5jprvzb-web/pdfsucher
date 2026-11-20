@@ -145,7 +145,11 @@ import SearchKit
     }
 
     private func open(_ ref: PageRef, reusing known: DetailDocument?) async -> DetailLoad {
-        if let running = opening[ref.url] { return await running.value.load }
+        if let running = opening[ref.url] {
+            let load = await running.value.load
+            // 1.4.4: a slow PDF opens as a one-page document of the page asked for; another page opens on its own.
+            guard case .ready(let document) = load, let single = document.singlePage, single != ref.pageIndex else { return load }
+        }
         let task = Task { LoadBox(load: await DetailDocument.load(ref, reusing: known)) }
         opening[ref.url] = task
         let result = await task.value

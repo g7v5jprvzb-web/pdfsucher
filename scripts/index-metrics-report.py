@@ -210,6 +210,8 @@ def analyse_ui(events):
             "longest": sorted(({k: e.get(k) for k in ("ts", "ms", "since_launch_ms", "phase", "last_launch_phase", "sample")}
                                for e in hangs), key=lambda e: e["ms"] or 0, reverse=True)[:5],
         },
+        "preview_open": sorted(({k: e.get(k) for k in ("ts", "file", "pages", "way", "probe_ms", "ms")}
+                                for e in events if e.get("event") == "preview_open"), key=lambda e: e["ms"] or 0, reverse=True)[:10],
         "launch_phases": [{k: e.get(k) for k in ("ts", "name", "ms", "source", "open_ms")}
                           for e in events if e.get("event") == "launch_phase"],
         "source_storage": {e.get("source"): {k: e.get(k) for k in ("volume_local", "volume_internal", "volume_type", "ubiquitous")}
@@ -235,6 +237,11 @@ def print_ui(u):
     for e in h["longest"]:
         print(f'  {e["ts"]}  {fmt(e["ms"], 1):>9} ms  ab Start {fmt(e["since_launch_ms"], 1)} ms  Phase {e["phase"]}  '
               f'nach {e["last_launch_phase"] or "—"}' + (f'  Sample {e["sample"]}' if e.get("sample") else ""))
+    print("\nVorschau geöffnet (langsamste):")
+    if not u["preview_open"]:
+        print("  keine")
+    for e in u["preview_open"]:
+        print(f'  {e["ts"]}  {e["file"]}  {e["pages"]} Seiten  {e["way"]:<11}  Suche {fmt(e["probe_ms"], 1)} ms, gesamt {fmt(e["ms"], 1)} ms')
     print("\nStartphasen (ms seit Prozessstart):")
     if not u["launch_phases"]:
         print("  keine")
@@ -248,6 +255,93 @@ def print_ui(u):
         nl = u["not_local"].get(src)
         print(f'  {src}: {v["volume_type"]}, lokal {v["volume_local"]}, intern {v["volume_internal"]}, iCloud {v["ubiquitous"]}'
               + (f', nicht geladen {nl}' if nl is not None else ""))
+
+
+def analyse_150(events):
+    """1.5.0: per file type, single files, preview, TextKit lock, tiles, resources, settings, OCR copies."""
+    by = lambda name: [e for e in events if e.get("event") == name]
+    kinds_hits, kinds_cand = Counter(), Counter()
+    pending = []
+    for e in by("search_source"):
+        kinds_hits.update(e.get("hits_by_kind") or {})
+        kinds_cand.update(e.get("candidates_by_kind") or {})
+        pending.append(e.get("office_pending", 0))
+    files = defaultdict(list)
+    outcomes = Counter()
+    for e in by("search_file"):
+        files[e.get("ext", "?")].append(e.get("ms", 0))
+        outcomes[f'{e.get("ext")}:{e.get("outcome")}'] += 1
+    previews = defaultdict(list)
+    for e in by("preview_open"):
+        previews[f'{e.get("ext", "pdf")}/{e.get("way")}'].append(e.get("ms", 0))
+    visible = defaultdict(list)
+    for e in by("preview_visible"):
+        visible[e.get("ext", "?")].append(e.get("ms", 0))
+
+    def sums(name, keyname, values):
+        out = {}
+        for e in by(name):
+            k = e.get(keyname, "?")
+            o = out.setdefault(k, {"count": 0, "tags": Counter(), **{f"{v}_sum_ms": 0.0 for v in values}, **{f"{v}_max_ms": 0.0 for v in values}})
+            o["count"] += e.get("count", 0)
+            o["tags"].update(e.get("tags") or {})
+            for v in values:
+                o[f"{v}_sum_ms"] += e.get(f"{v}_sum_ms", 0) or 0
+                o[f"{v}_max_ms"] = max(o[f"{v}_max_ms"], e.get(f"{v}_max_ms", 0) or 0)
+        for o in out.values():
+            o["tags"] = dict(o["tags"])
+        return out
+    res = by("resource")
+    ocr_end = [e for e in by("phase_end") if e.get("phase") == "ocr"]
+    return {"v150": {
+        "hits_by_kind": dict(kinds_hits), "candidates_by_kind": dict(kinds_cand), "office_pending_max": max(pending, default=None),
+        "search_file": {k: {"count": len(v), "median_ms": median(v), "max_ms": max(v)} for k, v in files.items()},
+        "search_file_outcomes": dict(outcomes),
+        "preview_open": {k: {"count": len(v), "median_ms": median(v), "max_ms": max(v)} for k, v in previews.items()},
+        "preview_visible": {k: {"count": len(v), "median_ms": median(v), "max_ms": max(v)} for k, v in visible.items()},
+        "textkit_lock": sums("textkit_lock", "turn", ["wait", "hold"]),
+        "tile_stats": sums("tile_stats", "ext", ["tile"]),
+        "resource": {"count": len(res), "cpu_pct_max": max((e.get("cpu_pct", 0) for e in res), default=None),
+                     "memory_mb_max": max((e.get("memory_mb", 0) for e in res), default=None),
+                     "thermal": dict(Counter(e.get("thermal") for e in res))},
+        "settings": [{k: v for k, v in e.items() if k not in ("event", "run")} for e in by("settings")],
+        "ocr_copied": sum(e.get("copied", 0) or 0 for e in ocr_end), "ocr_hash_ms": sum(e.get("hash_ms", 0) or 0 for e in ocr_end),
+        "log_full": len(by("log_full")),
+    }}
+
+
+def print_150(r):
+    v = r["v150"]
+    print("\nSuche nach Dateityp (Summe über alle Suchen):")
+    print(f'  Treffer: {v["hits_by_kind"] or "keine"}')
+    print(f'  Kandidatenseiten: {v["candidates_by_kind"] or "keine"}')
+    print(f'  Office-Dokumente noch ohne Layout (max): {fmt(v["office_pending_max"])}')
+    print("\nEinzeldateien (Suche):")
+    for k, x in v["search_file"].items():
+        print(f'  {k:<6} {x["count"]:>5}×  Median {fmt(x["median_ms"], 1)} ms, Max {fmt(x["max_ms"], 1)} ms')
+    if v["search_file_outcomes"]:
+        print(f'  Ergebnisse: {v["search_file_outcomes"]}')
+    print("\nVorschau öffnen / sichtbar:")
+    for k, x in v["preview_open"].items():
+        print(f'  öffnen {k:<22} {x["count"]:>5}×  Median {fmt(x["median_ms"], 1)} ms, Max {fmt(x["max_ms"], 1)} ms')
+    for k, x in v["preview_visible"].items():
+        print(f'  sichtbar {k:<20} {x["count"]:>5}×  Median {fmt(x["median_ms"], 1)} ms, Max {fmt(x["max_ms"], 1)} ms')
+    print("\nTextKit-Sperre (Word):")
+    for k, x in v["textkit_lock"].items():
+        print(f'  {k:<8} {x["count"]:>6}×  Warten {fmt(x["wait_sum_ms"] / 1000)} s (max {fmt(x["wait_max_ms"], 1)} ms), '
+              f'Halten {fmt(x["hold_sum_ms"] / 1000)} s (max {fmt(x["hold_max_ms"], 1)} ms)')
+    print("\nKacheln nach Endung:")
+    for k, x in v["tile_stats"].items():
+        avg = x["tile_sum_ms"] / x["count"] if x["count"] else 0
+        print(f'  {k:<6} {x["count"]:>6}×  Schnitt {avg:.1f} ms, Max {fmt(x["tile_max_ms"], 1)} ms  Herkunft {x["tags"]}')
+    rr = v["resource"]
+    print(f'\nRessourcen: {rr["count"]} Messungen, CPU max {fmt(rr["cpu_pct_max"])} %, Speicher max {fmt(rr["memory_mb_max"])} MB, '
+          f'Temperatur {rr["thermal"]}')
+    for e in v["settings"]:
+        print(f'Einstellungen {e.get("ts")}: {e}')
+    print(f'OCR-Kopien übernommen: {v["ocr_copied"]} (Hash-Zeit {fmt(v["ocr_hash_ms"] / 1000)} s)')
+    if v["log_full"]:
+        print("Achtung: Tagesgrenze des Protokolls erreicht (danach nur Hänger/Start).")
 
 
 def fmt(v, digits=2):
@@ -318,12 +412,14 @@ def main():
     report = analyse(events)
     report["files"] = files
     report.update(analyse_ui(events))
+    report.update(analyse_150(events))
     if args.json:
         json.dump(report, sys.stdout, ensure_ascii=False, indent=2)
         print()
     else:
         print_report(report)
         print_ui(report)
+        print_150(report)
 
 
 if __name__ == "__main__":

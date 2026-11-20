@@ -27,7 +27,7 @@ extension IndexStore {
                   let rows = try? db.query("SELECT key, value FROM meta WHERE key IN ('folder_path', 'schema_version')", []) else { continue }
             var meta: [String: String] = [:]
             for row in rows { if case .text(let k)? = row["key"], case .text(let v)? = row["value"] { meta[k] = v } }
-            guard let folder = meta["folder_path"], ["3", "4", "5"].contains(meta["schema_version"] ?? ""),
+            guard let folder = meta["folder_path"], ["3", "4", "5", "6"].contains(meta["schema_version"] ?? ""),
                   folder.hasPrefix(parent + "/") else { continue }
             found.append(ChildIndex(fileURL: file, folderPath: folder))
         }

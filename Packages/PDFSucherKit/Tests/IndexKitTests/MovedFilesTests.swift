@@ -109,6 +109,6 @@ struct MovedFilesTests {
         #expect(try reopened.documents().map(\.relativePath) == ["a.pdf"])
         #expect(try reopened.documents().first?.fileID == nil)
         let raw = try SQLiteConnection(path: url.path)
-        #expect(try raw.query("SELECT value FROM meta WHERE key = 'schema_version'", []).first?["value"] == .text("5"))
+        #expect(try raw.query("SELECT value FROM meta WHERE key = 'schema_version'", []).first?["value"] == .text("6"))
     }
 }

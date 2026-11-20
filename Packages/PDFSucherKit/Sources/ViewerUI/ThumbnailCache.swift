@@ -1,6 +1,7 @@
 // ThumbnailCache.swift — Task 4.2
 import AppKit
 import ImageIO
+import IndexKit
 import Foundation
 import OutputKit
 import SearchKit
@@ -113,16 +114,25 @@ public final class ThumbnailCache: Sendable {
             return nil
         }
         lastTileSize.withLock { $0 = size }
-        if let cached = images.withLock({ $0.value(for: request.key) }) { return cached }
+        // 1.5.0: time to a visible tile per file type and where it came from, summed every 5 s (`tile_stats`).
+        let started = ContinuousClock.now
+        let tally = { (from: String) in
+            MetricsTally.shared.add("tile_stats", key: ["ext": ref.url.pathExtension.lowercased()],
+                                    ms: ["tile": IndexMetrics.ms(since: started)], tag: from)
+        }
+        if let cached = images.withLock({ $0.value(for: request.key) }) { tally("memory"); return cached }
         guard !Task.isCancelled else { return nil }
         if let disk, let stored = await disk.image(named: request.diskName) {
             // Decoded already: kept even when the tile scrolled away meanwhile (review M5).
             let image = NSImage(cgImage: stored, size: size)
             images.withLock { $0.insert(image, for: request.key, cost: stored.bytesPerRow * stored.height) }
+            tally("disk")
             return Task.isCancelled ? nil : image
         }
         guard !Task.isCancelled else { return nil }
-        return await queue.image(key: JobKey(cache: id, key: request.key), priority: .visible) { [self] in render(request) }
+        let image = await queue.image(key: JobKey(cache: id, key: request.key), priority: .visible) { [self] in render(request) }
+        tally(image == nil ? "none" : "render")
+        return image
     }
 
     /// One group of tiles to render ahead with the same size and marks.

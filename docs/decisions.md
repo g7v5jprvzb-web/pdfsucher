@@ -1633,3 +1633,42 @@ Grundlage: interne Messnotiz, Ergebnis in docs/performance.md „office-speed“
 - **Auswertung:** `scripts/index-metrics-report.py` hat Abschnitte Suche, Hänger, Startphasen, Speicherort.
 - Tests: `MeasurementLog143Tests` (Default, 7 Tage, Export, Hänger mit echtem `sample`), `SearchMetricsTests`,
   `IndexMetricsAppTests.searchesAndStorageAreLogged`.
+
+## 2026-11-20 — Hänger in der großen Vorschau (Branch `fix-vorschau-haenger` ab main 1.4.3)
+
+- **Befund** (Mess-Protokoll + `sample` vom anderen Mac): 20-s-Hänger direkt nach einer Suche, deren erster Treffer
+  in der großen Vorschau erscheint. Hauptthread in `PDFPageView.updateNSView` → `PDFView.setDocument` →
+  `generateInternalDocumentGeometry` → `CGPDFDocumentGetPage` → `find_page_in_subtree` → `flate_filter_refill`, ebenso
+  `PreviewBuffer.prepare` → `pageAtIndex`. Die Datei hat ihren Seitenbaum in komprimierten Objekt-Streams; CoreGraphics
+  entpackt für jede Seite neu, PDFView fragt beim Setzen des Dokuments jede Seite ab. Suche und Indizierung unauffällig.
+- **Fix:** `DetailDocument.load` öffnet PDFs ganz im Hintergrund und misst dort die Suche der gezeigten und der letzten
+  Seite. Länger als 100 ms (normale PDFs: unter 1 ms) → die gezeigte Seite als eigenes Ein-Seiten-PDF
+  (`dataRepresentation`, `singlePage` wie bei Word/PowerPoint); jede andere Seite der Datei wird ebenso geöffnet.
+  `PreviewBuffer.open` teilt ein laufendes Öffnen nur noch bei passender Seite.
+- **Messung:** Ereignis `preview_open` (Datei-Hash, Seiten, `way` normal/single_page, `probe_ms`, `ms` bis das Dokument
+  bereit ist). Test `SlowPDFPreviewTests` baut so eine Datei nach (2 000 Seiten, flacher Baum in einem Objekt-Stream):
+  `PDFView.document` vorher ca. 1 s auf dem Hauptthread, mit Ein-Seiten-PDF ca. 3 ms.
+- **Fehlende Start-Ereignisse im Protokoll vom anderen Mac:** die Datei beginnt 49 s nach dem Start; die App schreibt
+  `app_start`, `launch_phase` und `source_storage` (Test `restoreWritesLaunchPhasesAndStorage`). Wahrscheinlich wurden
+  die Protokolle im Reiter Speicher gelöscht (dort wurde zur gleichen Zeit der Index gelöscht).
+
+## 2026-11-20 — 1.5.0 (Build 25): OCR-Dubletten, OCR-Parallelität, Word-Messung (Branch `release-1.5.0` ab `fix-vorschau-haenger`)
+
+- **Schema 6, eigener Ordner:** `documents.content_hash` (SHA-256 hex). Neuer Ordner `Indexes-v6`, damit eine
+  installierte 1.4.x ihren Index (`Indexes`) behält und sich die Versionen nicht gegenseitig neu aufbauen lassen; der alte
+  Ordner wird nie angefasst (Chris: keine Rückwärtskompatibilität nötig, alte Versionen unangetastet). Migration 3/4/5 → 6
+  bleibt für Dateien im neuen Ordner.
+- **OCR-Dubletten** (`Indexer.runOCR`): jede Datei mit wartender Erkennung wird gehasht (Kosten im Vergleich zur
+  Erkennung gering); gleiche Hash+Seite schon erkannt (`recognizedPages`) → Text und Wortboxen übernehmen, sonst die erste
+  Kopie im Lauf erkennen und die anderen übernehmen. Gilt für Bilder und gescannte PDF-Seiten (die PDF-Dubletten aus Phase 1
+  übernahmen nur den Text, die OCR-Seiten liefen bisher je Kopie). Nur innerhalb eines Index. `phase_end` (ocr): `copied`,
+  `hashed`, `hash_ms`; `ocr_page.result = copied`.
+- **OCR-Parallelität:** eine je Leistungskern (`hw.perflevel0.physicalcpu`), 2–8. Messung siehe Commit 3c18995 und
+  `Indexer.ocrParallelism`: Vision flacht ab etwa 8 ab, Gewinn gegenüber 3 rund 6–10 %, keine Hänger.
+- **Word-Messung** (Chris: „so viel Information wie möglich“): `search_source` mit `hits_by_kind`, `candidates_by_kind`,
+  `documents`, `office_pending`; `search_file` je Einzeldatei (Endung, Layout-Zustand, ms, Ergebnis); `preview_open` auch
+  für Office (Weg `office`/`office_not_laid_out`) und `preview_visible` (ms bis zur ersten scharfen Zeichnung);
+  `MetricsTally` (Summen alle 5 s): `textkit_lock` (Warten/Halten je `display`/`layout`), `tile_stats` (je Endung,
+  Herkunft memory/disk/render/none); `resource` alle 30 s (CPU % eines Kerns, `memory_mb`, Temperatur, Phase,
+  Warteschlangen); `settings` nach dem Wiederherstellen. Tagesgrenze 100 MB, danach nur `keptWhenFull`.
+- Nicht gebaut (nur Idee): Bilder vor der Erkennung verkleinern, Bilder ohne Text vorab verwerfen.

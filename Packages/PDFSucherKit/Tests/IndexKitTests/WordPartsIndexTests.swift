@@ -153,7 +153,7 @@ struct WordPartsIndexTests {
             try fillAll(reopened)
             try expectIntact(url, reopened)
             let raw = try SQLiteConnection(path: url.path)
-            #expect(try raw.query("SELECT value FROM meta WHERE key = 'schema_version'", []).first?["value"] == .text("5"))    // 1.4.0: on to schema 5
+            #expect(try raw.query("SELECT value FROM meta WHERE key = 'schema_version'", []).first?["value"] == .text("6"))    // 1.4.0: on to schema 5
         }
     }
 

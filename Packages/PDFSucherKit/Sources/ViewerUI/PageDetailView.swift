@@ -28,6 +28,8 @@ struct PageDetailView: View {
     @State private var loadingKey: DetailTaskKey?
     /// Recognized text of the focused page (spec 1.2 §5); nil for pages with a text layer.
     @State private var ocr: DetailOCR?
+    /// 1.5.0: the page asked for and since when, until its first sharp draw (`preview_visible` in the measurement log).
+    @State private var visibleClock: (ref: PageRef, since: ContinuousClock.Instant)?
 
     init(model: any ViewerModel, cache: ThumbnailCache, highlightKey: String, highlightRanges: HighlightRanges?) {
         self.model = model
@@ -83,6 +85,12 @@ struct PageDetailView: View {
                                         PreviewTiming.event("draw", shown.ref)
                                         if sharp {
                                             PreviewTiming.event("sharp", shown.ref)
+                                            if let clock = visibleClock, clock.ref == shown.ref {
+                                                visibleClock = nil
+                                                IndexMetrics.shared.log("preview_visible", [
+                                                    "file": IndexMetrics.hash(shown.ref.url), "ext": shown.ref.url.pathExtension.lowercased(),
+                                                    "page": shown.ref.pageIndex, "ms": IndexMetrics.ms(since: clock.since)])
+                                            }
                                             stage.drewSharp(pageIndex: pageIndex, document: pdf)
                                         }
                                     })
@@ -129,6 +137,7 @@ struct PageDetailView: View {
             // A cancelled task leaves `loadingKey` to the task that replaced it.
             defer { if loadingKey == key { loadingKey = nil } }
             let startRevision = model.layoutRevision
+            if visibleClock?.ref != ref { visibleClock = (ref, .now) }
             let current = Self.reusable(load: load, for: ref)
             if current == nil {
                 load = Self.placeholder(load: load, loadedURL: loadedURL, for: ref)
@@ -302,8 +311,13 @@ struct DetailDocument: Equatable {
     /// Checks and reads the file off the main actor (a hung network volume must not freeze the UI)
     /// and reuses `current` when the file has not changed since it was read. Pages of files `foreign` handles
     /// (Word, PowerPoint) come from it as one-page documents in full quality; nil from it = not laid out yet.
+    /// - Parameter slowPages: 1.4.4: finding pages in some PDFs takes seconds (page tree in compressed object streams,
+    ///   unpacked again and again), and PDFView computes every page's size on the main thread when it gets the
+    ///   document (20 s hangs). A probe longer than this (finding the shown and the last page, off the main thread)
+    ///   shows only that page, as a one-page document.
     @MainActor static func load(_ ref: PageRef, reusing current: DetailDocument? = nil,
-                                foreign: (any ForeignPageProvider)? = nil) async -> DetailLoad {
+                                foreign: (any ForeignPageProvider)? = nil, slowPages: Duration = .milliseconds(100),
+                                metrics: IndexMetrics = .shared) async -> DetailLoad {
         let url = ref.url
         let probe = await Task.detached { () -> (exists: Bool, modifiedAt: Date?) in
             var fresh = url
@@ -316,11 +330,15 @@ struct DetailDocument: Equatable {
             if let current, current.url == url, current.singlePage == ref.pageIndex, current.modifiedAt == probe.modifiedAt {
                 return .ready(current)
             }
+            let started = ContinuousClock.now
             let built = await Task.detached { DocumentBox(foreign.pageDocument(ref, maxPixel: nil)) }.value
+            metrics.log("preview_open", ["file": IndexMetrics.hash(url), "ext": url.pathExtension.lowercased(), "page": ref.pageIndex,
+                                         "way": built.document == nil ? "office_not_laid_out" : "office", "ms": IndexMetrics.ms(since: started)])
             guard let pdf = built.document, pdf.pageCount > 0 else { return .preparing }
             return .ready(DetailDocument(url: url, modifiedAt: probe.modifiedAt, pdf: pdf, singlePage: ref.pageIndex))
         }
-        if let current, current.url == url, current.singlePage == nil, current.modifiedAt == probe.modifiedAt { return .ready(current) }
+        if let current, current.url == url, current.singlePage == nil || current.singlePage == ref.pageIndex,
+           current.modifiedAt == probe.modifiedAt { return .ready(current) }
         if ImagePages.isImage(url) {
             // Decoded off the main actor; 4,000 px keep zooming sharp.
             // The page is built off the main actor too (PDFPage(image:) of a large image takes 100+ ms).
@@ -328,12 +346,41 @@ struct DetailDocument: Equatable {
             guard let pdf = built.document else { return .unavailable }
             return .ready(DetailDocument(url: url, modifiedAt: probe.modifiedAt, pdf: pdf))
         }
-        let data = await Task.detached { try? Data(contentsOf: url, options: .mappedIfSafe) }.value
-        guard let data, let pdf = PDFDocument(data: data), !pdf.isLocked else { return .unavailable }
+        let opened = await Task.detached { openPDF(ref, slowPages: slowPages, metrics: metrics) }.value
+        guard let opened else { return .unavailable }
+        return .ready(DetailDocument(url: url, modifiedAt: probe.modifiedAt, pdf: opened.document.document!,
+                                     singlePage: opened.singlePage ? ref.pageIndex : nil, tracker: opened.tracker))
+    }
+
+    private struct OpenedPDF: @unchecked Sendable {
+        let document: DocumentBox
+        let tracker: PreviewDrawTracker
+        let singlePage: Bool
+    }
+
+    /// Reads and opens the PDF off the main actor. A slow one becomes a one-page document of `ref`'s page.
+    /// Writes `preview_open` (hash, pages, way, ms) to the measurement log.
+    private nonisolated static func openPDF(_ ref: PageRef, slowPages: Duration, metrics: IndexMetrics) -> OpenedPDF? {
+        let start = ContinuousClock.now
+        guard let data = try? Data(contentsOf: ref.url, options: .mappedIfSafe), let pdf = PDFDocument(data: data),
+              !pdf.isLocked else { return nil }
         // Before any page is read: the pages become `TrackedPage`s (1.3.4).
         let tracker = PreviewDrawTracker()
         pdf.delegate = tracker
-        return .ready(DetailDocument(url: url, modifiedAt: probe.modifiedAt, pdf: pdf, tracker: tracker))
+        let probeStart = ContinuousClock.now
+        let page = pdf.page(at: ref.pageIndex)
+        _ = pdf.page(at: pdf.pageCount - 1)
+        let probe = ContinuousClock.now - probeStart
+        var opened = OpenedPDF(document: DocumentBox(pdf), tracker: tracker, singlePage: false)
+        if probe > slowPages, let one = page?.dataRepresentation.flatMap(PDFDocument.init(data:)), one.pageCount == 1 {
+            let oneTracker = PreviewDrawTracker()
+            one.delegate = oneTracker
+            opened = OpenedPDF(document: DocumentBox(one), tracker: oneTracker, singlePage: true)
+        }
+        metrics.log("preview_open", ["file": IndexMetrics.hash(ref.url), "ext": "pdf", "page": ref.pageIndex, "pages": pdf.pageCount,
+                                                 "way": opened.singlePage ? "single_page" : "normal",
+                                                 "probe_ms": IndexMetrics.ms(probe), "ms": IndexMetrics.ms(since: start)])
+        return opened
     }
 }
 

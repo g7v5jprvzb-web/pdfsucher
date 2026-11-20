@@ -48,11 +48,16 @@ public final class IndexMetrics: Sendable {
         var flushScheduled = false
     }
     private let output = Mutex(Output())      // only touched on `queue`
+    /// 1.5.0: bytes logged per day; above `dailyLimit` only `keptWhenFull` events are written (and `log_full` once).
+    private let today = Mutex((day: "", bytes: 0, full: false))
+    public let dailyLimit: Int
+    public static let keptWhenFull: Set<String> = ["app_start", "logging_on", "main_hang", "launch_phase", "settings", "log_full"]
     private let done = Mutex(Set<String>())
 
-    public init(directory: URL, prefix: String = "index-metrics") {
+    public init(directory: URL, prefix: String = "index-metrics", dailyLimit: Int = 100 << 20) {
         self.directory = directory
         self.prefix = prefix
+        self.dailyLimit = dailyLimit
     }
 
     public var isEnabled: Bool { enabled.load(ordering: .relaxed) }
@@ -84,6 +89,21 @@ public final class IndexMetrics: Sendable {
         guard var data = try? JSONSerialization.data(withJSONObject: line, options: [.sortedKeys]) else { return }
         data.append(0x0A)
         let day = String(ts.prefix(10))
+        let (write, justFull) = today.withLock { t -> (Bool, Bool) in
+            if t.day != day {
+                // A new day (or the first line): what an earlier run of the day wrote counts too.
+                let file = directory.appendingPathComponent("\(prefix)-\(day).jsonl").path
+                t = (day, (try? FileManager.default.attributesOfItem(atPath: file)[.size] as? Int) ?? 0, false)
+            }
+            guard t.bytes + data.count <= dailyLimit || Self.keptWhenFull.contains(event) else {
+                defer { t.full = true }
+                return (false, !t.full)
+            }
+            t.bytes += data.count
+            return (true, false)
+        }
+        if justFull { log("log_full", ["limit_mb": dailyLimit >> 20]) }
+        guard write else { return }
         queue.async { [self] in append(data, day: day) }
     }
 

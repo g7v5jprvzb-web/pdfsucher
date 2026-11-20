@@ -114,3 +114,53 @@ struct MeasurementLog143Tests {
         #expect(try events(logs).allSatisfy { $0["event"] as? String != "main_hang" })
     }
 }
+
+/// 1.5.0: summed measurements and the daily limit of the log.
+@Suite("Measurement log 1.5.0")
+struct MeasurementLog150Tests {
+    private func events(_ logs: URL) throws -> [[String: Any]] {
+        let files = (try? FileManager.default.contentsOfDirectory(at: logs, includingPropertiesForKeys: nil)) ?? []
+        return try files.map { try String(contentsOf: $0, encoding: .utf8) }.joined()
+            .split(separator: "\n").compactMap { try JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }
+    }
+
+    @Test func tallySumsPerKey() throws {
+        let logs = try PDFFixtures.tempDirectory()
+        defer { try? FileManager.default.removeItem(at: logs) }
+        let metrics = IndexMetrics(directory: logs)
+        metrics.setEnabled(true)
+        let tally = MetricsTally(metrics: metrics, every: .seconds(60))
+        tally.add("textkit_lock", key: ["turn": "display"], ms: ["wait": 2, "hold": 10])
+        tally.add("textkit_lock", key: ["turn": "display"], ms: ["wait": 4, "hold": 30], tag: "x")
+        tally.add("textkit_lock", key: ["turn": "layout"], ms: ["wait": 1, "hold": 1])
+        tally.flush()
+        metrics.flush()
+        let lines = try events(logs).filter { $0["event"] as? String == "textkit_lock" }
+        #expect(lines.count == 2)
+        let display = try #require(lines.first { $0["turn"] as? String == "display" })
+        #expect(display["count"] as? Int == 2)
+        #expect(display["wait_sum_ms"] as? Double == 6)
+        #expect(display["hold_max_ms"] as? Double == 30)
+        #expect((display["tags"] as? [String: Int]) == ["x": 1])
+    }
+
+    @Test func fullDayKeepsOnlyHangsAndStart() throws {
+        let logs = try PDFFixtures.tempDirectory()
+        defer { try? FileManager.default.removeItem(at: logs) }
+        let metrics = IndexMetrics(directory: logs, dailyLimit: 2_000)
+        metrics.setEnabled(true)
+        for i in 0..<100 { metrics.log("file", ["i": i, "pad": String(repeating: "x", count: 50)]) }
+        metrics.log("main_hang", ["ms": 300.0])
+        metrics.flush()
+        let all = try events(logs)
+        #expect(all.filter { $0["event"] as? String == "file" }.count < 30)
+        #expect(all.filter { $0["event"] as? String == "log_full" }.count == 1)
+        #expect(all.contains { $0["event"] as? String == "main_hang" })
+    }
+
+    @Test func resourceUsageIsReadable() {
+        #expect(ResourceUsage.cpuTime() > .zero)
+        #expect((ResourceUsage.footprintMB() ?? 0) > 0)
+        #expect(["nominal", "fair", "serious", "critical"].contains(ResourceUsage.thermalState))
+    }
+}

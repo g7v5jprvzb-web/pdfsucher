@@ -58,6 +58,7 @@ struct PDFSucherApp: App {
             // 1.4.2: diagnosis log of the result rows, off by default.
             IndexMetrics.rows.setEnabled(UserDefaults.standard.bool(forKey: IndexMetrics.rowsDefaultsKey), atLaunch: true)
             NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { _ in
+                MetricsTally.shared.flush()
                 IndexMetrics.shared.flush()
                 IndexMetrics.rows.flush()
             }
@@ -70,6 +71,7 @@ struct PDFSucherApp: App {
             // Settings „Verwaiste Indexe“ (1.3.10): only the user's index folder, never in UI tests.
             model.indexDirectory = IndexStore.location(forFolder: URL(fileURLWithPath: "/", isDirectory: true)).deletingLastPathComponent()
             model.folderWatcher = FSEventsFolderWatcher()   // the tree follows the Finder (decisions „Ordner beobachten“)
+            model.startResourceLog()                         // 1.5.0: `resource` every 30 s while the log is on
             _model = State(initialValue: model)
         }
     }

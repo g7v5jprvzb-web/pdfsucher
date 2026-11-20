@@ -26,7 +26,7 @@ struct IndexStoreTests {
         #expect(a == b)
         #expect(a.pathExtension == "sqlite")
         #expect(a.deletingPathExtension().lastPathComponent.count == 64)
-        #expect(a.deletingLastPathComponent().path.hasSuffix("Application Support/PDFSucher/Indexes"))
+        #expect(a.deletingLastPathComponent().path.hasSuffix("Application Support/PDFSucher/Indexes-v6"))
         #expect(a != IndexStore.location(forFolder: URL(fileURLWithPath: "/Users/x/Other")))
     }
 

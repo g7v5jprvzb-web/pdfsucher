@@ -547,12 +547,23 @@ public actor Indexer {
 
     // MARK: Phase 2 — text recognition (spec 1.2 §3)
 
-    /// At most this many recognitions at once (spec 1.2 §3), so the Mac stays responsive: a quarter of the cores, 2 to 4
-    /// (1.4.0 P7, measured on 48 real scan pages, M3 Max: 2 → 5.7, 4 → 7.3, 6 → 7.8 pages/s, the same text in every case;
-    /// each on a utility thread). 2 on Macs with fewer than 12 cores, as before.
-    public static let ocrParallelism = parallelism(cores: ProcessInfo.processInfo.activeProcessorCount)
+    /// At most this many recognitions at once (spec 1.2 §3), each on a utility thread: 1.5.0 one per performance core,
+    /// 2 to 8. Measured on an M3 Max (12 performance cores), same text in every case, no main-thread hang at any level:
+    /// 300 real images 2 → 12.5, 3 → 12.9, 4 → 13.5, 8 → 13.6, 12 → 13.7 images/s; 96 scan pages 2 → 5.3, 3 → 6.2,
+    /// 4 → 6.6, 8 → 6.8, 12 → 6.8 pages/s. Vision levels off at about 8; an M2 Pro (6 or 8 performance cores) gets 6 or 8
+    /// instead of 2 or 3 before (1.4.0 P7: a quarter of all cores, 2 to 4).
+    public static let ocrParallelism = parallelism(performanceCores: performanceCores)
 
-    static func parallelism(cores: Int) -> Int { max(2, min(4, cores / 4)) }
+    static func parallelism(performanceCores: Int) -> Int { max(2, min(8, performanceCores)) }
+
+    /// `hw.perflevel0.physicalcpu` (the performance cores); half of the active cores if the Mac does not report it.
+    static var performanceCores: Int {
+        var count: Int32 = 0, size = MemoryLayout<Int32>.size
+        guard sysctlbyname("hw.perflevel0.physicalcpu", &count, &size, nil, 0) == 0, count > 0 else {
+            return ProcessInfo.processInfo.activeProcessorCount / 2
+        }
+        return Int(count)
+    }
 
     private enum OCROutcome: Sendable {
         case text(OCRResult)
@@ -582,8 +593,29 @@ public actor Indexer {
         var storeError: Error?
         let metrics = metrics, phaseStart = ContinuousClock.now
         var sumMs = 0.0
+
+        // 1.5.0: identical files (images, scanned PDFs) are recognized once. Every queued file is hashed (SHA-256, kept
+        // in the index); a page whose content was recognized before takes over that text and its word boxes, and
+        // copies within this run wait for the first of them (the lead).
+        let hashStart = ContinuousClock.now
+        let hashes = try await Self.contentHashes(of: jobs, root: root, limit: max(1, ProcessInfo.processInfo.activeProcessorCount - 1))
+        let hashMs = IndexMetrics.ms(since: hashStart)
+        try store.setContentHashes(hashes.values.map { ($0.job.docId, $0.job.fileSize, $0.job.modifiedAt, $0.hash) })
+        let key = { (job: OCRPageJob) in hashes[job.docId].map { "\($0.hash)|\(job.pageIndex)" } }
+        let known = try store.recognizedPages(for: Set(jobs.compactMap(key)))
+        var takenOver: [(OCRPageJob, OCRResult)] = []
+        var followers: [String: [OCRPageJob]] = [:]
+        var leads = Set<String>()
+        var work: [OCRPageJob] = []
+        for job in jobs {
+            guard let k = key(job) else { work.append(job); continue }
+            if let page = known[k] { takenOver.append((job, OCRResult(text: page.text, words: page.words))) }
+            else if leads.contains(k) { followers[k, default: []].append(job) }
+            else { leads.insert(k); work.append(job) }
+        }
+        var copied = 0
         await withTaskGroup(of: (OCRPageJob, OCROutcome, Double).self) { group in
-            var queue = PreferredOrder(jobs, path: \.relativePath)
+            var queue = PreferredOrder(work, path: \.relativePath)
             let priority = self.priority
             func start(_ job: OCRPageJob) {
                 group.addTask {
@@ -593,44 +625,79 @@ public actor Indexer {
                     return (job, outcome, IndexMetrics.ms(since: started))
                 }
             }
+            // Taken over from the index: stored like a recognition (no Vision, 0 ms), not counted in the parallelism.
+            var instant = Set<Int64>()
+            for (job, result) in takenOver {
+                instant.insert(job.docId &* 100_000 &+ Int64(job.pageIndex))
+                group.addTask { (job, .text(result), 0) }
+            }
             for _ in 0..<Self.ocrParallelism {
                 guard let job = queue.next(preferring: priority()) else { break }
                 start(job)
             }
             while let (job, outcome, ms) = await group.next() {
-                done += 1
-                sumMs += ms
-                if metrics.isEnabled {
-                    let (result, chars): (String, Int?) = switch outcome {
-                    case .text(let r): ("ok", r.text.count)
-                    case .unreadable: ("unreadable", nil)
-                    case .retryLater: ("retry_later", nil)
+                let wasInstant = instant.remove(job.docId &* 100_000 &+ Int64(job.pageIndex)) != nil
+                // A lead's copies take over its outcome (they wait again when the lead is tried again later).
+                var results = [(job, ms, wasInstant)]
+                if let k = key(job), let copies = followers.removeValue(forKey: k) {
+                    if case .retryLater = outcome {} else { results += copies.map { ($0, 0, true) } }
+                }
+                for (job, ms, isCopy) in results {
+                    done += 1
+                    sumMs += ms
+                    if isCopy { copied += 1 }
+                    if metrics.isEnabled {
+                        let (result, chars): (String, Int?) = switch outcome {
+                        case .text(let r): (isCopy ? "copied" : "ok", r.text.count)
+                        case .unreadable: ("unreadable", nil)
+                        case .retryLater: ("retry_later", nil)
+                        }
+                        logJob("ocr_page", phase: "ocr", relativePath: job.relativePath, kind: job.kind, fileSize: job.fileSize,
+                               modifiedAt: job.modifiedAt, page: job.pageIndex, ms: ms, waitMs: nil, result: result, pages: nil, chars: chars)
                     }
-                    logJob("ocr_page", phase: "ocr", relativePath: job.relativePath, kind: job.kind, fileSize: job.fileSize,
-                           modifiedAt: job.modifiedAt, page: job.pageIndex, ms: ms, waitMs: nil, result: result, pages: nil, chars: chars)
+                    do {
+                        try Self.store(outcome, of: job, in: store, report: &report)
+                    } catch {
+                        // A store failure (e.g. damage) ends the run; finish the running pages first.
+                        Self.log.error("Could not store OCR result of \(job.relativePath, privacy: .public): \(String(describing: error), privacy: .public)")
+                        cancelled = true
+                        storeError = error
+                    }
+                    progress(IndexProgress(done: done, total: total, currentFile: job.relativePath, phase: .ocr))
                 }
-                do {
-                    try Self.store(outcome, of: job, in: store, report: &report)
-                } catch {
-                    // A store failure (e.g. damage) ends the run; finish the running pages first.
-                    Self.log.error("Could not store OCR result of \(job.relativePath, privacy: .public): \(String(describing: error), privacy: .public)")
-                    cancelled = true
-                    storeError = error
-                }
-                progress(IndexProgress(done: done, total: total, currentFile: job.relativePath, phase: .ocr))
                 if Task.isCancelled { cancelled = true }
                 // After a wipe every remaining job is stale: stop starting new ones; `update`
                 // notices the wipe and starts over.
                 let wiped = store.resetCount != resetsAtStart
-                if !cancelled, !wiped, let next = queue.next(preferring: priority()) { start(next) }
+                if !wasInstant, !cancelled, !wiped, let next = queue.next(preferring: priority()) { start(next) }
             }
         }
         metrics.log("phase_end", ["source": metricsSource, "phase": "ocr", "wall_ms": IndexMetrics.ms(since: phaseStart),
-                                  "sum_ms": sumMs, "count": done, "queued": total, "cancelled": cancelled])
+                                  "sum_ms": sumMs, "count": done, "queued": total, "cancelled": cancelled,
+                                  "copied": copied, "hashed": hashes.count, "hash_ms": hashMs])
         if let storeError { throw storeError }
         if cancelled { throw CancellationError() }
 
         return try Self.problems(in: store, report: report)
+    }
+
+    /// 1.5.0: SHA-256 (hex) of each document of `jobs`, at most `limit` files at once; a file that cannot be read has none.
+    static func contentHashes(of jobs: [OCRPageJob], root: URL, limit: Int) async throws -> [Int64: (job: OCRPageJob, hash: String)] {
+        var first: [Int64: OCRPageJob] = [:]
+        for job in jobs where first[job.docId] == nil { first[job.docId] = job }
+        var result: [Int64: (job: OCRPageJob, hash: String)] = [:]
+        try await withThrowingTaskGroup(of: (OCRPageJob, Data?).self) { group in
+            var queue = first.values.sorted { $0.relativePath < $1.relativePath }.makeIterator()
+            func add(_ job: OCRPageJob) {
+                group.addTask { (job, try sha256(of: root.appendingPathComponent(job.relativePath))) }
+            }
+            for _ in 0..<max(1, limit) { guard let job = queue.next() else { break }; add(job) }
+            while let (job, digest) = try await group.next() {
+                if let digest { result[job.docId] = (job, digest.map { String(format: "%02x", $0) }.joined()) }
+                if let job = queue.next() { add(job) }
+            }
+        }
+        return result
     }
 
     /// Every document of the index that ended without any text, and every unreadable image — not only

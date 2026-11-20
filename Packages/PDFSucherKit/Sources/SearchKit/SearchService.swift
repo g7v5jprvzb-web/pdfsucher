@@ -45,6 +45,10 @@ public struct SearchService: Sendable {
         let started = ContinuousClock.now
         var candidates = 0, checkTime = Duration.zero, consumeTime = Duration.zero, namesTime = Duration.zero
         var readTime = Duration.zero, firstPartialMs: Double?, hitCount: Int?
+        // 1.5.0: per file type: candidate pages, hits; Office documents not laid out yet (no page text to search).
+        var candidatesByKind: [String: Int] = [:], hitsByKind: [String: Int] = [:], officePending = 0
+        var stored: [StoredDocument] = []
+        var kinds: [Int64: String] = [:]
         defer {
             if metrics.isEnabled {
                 var fields: [String: Any] = [
@@ -53,11 +57,20 @@ public struct SearchService: Sendable {
                     "total_ms": IndexMetrics.ms(since: started), "cancelled": hitCount == nil]
                 if let hitCount { fields["hits"] = hitCount }
                 if let firstPartialMs { fields["first_partial_ms"] = firstPartialMs }
+                fields["candidates_by_kind"] = candidatesByKind
+                fields["hits_by_kind"] = hitsByKind
+                fields["documents"] = stored.count
+                fields["office_pending"] = officePending
                 metrics.log("search_source", fields)
             }
         }
-        var stored: [StoredDocument] = []
         try Self.timed(&readTime) { stored = try index.documents() }
+        if metrics.isEnabled {
+            for doc in stored {
+                kinds[doc.id] = doc.kind.rawValue
+                if doc.kind.isOffice, doc.pageCount == 0, doc.status != .error { officePending += 1 }
+            }
+        }
         // Content only of readable documents; names of every document (Chris, 2026-11-14: unreadable, locked and
         // not yet read ones too, shown like when browsing).
         var documents: [Int64: StoredDocument] = [:]
@@ -82,6 +95,7 @@ public struct SearchService: Sendable {
             let consumeStart = ContinuousClock.now
             defer { consumeTime += ContinuousClock.now - consumeStart }
             candidates += batch.count
+            if !kinds.isEmpty { for page in batch { candidatesByKind[kinds[page.docId] ?? "?", default: 0] += 1 } }
             pending += batch.filter { documents[$0.docId] != nil }
             if !reported, let onPartial {
                 if batch.count == batchSize, let lastDoc = batch.last?.docId {
@@ -120,6 +134,7 @@ public struct SearchService: Sendable {
         Self.timed(&checkTime) { verified += Self.check(pending, with: matcher) }
         let result = sortHits(hits(verified), by: sort)
         hitCount = result.count
+        if metrics.isEnabled { for hit in result { hitsByKind[hit.kind.rawValue, default: 0] += 1 } }
         return result
     }
 
