@@ -47,7 +47,7 @@ public enum KindQuery {
 
     private static let prefixes = ["typ:", "type:", "ext:"]
     private static let names: [String: DocumentKind] = [
-        "pdf": .pdf, "word": .word, "powerpoint": .powerpoint, "bild": .image, "bilder": .image, "image": .image,
+        "pdf": .pdf, "word": .word, "powerpoint": .powerpoint, "ppt": .powerpoint, "bild": .image, "bilder": .image, "image": .image,
     ]
 
     /// The kinds of a shortcut token; nil when it is none or names an unknown kind.
